@@ -102,6 +102,14 @@ assign is not an error — the wire value is authoritative and gets a distinct s
 `SOURCE_<id>` label. Assigning a venue is therefore a republish of this document rather than a new
 release.
 
+Where several ids share a name, a feed row may say which one it carries with an optional
+**`source_id`** (for example `"source_id": 6` on one row and `8` on its sibling). It never relabels
+data — the wire value stays authoritative — it only keeps each engine's health, `status`,
+`/v1/status` entry and `dz_feed_up` series apart, so one live engine cannot mask the other's
+outage. It must be an id this document's `sources` block (or, with no block, the compiled-in table)
+assigns to that row's own `venue`; anything else refuses the document. A row without it reports at
+the name level, as every row did before the field existed, and a binary that predates it ignores it.
+
 ⚠️ **With one ordering constraint** — and it is not specific to `sources`. A binary that predates
 the block has no `sources` field, so it warns about `$.sources` and ignores it — and then validates
 the rows against its own compiled-in table, where the new venue does not resolve. Under a URL origin

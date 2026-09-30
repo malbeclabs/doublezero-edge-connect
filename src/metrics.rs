@@ -53,9 +53,10 @@ const SHORTFALL_LEVEL_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 6
 pub struct Metrics {
     registry: Registry,
 
-    // --- Ingest receivers (labelled by `venue`, `kind`, `publisher` — one receiver per publisher
-    // of a feed, where `publisher` is its base port (`FeedPublisher::base_port`);
-    // `feed_up`/`feed_stale_ms` are deliberately venue-level aggregates) ---
+    // --- Ingest receivers (labelled by `venue`, `category`, `kind`, `publisher` — one receiver per
+    // publisher of a feed, where `publisher` is its base port (`FeedPublisher::base_port`) and
+    // `category` keeps two rows of one kind on one base port apart; `feed_up`/`feed_stale_ms` are
+    // deliberately venue-level aggregates, per `(venue, source_id)`) ---
     /// Datagrams received per publisher, split by port `role` (mktdata/refdata/snapshot/combined).
     pub datagrams_received: IntCounterVec,
     /// Total bytes received per publisher (sum of datagram lengths).
@@ -66,7 +67,8 @@ pub struct Metrics {
     pub idle_rejoin: IntCounterVec,
     /// Feed health: 1 while the venue's market-data multicast is up, 0 while it is considered down.
     /// A **venue-level aggregate** over its publishers (up if any is up) — see
-    /// [`receiver_up`](Self::receiver_up) and `ingest::health`.
+    /// [`receiver_up`](Self::receiver_up) and `ingest::health`. `source_id` is the row's declared
+    /// Source ID, so engines sharing a name aggregate apart; empty for a row that declares none.
     pub feed_up: IntGaugeVec,
     /// Market-data staleness: 0 while up; the staleness in milliseconds at the last `down`
     /// transition (reset to 0 on recovery). Venue-level, like [`feed_up`](Self::feed_up).
@@ -76,13 +78,15 @@ pub struct Metrics {
     /// venue-level aggregate (up if ANY publisher is up). A venue can be `dz_feed_up == 1` while
     /// one of its publishers reads `dz_receiver_up == 0`; that is the wedged-mirror signal.
     pub receiver_up: IntGaugeVec,
-    /// Datagram-sequence classifications per feed, by `kind` (first/ok/reset/stale).
+    /// Datagram-sequence classifications per feed row (`venue`, `category`), by `kind`
+    /// (first/ok/reset/stale).
     pub seq_events: IntCounterVec,
 
     // --- Arbiter emit stage (labelled by `venue`) ---
-    /// Messages that survived dedup and were broadcast, by `kind` (quote/trade/instrument/midpoint/
-    /// depth). `status` is structurally possible but currently never routed through the arbiter, so
-    /// that child is not recorded in practice.
+    /// Messages that survived dedup and were broadcast, by wire `source_id` (from the message, so
+    /// engines sharing a name count apart) and `kind` (quote/trade/instrument/midpoint/depth).
+    /// `status` is structurally possible but currently never routed through the arbiter, so that
+    /// child is not recorded in practice.
     pub emit: IntCounterVec,
     /// Quotes admitted by the staleness floor, attributed to the winning `publisher` (edge/public).
     /// A rise in `publisher="public"` is the direct signal of the public backstop filling a gap.
@@ -508,55 +512,55 @@ impl Metrics {
                 &registry,
                 "dz_datagrams_received_total",
                 "DZ Edge multicast datagrams received per publisher and port role",
-                &["venue", "kind", "publisher", "role"],
+                &["venue", "category", "kind", "publisher", "role"],
             ),
             datagram_bytes: counter_vec(
                 &registry,
                 "dz_datagram_bytes_total",
                 "Total bytes received per publisher",
-                &["venue", "kind", "publisher"],
+                &["venue", "category", "kind", "publisher"],
             ),
             socket_errors: counter_vec(
                 &registry,
                 "dz_socket_errors_total",
                 "Socket/transport receive errors per publisher (each triggers a rejoin)",
-                &["venue", "kind", "publisher"],
+                &["venue", "category", "kind", "publisher"],
             ),
             idle_rejoin: counter_vec(
                 &registry,
                 "dz_idle_rejoin_total",
                 "Idle-rejoin watchdog firings per publisher",
-                &["venue", "kind", "publisher"],
+                &["venue", "category", "kind", "publisher"],
             ),
             feed_up: gauge_vec(
                 &registry,
                 "dz_feed_up",
                 "Feed health: 1 if any of the venue's publishers has market data up, 0 if all down",
-                &["venue"],
+                &["venue", "source_id"],
             ),
             feed_stale_ms: gauge_vec(
                 &registry,
                 "dz_feed_stale_ms",
                 "Market-data staleness in ms: 0 while up; staleness at the last down transition",
-                &["venue"],
+                &["venue", "source_id"],
             ),
             receiver_up: gauge_vec(
                 &registry,
                 "dz_receiver_up",
                 "Per-publisher receiver health: 1 if this publisher's market data is up, 0 if down",
-                &["venue", "kind", "publisher"],
+                &["venue", "category", "kind", "publisher"],
             ),
             seq_events: counter_vec(
                 &registry,
                 "dz_seq_events_total",
                 "Datagram-sequence classifications per feed (first/ok/reset/stale)",
-                &["venue", "kind"],
+                &["venue", "category", "kind"],
             ),
             emit: counter_vec(
                 &registry,
                 "dz_emit_total",
                 "Messages broadcast after dedup, by venue and kind",
-                &["venue", "kind"],
+                &["venue", "source_id", "kind"],
             ),
             quotes_admitted: counter_vec(
                 &registry,
@@ -1259,9 +1263,11 @@ mod tests {
         // Touch a few families so they appear in the text output (a zero CounterVec child only
         // materializes once a label set is observed).
         m.datagrams_received
-            .with_label_values(&["HYPERLIQUID", "tob", "9201", "mktdata"])
+            .with_label_values(&["HYPERLIQUID", "cat", "tob", "9201", "mktdata"])
             .inc();
-        m.emit.with_label_values(&["HYPERLIQUID", "quote"]).inc();
+        m.emit
+            .with_label_values(&["HYPERLIQUID", "1", "quote"])
+            .inc();
         m.ws_clients.set(0);
         m.shred_processed.inc();
         m.trades_admitted
@@ -1477,14 +1483,20 @@ mod tests {
         // child of every series under test rather than relying on another test having run first.
         let v = "LabelSplitTest";
         m.datagrams_received
-            .with_label_values(&[v, "tob", "9101", "mktdata"])
+            .with_label_values(&[v, "cat", "tob", "9101", "mktdata"])
             .inc();
         m.datagram_bytes
-            .with_label_values(&[v, "tob", "9101"])
+            .with_label_values(&[v, "cat", "tob", "9101"])
             .inc();
-        m.socket_errors.with_label_values(&[v, "tob", "9101"]).inc();
-        m.idle_rejoin.with_label_values(&[v, "tob", "9101"]).inc();
-        m.receiver_up.with_label_values(&[v, "tob", "9101"]).set(1);
+        m.socket_errors
+            .with_label_values(&[v, "cat", "tob", "9101"])
+            .inc();
+        m.idle_rejoin
+            .with_label_values(&[v, "cat", "tob", "9101"])
+            .inc();
+        m.receiver_up
+            .with_label_values(&[v, "cat", "tob", "9101"])
+            .set(1);
         for c in [
             &m.quotes_admitted,
             &m.quote_ticks_won,
@@ -1540,6 +1552,33 @@ mod tests {
         );
     }
 
+    /// Two rows of one venue, kind and base port — the two Binance engines are both
+    /// `BINANCE`/`tob`/`30001` — are distinct series only because of `category`. Without it either
+    /// receiver overwrites the other's gauge and adds into its counters.
+    #[test]
+    fn two_rows_on_one_base_port_are_distinct_series() {
+        let m = metrics();
+        let venue = "TwoRowsOnePortTest";
+        let up = |cat| {
+            m.receiver_up
+                .with_label_values(&[venue, cat, "tob", "30001"])
+        };
+        let rx = |cat| {
+            m.datagrams_received
+                .with_label_values(&[venue, cat, "tob", "30001", "mktdata"])
+        };
+        up("usdsm").set(1);
+        up("spot").set(0);
+        rx("usdsm").inc_by(5);
+        rx("spot").inc();
+        assert_eq!((up("usdsm").get(), up("spot").get()), (1, 0));
+        assert_eq!((rx("usdsm").get(), rx("spot").get()), (5, 1));
+        let feed_up = |id| m.feed_up.with_label_values(&[venue, id]);
+        feed_up("6").set(1);
+        feed_up("8").set(0);
+        assert_eq!((feed_up("6").get(), feed_up("8").get()), (1, 0));
+    }
+
     /// The receiver-side counters carry `kind` and `publisher` so a six-publisher venue's series
     /// don't collapse into one. A unique venue label keeps this independent of other tests
     /// touching the process-global registry.
@@ -1548,40 +1587,40 @@ mod tests {
         let m = metrics();
         let venue = "PerPublisherLabelTest";
         m.datagrams_received
-            .with_label_values(&[venue, "tob", "9101", "mktdata"])
+            .with_label_values(&[venue, "cat", "tob", "9101", "mktdata"])
             .inc();
         m.datagrams_received
-            .with_label_values(&[venue, "tob", "9201", "mktdata"])
+            .with_label_values(&[venue, "cat", "tob", "9201", "mktdata"])
             .inc_by(3);
         m.datagram_bytes
-            .with_label_values(&[venue, "tob", "9101"])
+            .with_label_values(&[venue, "cat", "tob", "9101"])
             .inc_by(100);
         m.socket_errors
-            .with_label_values(&[venue, "tob", "9101"])
+            .with_label_values(&[venue, "cat", "tob", "9101"])
             .inc();
         m.idle_rejoin
-            .with_label_values(&[venue, "mbo", "10601"])
+            .with_label_values(&[venue, "cat", "mbo", "10601"])
             .inc();
         m.receiver_up
-            .with_label_values(&[venue, "mbo", "10601"])
+            .with_label_values(&[venue, "cat", "mbo", "10601"])
             .set(0);
 
         // Distinct publishers are distinct series, not a merged total.
         assert_eq!(
             m.datagrams_received
-                .with_label_values(&[venue, "tob", "9101", "mktdata"])
+                .with_label_values(&[venue, "cat", "tob", "9101", "mktdata"])
                 .get(),
             1
         );
         assert_eq!(
             m.datagrams_received
-                .with_label_values(&[venue, "tob", "9201", "mktdata"])
+                .with_label_values(&[venue, "cat", "tob", "9201", "mktdata"])
                 .get(),
             3
         );
         assert_eq!(
             m.receiver_up
-                .with_label_values(&[venue, "mbo", "10601"])
+                .with_label_values(&[venue, "cat", "mbo", "10601"])
                 .get(),
             0
         );

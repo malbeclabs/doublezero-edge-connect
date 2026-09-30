@@ -82,6 +82,15 @@ pub enum RegistryError {
         field: &'static str,
     },
     UnknownVenue(String),
+    /// A row declares a `source_id` the resolving `sources` table does not assign to its `venue` —
+    /// unassigned, or assigned to another name.
+    SourceIdMismatch {
+        venue: String,
+        category: String,
+        source_id: u16,
+        /// What the table names that ID, if anything.
+        assigned: Option<String>,
+    },
     /// A `sources` row carries no `name`, or a name that is not the uppercase form consumers see.
     BadSourceName {
         id: u16,
@@ -189,6 +198,24 @@ impl std::fmt::Display for RegistryError {
                 "venue `{v}` resolves to no Source ID; its messages would be dropped and its \
                  status feed would go unrecorded"
             ),
+            RegistryError::SourceIdMismatch {
+                venue,
+                category,
+                source_id,
+                assigned,
+            } => match assigned {
+                Some(name) => write!(
+                    f,
+                    "{venue}/{category}: `source_id` {source_id} is assigned to `{name}`, not \
+                     `{venue}`; the row's health and status would report under another venue's \
+                     engine"
+                ),
+                None => write!(
+                    f,
+                    "{venue}/{category}: `source_id` {source_id} is not assigned in the `sources` \
+                     table; its traffic would be labelled unregistered"
+                ),
+            },
             RegistryError::EmptyPublishedSet { venue, category } => {
                 write!(f, "{venue}/{category}: derived published set is empty")
             }
@@ -354,6 +381,11 @@ struct FeedRow {
     /// becomes downstream.
     #[serde(default)]
     publisher_offset: Option<u8>,
+    /// The Source ID this row's publishers stamp. Optional so every existing document still loads,
+    /// and an older binary ignores it (no `deny_unknown_fields`) rather than refusing the document.
+    /// See [`crate::ingest::feeds::Feed::source_id`].
+    #[serde(default)]
+    source_id: Option<u16>,
     #[serde(default)]
     #[allow(dead_code)]
     notes: serde_json::Value,
@@ -934,6 +966,23 @@ fn feed_from(
     if !resolves {
         return Err(RegistryError::UnknownVenue(row.venue.clone()));
     }
+    // The name resolving is not enough once several IDs share it: with `{6, BINANCE}` alone in
+    // the table, a row declaring 8 would validate on its name and its traffic would be labelled
+    // unregistered. The declared ID must be one the same table assigns to this very name.
+    if let Some(id) = row.source_id {
+        let assigned = match sources {
+            Some(a) => a.iter().find(|s| s.id == id).map(|s| s.name),
+            None => sources::source_name(id),
+        };
+        if assigned != Some(row.venue.as_str()) {
+            return Err(RegistryError::SourceIdMismatch {
+                venue: row.venue.clone(),
+                category: row.category.clone(),
+                source_id: id,
+                assigned: assigned.map(str::to_string),
+            });
+        }
+    }
 
     // Row-level: which mirror scheme (if any) a deployment runs is a property of the feed, not of
     // whether its publishers are written out explicitly or derived — both shapes carry it the same
@@ -979,6 +1028,7 @@ fn feed_from(
         emit_trades: row.emit_trades,
         arbitration: row.arbitration.into(),
         mirror_offset,
+        source_id: row.source_id,
     })
 }
 
@@ -1896,6 +1946,102 @@ mod tests {
         let block = r#"{"id":3,"name":"KALSHI"},{"id":4,"name":"KALSHI"}"#;
         let loaded = build(&doc_with_sources(block, SPORTS_ROW), "test").expect("loads");
         assert_eq!(loaded.sources.expect("installed").len(), 2);
+    }
+
+    /// Two engines under one name, each row declaring its own Source ID — the shape the Binance
+    /// rows take. `{source_id}` placeholders let each test vary one row.
+    fn two_engine_rows(perp_id: &str, spot_id: &str) -> String {
+        format!(
+            r#"{{
+            "venue":"BINANCE","category":"usdsm","code":"edge-binance-usdsm-tob","kind":"TopOfBook",
+            "group":"233.84.178.23","emit_trades":true,"arbitration":"Sticky"{perp_id},
+            "publishers":{{"explicit":[{{"mktdata":30001,"refdata":30002}}]}}}},{{
+            "venue":"BINANCE","category":"spot","code":"edge-binance-spot-tob","kind":"TopOfBook",
+            "group":"233.84.178.31","emit_trades":true,"arbitration":"Sticky"{spot_id},
+            "publishers":{{"explicit":[{{"mktdata":30001,"refdata":30002}}]}}}}"#
+        )
+    }
+    const BOTH_BINANCE_IDS: &str = r#"{"id":6,"name":"BINANCE"},{"id":8,"name":"BINANCE"}"#;
+
+    /// Each row carries the ID it declares, so health and status can tell the engines apart.
+    #[test]
+    fn a_row_carries_its_declared_source_id() {
+        let rows = two_engine_rows(r#","source_id":6"#, r#","source_id":8"#);
+        let loaded = build(&doc_with_sources(BOTH_BINANCE_IDS, &rows), "test").expect("loads");
+        let ids: Vec<_> = loaded
+            .rows
+            .iter()
+            .map(|f| (f.category, f.source_id))
+            .collect();
+        assert_eq!(ids, vec![("usdsm", Some(6)), ("spot", Some(8))]);
+    }
+
+    /// The name resolving is not enough: with only `{6, BINANCE}` assigned, the spot row's name
+    /// resolves while its declared ID does not, and its traffic would be labelled unregistered.
+    #[test]
+    fn a_source_id_the_block_does_not_assign_is_fatal() {
+        let rows = two_engine_rows(r#","source_id":6"#, r#","source_id":8"#);
+        let err = build(
+            &doc_with_sources(r#"{"id":6,"name":"BINANCE"}"#, &rows),
+            "test",
+        )
+        .map(|_| ())
+        .expect_err("ID 8 is unassigned");
+        assert!(
+            matches!(
+                &err,
+                RegistryError::SourceIdMismatch { category, source_id: 8, assigned: None, .. }
+                    if category == "spot"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// An ID assigned to another name would file this row's health under that venue's engine.
+    #[test]
+    fn a_source_id_assigned_to_another_venue_is_fatal() {
+        let block = format!(r#"{BOTH_BINANCE_IDS},{{"id":1,"name":"HYPERLIQUID"}}"#);
+        let rows = two_engine_rows(r#","source_id":6"#, r#","source_id":1"#);
+        let err = build(&doc_with_sources(&block, &rows), "test")
+            .map(|_| ())
+            .expect_err("ID 1 is HYPERLIQUID's");
+        assert!(
+            matches!(
+                &err,
+                RegistryError::SourceIdMismatch { source_id: 1, assigned: Some(n), .. }
+                    if n == "HYPERLIQUID"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// Optional: a row declaring none loads exactly as before, at the name-level status key.
+    #[test]
+    fn a_row_without_a_source_id_loads_as_before() {
+        let loaded = build(
+            &doc_with_sources(BOTH_BINANCE_IDS, &two_engine_rows("", "")),
+            "test",
+        )
+        .expect("loads");
+        assert!(loaded.rows.iter().all(|f| f.source_id.is_none()));
+    }
+
+    /// A document with no `sources` block checks the declared ID against the compiled-in table,
+    /// the same table its `venue` resolves against.
+    #[test]
+    fn with_no_block_a_source_id_is_checked_against_the_compiled_in_table() {
+        let with = |id: &str| {
+            SPORTS_ROW.replace(
+                r#""arbitration":"Sticky""#,
+                &format!(r#""arbitration":"Sticky","source_id":{id}"#),
+            )
+        };
+        let loaded = build(&doc_with(&with("3")), "test").expect("3 is KALSHI's");
+        assert_eq!(loaded.rows[0].source_id, Some(3));
+        assert!(matches!(
+            build(&doc_with(&with("2")), "test"),
+            Err(RegistryError::SourceIdMismatch { source_id: 2, .. })
+        ));
     }
 
     /// The synthesized-label namespace and the `0` sentinel are reserved: a block claiming either

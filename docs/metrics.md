@@ -46,15 +46,26 @@ the publisher's **base port** (the market-data port of its block, e.g. `9201`), 
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `dz_datagrams_received_total` | counter | `venue`, `kind`, `publisher`, `role` | Datagrams received per publisher, split by port `role` (mktdata/refdata/snapshot/combined). |
-| `dz_datagram_bytes_total` | counter | `venue`, `kind`, `publisher` | Total bytes received per publisher. |
-| `dz_socket_errors_total` | counter | `venue`, `kind`, `publisher` | Socket/transport receive errors per publisher (each triggers a rejoin). |
-| `dz_idle_rejoin_total` | counter | `venue`, `kind`, `publisher` | Idle-rejoin watchdog firings per publisher. |
-| `dz_receiver_up` | gauge | `venue`, `kind`, `publisher` | `1` while this publisher's market-data feed is up, `0` while down. The per-publisher counterpart of `dz_feed_up`. |
-| `dz_feed_up` | gauge | `venue` | `1` while *any* publisher of the venue is up, `0` once every one has gone silent. |
-| `dz_feed_stale_ms` | gauge | `venue` | Staleness in milliseconds: `0` while up; the staleness at the last venue-level `down` transition (reset to `0` on recovery). |
-| `dz_seq_events_total` | counter | `venue`, `kind` | Datagram-sequence classifications (`first`/`ok`/`reset`/`stale`). Incremented in the processor, which demultiplexes publishers by source IP address and so has no configured base port — hence no `publisher` label. Reported by the top-of-book, midpoint and market-by-price processors (market-by-order carries no stale check); a `stale` rate on a market-by-price feed is the series to watch, since a reordered datagram there carries a batch boundary that would otherwise close every open event at a slot the venue has left. |
+| `dz_datagrams_received_total` | counter | `venue`, `category`, `kind`, `publisher`, `role` | Datagrams received per publisher, split by port `role` (mktdata/refdata/snapshot/combined). |
+| `dz_datagram_bytes_total` | counter | `venue`, `category`, `kind`, `publisher` | Total bytes received per publisher. |
+| `dz_socket_errors_total` | counter | `venue`, `category`, `kind`, `publisher` | Socket/transport receive errors per publisher (each triggers a rejoin). |
+| `dz_idle_rejoin_total` | counter | `venue`, `category`, `kind`, `publisher` | Idle-rejoin watchdog firings per publisher. |
+| `dz_receiver_up` | gauge | `venue`, `category`, `kind`, `publisher` | `1` while this publisher's market-data feed is up, `0` while down. The per-publisher counterpart of `dz_feed_up`. |
+| `dz_feed_up` | gauge | `venue`, `source_id` | `1` while *any* publisher of the venue is up, `0` once every one has gone silent. `source_id` is the row's declared Source ID, so two engines sharing a name aggregate apart; empty for a row that declares none. |
+| `dz_feed_stale_ms` | gauge | `venue`, `source_id` | Staleness in milliseconds: `0` while up; the staleness at the last venue-level `down` transition (reset to `0` on recovery). |
+| `dz_seq_events_total` | counter | `venue`, `category`, `kind` | Datagram-sequence classifications (`first`/`ok`/`reset`/`stale`). Incremented in the processor, which demultiplexes publishers by source IP address and so has no configured base port — hence no `publisher` label. Reported by the top-of-book, midpoint and market-by-price processors (market-by-order carries no stale check); a `stale` rate on a market-by-price feed is the series to watch, since a reordered datagram there carries a batch boundary that would otherwise close every open event at a slot the venue has left. |
 
+> **Label change (Source IDs sharing a name):** several Source IDs may share one registry name —
+> Binance's two matching engines are both `BINANCE`, both Top-of-Book on base port `30001` — so the
+> five per-receiver series gained `category`, `dz_seq_events_total` gained `category`,
+> `dz_emit_total` gained the message's `source_id`, and `dz_feed_up` / `dz_feed_stale_ms` gained
+> the row's declared `source_id` (empty for a row that declares none, which is every row that
+> predates the field). Without them the two engines' receivers wrote one series each: either
+> overwrote the other's gauge and added into its counters, and one live engine masked the other's
+> outage. Aggregating queries are unaffected; an instant selector on the old exact label set
+> matches the same series with the new label added. The per-engine runbook signal is
+> `dz_datagrams_received_total{venue,category,role}` pinned at `0` while the other engine's rises.
+>
 > **Label change (multi-publisher):** the four receiver counters gained `kind` and `publisher` when
 > a feed became N publishers rather than one port block. Aggregating queries (`sum by (venue)`,
 > `rate(...)` summed over labels) are unaffected; queries that match the old exact label set
@@ -121,7 +132,7 @@ Recorded by the shared pre-broadcast emit stage (`src/ingest/arbiter.rs`). Label
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `dz_emit_total` | counter | `venue`, `kind` | Messages broadcast after dedup, by `kind` (quote/trade/instrument/midpoint/depth/book). `status` is structurally possible but never routed through the arbiter today, so it is not recorded in practice. |
+| `dz_emit_total` | counter | `venue`, `source_id`, `kind` | Messages broadcast after dedup, by the message's wire `source_id` and `kind` (quote/trade/instrument/midpoint/depth/book). `status` is structurally possible but never routed through the arbiter today, so it is not recorded in practice. |
 | `dz_quotes_admitted_total` | counter | `venue`, `transport` | Quotes admitted by the staleness floor, attributed to the winning `transport` (`edge`/`public`). A rise in `transport="public"` is the direct signal of the public backstop filling an edge gap. |
 | `dz_trades_admitted_total` | counter | `venue`, `transport` | Trades admitted by the windowed dedup, attributed to the winning `transport` (`edge`/`public`). A rise in `transport="public"` is the trade-side signal of the public backstop filling an edge gap — the counterpart to `dz_quotes_admitted_total` for a trades-only backstop like Phoenix. |
 | `dz_quote_ticks_won_total` | counter | `venue`, `transport` | Quote `source_ts` ticks **won** — the once-per-tick first delivery, attributed to the winning class. Every tick counts exactly once: a mirror's copy or the leader's later in-tick contents never re-count it, and a tick the public feed never delivers still counts for the edge (the walkover). `edge / sum` is the published DZ win rate (see below). `source_ts == 0` sentinel quotes bypass the floor and are not counted. |

@@ -58,7 +58,7 @@ use crate::{
     ingest::{
         arbiter::{lock, SharedArbiter, Transport},
         feeds::{feeds, Feed, FeedKind, FeedPorts, FeedPublisher},
-        health::{FeedHealth, ReceiverKey, SharedFeedHealth},
+        health::{FeedHealth, ReceiverKey, SharedFeedHealth, StatusKey},
         processor::{MboProcessor, MbpProcessor, MidpointProcessor, TobProcessor, MAX_PUBLISHERS},
         reconcile::TapeOwner,
         sources,
@@ -262,13 +262,19 @@ pub(crate) fn revealed_ids_for(venue: &str) -> BTreeSet<u16> {
 
 /// Which `(name, source_id)` pairs a status for row `venue` speaks for: every revealed ID, except
 /// one whose name is another row's own venue (that row reports itself).
+///
+/// A row that declares its Source ID (`declared`) speaks for that ID alone. `revealed_ids_for` is
+/// keyed by the row's *name*, so two engines under one name share one revealed set, and without
+/// this the perp receiver's edge would announce a `status` for the spot engine's ID as well.
 fn status_targets(
     venue: &str,
+    declared: Option<u16>,
     ids: &BTreeSet<u16>,
     label: impl Fn(u16) -> &'static str,
     owns_row: impl Fn(&str) -> bool,
 ) -> Vec<(&'static str, u16)> {
     ids.iter()
+        .filter(|&&id| declared.is_none_or(|d| d == id))
         .map(|&id| (label(id), id))
         .filter(|(name, _)| *name == venue || !owns_row(name))
         .collect()
@@ -283,6 +289,12 @@ pub trait DatagramProcessor {
     fn on_datagram(&mut self, buf: &[u8], ctx: &DatagramCtx);
 }
 
+/// The `source_id` label value of `dz_feed_up`/`dz_feed_stale_ms`: the row's declared ID, or empty
+/// for a row that declares none (the name-level aggregate).
+fn source_id_label(status: StatusKey) -> String {
+    status.1.map(|id| id.to_string()).unwrap_or_default()
+}
+
 /// Materialize the feed-health gauges for `venue` in their at-rest state at receiver setup, so a
 /// venue healthy from boot still exposes a `dz_feed_up{venue}` series (without this the children
 /// are created only on the first down/ok edge, making the headline `dz_feed_up == 0` alert
@@ -290,12 +302,13 @@ pub trait DatagramProcessor {
 /// starting while the venue's quote publishers are all down does not paper over that. `stale_ms` is
 /// left alone in that case — zeroing it would publish the contradictory pair `feed_up=0,
 /// stale_ms=0`.
-fn init_feed_health(health: &FeedHealth, venue: &str) {
-    let up = health.venue_up(venue);
+fn init_feed_health(health: &FeedHealth, status: StatusKey) {
+    let up = health.status_up(status);
     let m = metrics();
-    m.feed_up.with_label_values(&[venue]).set(i64::from(up));
+    let labels = [status.0, &source_id_label(status)];
+    m.feed_up.with_label_values(&labels).set(i64::from(up));
     if up {
-        m.feed_stale_ms.with_label_values(&[venue]).set(0);
+        m.feed_stale_ms.with_label_values(&labels).set(0);
     }
 }
 
@@ -311,6 +324,8 @@ struct ReceiverRegistration {
     health: SharedFeedHealth,
     arbiter: SharedArbiter,
     key: ReceiverKey,
+    /// The key this receiver's `status` edges report under (see `health::StatusKey`).
+    status: StatusKey,
     up_gauge: prometheus::IntGauge,
     /// Source IP addresses this receiver has carried, so their book standing and Source ID paths go
     /// with it. Only the book kinds produce either, and a publisher host uses one IP, so this stays
@@ -323,15 +338,17 @@ impl ReceiverRegistration {
         health: SharedFeedHealth,
         arbiter: SharedArbiter,
         key: ReceiverKey,
+        source_id: Option<u16>,
         up_gauge: prometheus::IntGauge,
     ) -> Self {
         up_gauge.set(1);
-        let venue = key.0;
-        health.register(key, |venue_up| emit_status(&arbiter, venue, venue_up, 0));
+        let status = (key.0, source_id);
+        health.register(key, source_id, |up| emit_status(&arbiter, status, up, 0));
         Self {
             health,
             arbiter,
             key,
+            status,
             up_gauge,
             publishers: Vec::new(),
         }
@@ -360,9 +377,9 @@ impl ReceiverRegistration {
     /// opposite edges concurrently can't publish out of order.
     fn set(&self, up: bool, stale_ms: u64) {
         self.up_gauge.set(i64::from(up));
-        let (venue, arbiter) = (self.key.0, &self.arbiter);
-        self.health.set(self.key, up, |venue_up| {
-            emit_status(arbiter, venue, venue_up, stale_ms)
+        let (status, arbiter) = (self.status, &self.arbiter);
+        self.health.set(self.key, up, |status_up| {
+            emit_status(arbiter, status, status_up, stale_ms)
         });
     }
 }
@@ -370,7 +387,7 @@ impl ReceiverRegistration {
 impl Drop for ReceiverRegistration {
     fn drop(&mut self) {
         self.up_gauge.set(0);
-        let (venue, arbiter) = (self.key.0, &self.arbiter);
+        let (status, arbiter) = (self.status, &self.arbiter);
         if !self.publishers.is_empty() {
             let mut a = lock(arbiter);
             for &ip in &self.publishers {
@@ -381,8 +398,8 @@ impl Drop for ReceiverRegistration {
                 }
             }
         }
-        self.health.deregister(self.key, |venue_up| {
-            emit_status(arbiter, venue, venue_up, 0)
+        self.health.deregister(self.key, |status_up| {
+            emit_status(arbiter, status, status_up, 0)
         });
     }
 }
@@ -409,20 +426,26 @@ impl Drop for ReceiverRegistration {
 /// group's Source-ID-3 traffic) would make this row speak for that other venue too — on this row's `down` edge
 /// wrongly declaring the other venue down while its own rows still stream, and on this row's `ok` edge
 /// worse, silently overwriting a genuine `down` the other venue's own aggregate just published.
-fn emit_status(arbiter: &SharedArbiter, venue: &str, up: bool, stale_ms: u64) {
+///
+/// `status` is the row's [`StatusKey`]: a row that declares its Source ID reports that ID alone,
+/// and its gauges carry it as the `source_id` label (see [`status_targets`]).
+fn emit_status(arbiter: &SharedArbiter, status: StatusKey, up: bool, stale_ms: u64) {
+    let venue = status.0;
     let state = if up { "ok" } else { "down" };
     let stale_ms = if up { 0 } else { stale_ms };
     // Mirror the transition into the feed-health gauges (cheap; only fires on a down/ok edge).
+    let labels = [venue, &source_id_label(status)];
     metrics()
         .feed_up
-        .with_label_values(&[venue])
+        .with_label_values(&labels)
         .set(i64::from(up));
     metrics()
         .feed_stale_ms
-        .with_label_values(&[venue])
+        .with_label_values(&labels)
         .set(stale_ms as i64);
     let targets = status_targets(
         venue,
+        status.1,
         &revealed_ids_for(venue),
         sources::source_label,
         |name| feeds().iter().any(|f| f.venue == name),
@@ -711,6 +734,7 @@ async fn drive<P: DatagramProcessor>(
     category: &'static str,
     kind: FeedKind,
     publisher_port: u16,
+    source_id: Option<u16>,
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     health: SharedFeedHealth,
@@ -733,15 +757,12 @@ async fn drive<P: DatagramProcessor>(
     // The `publisher` label/log value is the base port, rendered once here - never per datagram.
     let publisher_port_str = publisher_port.to_string();
     let publisher_name: &str = &publisher_port_str;
-    let bytes_ctr = m
-        .datagram_bytes
-        .with_label_values(&[venue, kind_label, publisher_name]);
-    let socket_errors = m
-        .socket_errors
-        .with_label_values(&[venue, kind_label, publisher_name]);
-    let idle_rejoin = m
-        .idle_rejoin
-        .with_label_values(&[venue, kind_label, publisher_name]);
+    // `category` is what keeps two rows of one kind on one base port apart — the two Binance
+    // engines are both `BINANCE`/`tob`/`30001` — so without it they share (and overwrite) a series.
+    let labels = [venue, category, kind_label, publisher_name];
+    let bytes_ctr = m.datagram_bytes.with_label_values(&labels);
+    let socket_errors = m.socket_errors.with_label_values(&labels);
+    let idle_rejoin = m.idle_rejoin.with_label_values(&labels);
     // Registers this receiver in the shared health map and owns its `dz_receiver_up`; deregisters
     // both when this task ends for any reason (see `ReceiverRegistration`). Deferred until the
     // sockets actually bind: a receiver that can never bind (taken port, bad interface) would
@@ -750,7 +771,7 @@ async fn drive<P: DatagramProcessor>(
     let mut registration: Option<ReceiverRegistration> = None;
     // Create the feed-health gauge series up front, so a feed that never goes down still exposes
     // `dz_feed_up{venue}` (the venue-level down/ok edges flip it).
-    init_feed_health(&health, venue);
+    init_feed_health(&health, (venue, source_id));
 
     'rejoin: loop {
         // Wait for the interface to acquire an IPv4 before joining, so we don't race the tunnel
@@ -766,6 +787,7 @@ async fn drive<P: DatagramProcessor>(
                 buf: vec![0u8; 2048],
                 dgrams: m.datagrams_received.with_label_values(&[
                     venue,
+                    category,
                     kind_label,
                     publisher_name,
                     role.label(),
@@ -777,8 +799,8 @@ async fn drive<P: DatagramProcessor>(
                 health.clone(),
                 arbiter.clone(),
                 (venue, category, kind, publisher_port),
-                m.receiver_up
-                    .with_label_values(&[venue, kind_label, publisher_name]),
+                source_id,
+                m.receiver_up.with_label_values(&labels),
             )
         });
         info!(%group, ?ports, %iface, %iface_ip, recv_buf, venue, kind = kind_label,
@@ -898,6 +920,7 @@ pub async fn run_feed(
                 feed.category,
                 feed.kind,
                 publisher.base_port(),
+                feed.source_id,
                 arbiter,
                 instruments,
                 health,
@@ -917,6 +940,7 @@ pub async fn run_feed(
                 feed.category,
                 feed.kind,
                 publisher.base_port(),
+                feed.source_id,
                 arbiter,
                 instruments,
                 health,
@@ -952,6 +976,7 @@ pub async fn run_feed(
                 feed.category,
                 feed.kind,
                 publisher.base_port(),
+                feed.source_id,
                 arbiter,
                 instruments,
                 health,
@@ -987,6 +1012,7 @@ pub async fn run_feed(
                 feed.category,
                 feed.kind,
                 publisher.base_port(),
+                feed.source_id,
                 arbiter,
                 instruments,
                 health,
@@ -1019,12 +1045,22 @@ mod tests {
         // process-global metrics registry (see `metrics()` docs).
         let venue = "FeedHealthInitTest";
         let health = FeedHealth::new();
-        health.register((venue, "testcategory", FeedKind::TopOfBook, 9101), |_| {});
-        init_feed_health(&health, venue);
+        health.register(
+            (venue, "testcategory", FeedKind::TopOfBook, 9101),
+            None,
+            |_| {},
+        );
+        init_feed_health(&health, (venue, None));
         // The gauge reads healthy (1) with no prior down/ok transition — the whole point of the
         // up-front init, so the `dz_feed_up == 0` alert has a series to evaluate.
-        assert_eq!(metrics().feed_up.with_label_values(&[venue]).get(), 1);
-        assert_eq!(metrics().feed_stale_ms.with_label_values(&[venue]).get(), 0);
+        assert_eq!(metrics().feed_up.with_label_values(&[venue, ""]).get(), 1);
+        assert_eq!(
+            metrics()
+                .feed_stale_ms
+                .with_label_values(&[venue, ""])
+                .get(),
+            0
+        );
     }
 
     fn test_arbiter() -> (
@@ -1044,7 +1080,7 @@ mod tests {
     #[test]
     fn emit_status_emits_nothing_when_no_venue_revealed_yet() {
         let (arbiter, mut rx) = test_arbiter();
-        emit_status(&arbiter, "EmitStatusNoRevealRow", false, 5_000);
+        emit_status(&arbiter, ("EmitStatusNoRevealRow", None), false, 5_000);
         assert!(
             rx.try_recv().is_err(),
             "no revealed venue: nothing to declare an outage on"
@@ -1063,7 +1099,7 @@ mod tests {
         let venue = "KALSHI";
         record_revealed(venue, 3);
         let (arbiter, mut rx) = test_arbiter();
-        emit_status(&arbiter, venue, true, 0);
+        emit_status(&arbiter, (venue, None), true, 0);
         match &*rx.try_recv().expect("a status was emitted") {
             FeedMessage::Status(s) => {
                 assert_eq!(s.venue.as_ref(), venue);
@@ -1085,15 +1121,87 @@ mod tests {
                 "OTHER"
             }
         };
-        let targets = status_targets("SHARED", &BTreeSet::from([4, 10]), label, |_| true);
+        let targets = status_targets("SHARED", None, &BTreeSet::from([4, 10]), label, |_| true);
         assert_eq!(targets, vec![("SHARED", 4), ("SHARED", 10)]);
+    }
+
+    /// Both engines' IDs are revealed under the one row name they share, so a row that declares
+    /// its ID must speak for that ID alone — or the perp receiver's edge announces the spot
+    /// engine's `status` too.
+    #[test]
+    fn a_row_declaring_its_id_speaks_for_that_id_alone() {
+        let label = |_| "SHARED";
+        let ids = BTreeSet::from([4, 10]);
+        assert_eq!(
+            status_targets("SHARED", Some(10), &ids, label, |_| true),
+            vec![("SHARED", 10)]
+        );
+        assert!(
+            status_targets("SHARED", Some(7), &ids, label, |_| true).is_empty(),
+            "an ID not yet revealed has nothing to report"
+        );
+    }
+
+    /// End to end through `ReceiverRegistration`: two engines under one name, each declaring its
+    /// ID. The one that fails goes down on its own `dz_feed_up` series and announces nothing for
+    /// its peer, whose `status` and gauge stay up.
+    #[test]
+    fn one_engine_failing_reports_down_for_its_own_id_only() {
+        use crate::ingest::{feeds::FeedKind, health::FeedHealth};
+
+        // KALSHI (ID 3) is the one assigned name whose revealed set these keys can reach; ID 4
+        // stands in for a second engine under the same name.
+        let venue = "KALSHI";
+        record_revealed(venue, 3);
+        let (arbiter, mut rx) = test_arbiter();
+        let health: crate::ingest::health::SharedFeedHealth = FeedHealth::new().into();
+        let gauge = |cat| {
+            metrics()
+                .receiver_up
+                .with_label_values(&[venue, cat, "tob", "39001"])
+        };
+        let a = ReceiverRegistration::new(
+            health.clone(),
+            arbiter.clone(),
+            (venue, "engine-a", FeedKind::TopOfBook, 39001),
+            Some(3),
+            gauge("engine-a"),
+        );
+        let b = ReceiverRegistration::new(
+            health.clone(),
+            arbiter.clone(),
+            (venue, "engine-b", FeedKind::TopOfBook, 39001),
+            Some(4),
+            gauge("engine-b"),
+        );
+        while rx.try_recv().is_ok() {}
+
+        b.set(false, 9_000);
+        assert!(
+            rx.try_recv().is_err(),
+            "engine b's outage must not announce a status for engine a's ID"
+        );
+        let feed_up = |id| metrics().feed_up.with_label_values(&[venue, id]).get();
+        assert_eq!(feed_up("4"), 0, "engine b's own series goes down");
+        assert_eq!(feed_up("3"), 1, "engine a's stays up");
+
+        a.set(false, 1_000);
+        match &*rx.try_recv().expect("engine a's own down edge") {
+            FeedMessage::Status(s) => {
+                assert_eq!((s.source_id, s.state.as_str()), (3, "down"));
+            }
+            other => panic!("expected a status, got {other:?}"),
+        }
+        assert_eq!(feed_up("3"), 0);
     }
 
     /// A revealed ID whose name owns another row speaks for itself, not through this row.
     #[test]
     fn a_revealed_id_owning_another_row_is_skipped() {
         let label = |id: u16| if id == 1 { "ROW" } else { "ELSEWHERE" };
-        let targets = status_targets("ROW", &BTreeSet::from([1, 2]), label, |n| n == "ELSEWHERE");
+        let targets = status_targets("ROW", None, &BTreeSet::from([1, 2]), label, |n| {
+            n == "ELSEWHERE"
+        });
         assert_eq!(targets, vec![("ROW", 1)]);
     }
 
@@ -1136,7 +1244,7 @@ mod tests {
         record_revealed(row, 1);
         record_revealed(row, 3);
         let (arbiter, mut rx) = test_arbiter();
-        emit_status(&arbiter, row, false, 1_234);
+        emit_status(&arbiter, (row, None), false, 1_234);
         match &*rx.try_recv().expect("the row's own venue still reports") {
             FeedMessage::Status(s) => assert_eq!(s.venue.as_ref(), "HYPERLIQUID"),
             other => panic!("expected a status, got {other:?}"),
@@ -1219,10 +1327,11 @@ mod tests {
         let (arbiter, mut rx) = test_arbiter();
         let health = FeedHealth::new();
         let key = (row_venue, "testcategory", FeedKind::TopOfBook, 9101);
-        let up_gauge = metrics()
-            .receiver_up
-            .with_label_values(&[row_venue, "tob", "9101"]);
-        let reg = ReceiverRegistration::new(health.into(), arbiter, key, up_gauge);
+        let up_gauge =
+            metrics()
+                .receiver_up
+                .with_label_values(&[row_venue, "testcategory", "tob", "9101"]);
+        let reg = ReceiverRegistration::new(health.into(), arbiter, key, None, up_gauge);
         // Registering the first (and only) receiver for this venue is an up edge, so `emit_status`
         // fires synchronously from inside `ReceiverRegistration::new` — reporting only this row's
         // own venue, never the foreign one that governs its own aggregate.
@@ -1262,13 +1371,15 @@ mod tests {
             let arbiter: SharedArbiter =
                 std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 1_024)));
             lock(&arbiter).set_book_synced(&market, Transport::Edge(ip), true);
-            let up_gauge = metrics()
-                .receiver_up
-                .with_label_values(&["MBODEPART", "test", port]);
+            let up_gauge =
+                metrics()
+                    .receiver_up
+                    .with_label_values(&["MBODEPART", "test", "mbo", port]);
             let mut reg = ReceiverRegistration::new(
                 FeedHealth::new().into(),
                 arbiter.clone(),
                 ("MBODEPART", "test", kind, 9101),
+                None,
                 up_gauge,
             );
             reg.note_publisher(ip);
@@ -1331,13 +1442,15 @@ mod tests {
                 a.note_source_path(&market, Transport::Edge(peer));
                 a.release_source_market(&market, None, Transport::Edge(peer));
             }
-            let up_gauge = metrics()
-                .receiver_up
-                .with_label_values(&["MBPDEPART", "test", port]);
+            let up_gauge =
+                metrics()
+                    .receiver_up
+                    .with_label_values(&["MBPDEPART", "test", "mbp", port]);
             let mut reg = ReceiverRegistration::new(
                 FeedHealth::new().into(),
                 arbiter.clone(),
                 ("MBPDEPART", "test", kind, 9201),
+                None,
                 up_gauge,
             );
             reg.note_publisher(ip);
@@ -1381,11 +1494,12 @@ mod tests {
         lock(&arbiter).set_book_synced(&market, Transport::Edge(ip), true);
         let up_gauge = metrics()
             .receiver_up
-            .with_label_values(&[row_venue, "wiretest", "9103"]);
+            .with_label_values(&[row_venue, "wiretest", "mbo", "9103"]);
         let mut reg = ReceiverRegistration::new(
             FeedHealth::new().into(),
             arbiter.clone(),
             (row_venue, "wiretest", FeedKind::MarketByOrder, 9103),
+            None,
             up_gauge,
         );
         reg.note_publisher(ip);

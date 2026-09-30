@@ -76,7 +76,7 @@ impl WarnRateLimit {
     }
 }
 
-/// Pre-resolved `dz_seq_events_total{venue, kind}` children (one per [`SeqCheck`] outcome) for a
+/// Pre-resolved `dz_seq_events_total{venue, category, kind}` children (one per [`SeqCheck`] outcome) for a
 /// single feed, so the per-datagram hot path increments a cached counter instead of doing a label-map
 /// lookup. The processor doesn't know its venue until the first datagram (`ctx.venue`, fixed for the
 /// feed's lifetime), so the children are bound lazily on first use.
@@ -96,15 +96,13 @@ impl SeqEvents {
         }
     }
 
-    fn record(&mut self, venue: &str, check: &SeqCheck) {
+    /// `category` rides along because two rows can share a venue (two engines under one Source ID
+    /// name), and their sequence classifications must not merge into one series.
+    fn record(&mut self, venue: &str, category: &str, check: &SeqCheck) {
         let children = self.children.get_or_insert_with(|| {
             let m = metrics();
-            [
-                m.seq_events.with_label_values(&[venue, "first"]),
-                m.seq_events.with_label_values(&[venue, "ok"]),
-                m.seq_events.with_label_values(&[venue, "reset"]),
-                m.seq_events.with_label_values(&[venue, "stale"]),
-            ]
+            let child = |k| m.seq_events.with_label_values(&[venue, category, k]);
+            [child("first"), child("ok"), child("reset"), child("stale")]
         });
         children[Self::index(check)].inc();
     }
@@ -484,7 +482,7 @@ impl DatagramProcessor for TobProcessor {
                 header.reset_count,
                 header.sequence,
             );
-            self.seq_events.record(ctx.venue, &check);
+            self.seq_events.record(ctx.venue, ctx.category, &check);
             match check {
                 SeqCheck::Stale => {
                     debug!(
@@ -830,7 +828,7 @@ impl DatagramProcessor for MidpointProcessor {
                 header.reset_count,
                 header.sequence,
             );
-            self.seq_events.record(ctx.venue, &check);
+            self.seq_events.record(ctx.venue, ctx.category, &check);
             !matches!(check, SeqCheck::Stale)
         } else {
             true
@@ -2964,7 +2962,7 @@ impl DatagramProcessor for MbpProcessor {
             let check = self
                 .seq
                 .check(ctx.publisher, channel, header.reset_count, header.sequence);
-            self.seq_events.record(ctx.venue, &check);
+            self.seq_events.record(ctx.venue, ctx.category, &check);
             let fresh = !matches!(check, SeqCheck::Stale);
             if !fresh {
                 debug!(
@@ -7998,7 +7996,9 @@ mod tests {
     fn mbp_an_era_change_forgets_the_sequence_anchor() {
         let venue = "MbpSeqPurge";
         let (arbiter, _rx, instruments) = mbp_harness();
-        let stale = metrics().seq_events.with_label_values(&[venue, "stale"]);
+        let stale = metrics()
+            .seq_events
+            .with_label_values(&[venue, "testcategory", "stale"]);
         let before = stale.get();
         let ctx = |role| mbp_ctx(venue, &arbiter, &instruments, role);
         let mut proc = MbpProcessor::new(tape(false));
@@ -8331,7 +8331,9 @@ mod tests {
     fn mbp_a_reordered_datagram_cannot_move_the_slot_or_close_an_event() {
         let venue = "MbpStaleDatagram";
         let (arbiter, mut rx, instruments) = mbp_harness();
-        let stale = metrics().seq_events.with_label_values(&[venue, "stale"]);
+        let stale = metrics()
+            .seq_events
+            .with_label_values(&[venue, "testcategory", "stale"]);
         let before = stale.get();
         let ctx = |role| mbp_ctx(venue, &arbiter, &instruments, role);
         let boundary = |batch_id: u32, batch_time: u64| {

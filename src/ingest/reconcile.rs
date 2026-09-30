@@ -1206,6 +1206,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Coordinated,
             mirror_offset: None,
+            source_id: None,
         }
     }
 
@@ -1761,6 +1762,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            source_id: None,
         };
         let feed_b = Feed {
             venue: "KALSHI", // source_id 3
@@ -1772,6 +1774,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            source_id: None,
         };
         let r = test_reconciler(vec![feed_a, feed_b]);
         let key_a = (
@@ -1867,6 +1870,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            source_id: None,
         };
         let feed_sports = Feed {
             venue: "KALSHI",
@@ -1878,6 +1882,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            source_id: None,
         };
         let r = test_reconciler(vec![feed_perps, feed_sports]);
         let key_perps = ("KALSHI", "perps", FeedKind::MarketByPrice, 33030u16);

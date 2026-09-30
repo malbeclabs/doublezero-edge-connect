@@ -337,6 +337,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A market-by-price `InstrumentReset` discarded its own recovery snapshot group.** A publisher withholding and then re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin` follows its own reset by ~0.1 ms on a different port — resets ride mktdata, snapshot groups the snapshot port, on independent sequence series — so which is processed first is a coin flip. When the begin won, both the book's assembly and the processor's level route were torn out, the market waited a full snapshot rotation to heal, and the group's levels were counted on `dz_mbp_snapshot_levels_dropped_total{reason="reset"}`. A group anchored at or after the reset's `New Anchor Seq` is now kept — the same test a `SnapshotBegin` is already judged by — and only one that predates the reset is dropped and tombstoned. Observed on a live Phoenix feed at roughly two flaps per hour per market; expect that `reason="reset"` series to fall substantially.
 
 ### Changed
+- **Health, `status` and metrics are kept per Source ID where several IDs share one name.** Two
+  engines under one registry name — Binance's USD-margined perps (ID 6) and spot (ID 8), both
+  `BINANCE` — collapsed everywhere the bridge keyed on the name: one live engine masked the other's
+  outage in `status`, `dz_feed_up` and `/v1/status`, and the two receivers (same venue, kind and
+  base port) overwrote each other's per-receiver series. A feed-registry row may now declare its
+  `source_id` (optional; validated against the resolving `sources` table under the row's own
+  `venue`, so a mismatch refuses the document). A row that declares one aggregates its health under
+  `(venue, source_id)`, emits the wire `status` for that ID alone, and gets its own `/v1/status`
+  entry carrying `source_id`, which `doublezero-edge status`/`diagnose` render as `VENUE (source N)`;
+  a product's `status` reads its own engine. Rows that declare none behave exactly as before.
+  Metric labels: `category` on `dz_datagrams_received_total`, `dz_datagram_bytes_total`,
+  `dz_socket_errors_total`, `dz_idle_rejoin_total`, `dz_receiver_up` and `dz_seq_events_total`;
+  `source_id` on `dz_emit_total`, `dz_feed_up` and `dz_feed_stale_ms` (see `docs/metrics.md`).
+  Declaring `source_id` is not yet required for a shared name: the hosted document's rows are
+  copied from publisher fragments that do not carry it yet (malbeclabs/infra#2841,
+  malbeclabs/infra#2846), and requiring it is the follow-up once they do.
 - A `sources` block may give several Source IDs one name. Each ID keeps its own state and
   `status`; product ids use the shared name. A `status` carries its feed's health, so IDs on one
   feed go down together. Consumers must key on `source_id`, not the name (see PROTOCOL.md).

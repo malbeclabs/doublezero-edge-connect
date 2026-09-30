@@ -402,7 +402,12 @@ Modules are grouped by role under `src/`:
   (the same tuple as `reconcile::FeedKey`; `(venue, kind)` is not an identity once a venue carries two
   universes),
   aggregated to the **venue**-level `status`/`dz_feed_up` PROTOCOL.md promises, so one wedged
-  publisher never takes a venue down while a peer streams. Only quote-bearing kinds count
+  publisher never takes a venue down while a peer streams. "Venue" is a `StatusKey`
+  `(venue, source_id)`: a row that declares its optional `source_id` (validated against the
+  resolving `sources` table under its own `venue`) aggregates, emits its wire `status`, lists in
+  `/v1/status` and labels `dz_feed_up` under that ID alone, so two engines sharing a name (Binance's
+  6 and 8) never mask each other's outage; an undeclared row keeps `(venue, None)`. `ReceiverKey`
+  stays the reconciler's `FeedKey` — the status key is recorded once, at `register`. Only quote-bearing kinds count
   (`carries_venue_status`; MBO is depth-only and must neither declare an outage nor mask one), with a
   fallback to any registered receiver for a venue this process runs **no** quote-bearing receiver for
   — gated on a sticky per-venue carrier set, since a carrier that *stopped* leaves the liveness map
