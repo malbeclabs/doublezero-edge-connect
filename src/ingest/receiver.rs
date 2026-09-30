@@ -265,16 +265,23 @@ pub(crate) fn revealed_ids_for(venue: &str) -> BTreeSet<u16> {
 ///
 /// A row that declares its Source ID (`declared`) speaks for that ID alone. `revealed_ids_for` is
 /// keyed by the row's *name*, so two engines under one name share one revealed set, and without
-/// this the perp receiver's edge would announce a `status` for the spot engine's ID as well.
+/// this the perp receiver's edge would announce a `status` for the spot engine's ID as well. The
+/// converse holds too: a row that declares none skips every ID some row declares (`claimed`), since
+/// that row reports it — otherwise an undeclared sibling's edge (a document that declares the ID on
+/// one row of a name but not another) would declare that engine down, or mask its outage.
 fn status_targets(
     venue: &str,
     declared: Option<u16>,
     ids: &BTreeSet<u16>,
     label: impl Fn(u16) -> &'static str,
     owns_row: impl Fn(&str) -> bool,
+    claimed: impl Fn(u16) -> bool,
 ) -> Vec<(&'static str, u16)> {
     ids.iter()
-        .filter(|&&id| declared.is_none_or(|d| d == id))
+        .filter(|&&id| match declared {
+            Some(d) => d == id,
+            None => !claimed(id),
+        })
         .map(|&id| (label(id), id))
         .filter(|(name, _)| *name == venue || !owns_row(name))
         .collect()
@@ -412,8 +419,9 @@ impl Drop for ReceiverRegistration {
 /// only meaningful on a `down` edge.
 ///
 /// `venue` here is the feed **row's** static identity — used only for the health-map lookup above it
-/// and the `dz_feed_up`/`dz_feed_stale_ms` gauges, which stay keyed on the row (an operational
-/// aggregate wired to the registry, not the wire naming this fixes). The **wire** `status` message is
+/// and the `dz_feed_up`/`dz_feed_stale_ms` gauges, which stay keyed on the row's `StatusKey` (an
+/// operational aggregate wired to the registry, not the wire naming this fixes). The **wire** `status`
+/// message is
 /// different: it must name what this row's receivers have actually emitted quotes/trades under, since
 /// a publisher's wire Source ID can resolve to a different registry name than the row (see
 /// `record_revealed`). A row that has revealed no venue yet emits no `status` at all here — a receiver
@@ -449,6 +457,7 @@ fn emit_status(arbiter: &SharedArbiter, status: StatusKey, up: bool, stale_ms: u
         &revealed_ids_for(venue),
         sources::source_label,
         |name| feeds().iter().any(|f| f.venue == name),
+        |id| feeds().iter().any(|f| f.source_id == Some(id)),
     );
     for (name, source_id) in targets {
         let wire_venue = crate::model::venue_arc(name);
@@ -1121,7 +1130,14 @@ mod tests {
                 "OTHER"
             }
         };
-        let targets = status_targets("SHARED", None, &BTreeSet::from([4, 10]), label, |_| true);
+        let targets = status_targets(
+            "SHARED",
+            None,
+            &BTreeSet::from([4, 10]),
+            label,
+            |_| true,
+            |_| false,
+        );
         assert_eq!(targets, vec![("SHARED", 4), ("SHARED", 10)]);
     }
 
@@ -1133,12 +1149,25 @@ mod tests {
         let label = |_| "SHARED";
         let ids = BTreeSet::from([4, 10]);
         assert_eq!(
-            status_targets("SHARED", Some(10), &ids, label, |_| true),
+            status_targets("SHARED", Some(10), &ids, label, |_| true, |_| true),
             vec![("SHARED", 10)]
         );
         assert!(
-            status_targets("SHARED", Some(7), &ids, label, |_| true).is_empty(),
+            status_targets("SHARED", Some(7), &ids, label, |_| true, |_| true).is_empty(),
             "an ID not yet revealed has nothing to report"
+        );
+    }
+
+    /// A row that declares no ID must not speak for one a sibling row of its name declares: that
+    /// sibling reports it, and this row's edge would otherwise declare that engine down (or mask
+    /// its outage) whenever the document declares the ID on one row of the name but not another.
+    #[test]
+    fn an_undeclared_row_skips_ids_another_row_declares() {
+        let label = |_| "SHARED";
+        let ids = BTreeSet::from([4, 10]);
+        assert_eq!(
+            status_targets("SHARED", None, &ids, label, |_| true, |id| id == 10),
+            vec![("SHARED", 4)]
         );
     }
 
@@ -1199,9 +1228,14 @@ mod tests {
     #[test]
     fn a_revealed_id_owning_another_row_is_skipped() {
         let label = |id: u16| if id == 1 { "ROW" } else { "ELSEWHERE" };
-        let targets = status_targets("ROW", None, &BTreeSet::from([1, 2]), label, |n| {
-            n == "ELSEWHERE"
-        });
+        let targets = status_targets(
+            "ROW",
+            None,
+            &BTreeSet::from([1, 2]),
+            label,
+            |n| n == "ELSEWHERE",
+            |_| false,
+        );
         assert_eq!(targets, vec![("ROW", 1)]);
     }
 

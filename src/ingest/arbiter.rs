@@ -1640,8 +1640,13 @@ struct VenueMetrics {
     /// `dz_emit_total{source_id, kind}` per Source ID, indexed by kind:
     /// quote/trade/instrument/midpoint/depth/status/book. Keyed per ID because several IDs may
     /// share one name; bounded by the IDs sharing this label, since every ID past the unregistered
-    /// cap shares `UNREGISTERED` and is collapsed to `0` here exactly as `SourceKey` does.
-    emit: HashMap<u16, [IntCounter; 7]>,
+    /// cap shares `UNREGISTERED` and is collapsed to `0` here exactly as `SourceKey` does. A `Vec`
+    /// scanned linearly rather than a map: it holds one entry for nearly every name, and this is
+    /// read on every emitted message under the arbiter mutex.
+    emit: Vec<(u16, [IntCounter; 7])>,
+    /// Whether [`Self::venue`] is the shared `UNREGISTERED` label, decided once rather than by a
+    /// string comparison per message.
+    unregistered: bool,
     /// `dz_quotes_admitted_total{publisher}` / `dz_trades_admitted_total{publisher}`, `[edge, public]`.
     quotes_admitted: [IntCounter; 2],
     trades_admitted: [IntCounter; 2],
@@ -1678,29 +1683,30 @@ struct VenueMetrics {
 impl VenueMetrics {
     /// The `dz_emit_total` children for wire `source_id` under this venue, resolved on first use.
     fn emit_for(&mut self, source_id: u16) -> &[IntCounter; 7] {
-        let id = if self.venue.as_ref() == crate::ingest::sources::UNREGISTERED {
-            0
-        } else {
-            source_id
+        let id = if self.unregistered { 0 } else { source_id };
+        let idx = match self.emit.iter().position(|(have, _)| *have == id) {
+            Some(idx) => idx,
+            None => {
+                let label = id.to_string();
+                let emit_kind = |k: &str| {
+                    metrics()
+                        .emit
+                        .with_label_values(&[self.venue.as_ref(), label.as_str(), k])
+                };
+                let children = [
+                    emit_kind("quote"),
+                    emit_kind("trade"),
+                    emit_kind("instrument"),
+                    emit_kind("midpoint"),
+                    emit_kind("depth"),
+                    emit_kind("status"),
+                    emit_kind("book"),
+                ];
+                self.emit.push((id, children));
+                self.emit.len() - 1
+            }
         };
-        let venue = &self.venue;
-        self.emit.entry(id).or_insert_with(|| {
-            let id = id.to_string();
-            let emit_kind = |k: &str| {
-                metrics()
-                    .emit
-                    .with_label_values(&[venue.as_ref(), id.as_str(), k])
-            };
-            [
-                emit_kind("quote"),
-                emit_kind("trade"),
-                emit_kind("instrument"),
-                emit_kind("midpoint"),
-                emit_kind("depth"),
-                emit_kind("status"),
-                emit_kind("book"),
-            ]
-        })
+        &self.emit[idx].1
     }
 
     fn new(venue: &Arc<str>) -> Self {
@@ -1723,7 +1729,8 @@ impl VenueMetrics {
         };
         Self {
             venue: venue.clone(),
-            emit: HashMap::new(),
+            emit: Vec::new(),
+            unregistered: venue.as_ref() == crate::ingest::sources::UNREGISTERED,
             quotes_admitted: by_pub(&m.quotes_admitted),
             trades_admitted: by_pub(&m.trades_admitted),
             quote_ticks_won: by_pub(&m.quote_ticks_won),

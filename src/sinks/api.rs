@@ -407,7 +407,7 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         "price_increment": price_increment_string(i.tick_size, i.price_exponent),
         "base_increment": increment_string(i.qty_exponent),
         // The product's own engine: two Source IDs sharing one name keep separate health.
-        "status": if state.health.source_up(i.venue.as_ref(), i.source_id) { "online" } else { "offline" },
+        "status": if state.health.source_up(feeds(), i.venue.as_ref(), i.source_id) { "online" } else { "offline" },
     });
     let (feed_kind, book_complete) = feed_kind_for(state, i);
     entry["feed_kind"] = json!(feed_kind);

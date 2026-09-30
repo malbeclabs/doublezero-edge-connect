@@ -27,7 +27,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::ingest::feeds::FeedKind;
+use crate::ingest::feeds::{Feed, FeedKind};
 
 /// Identity of one receiver: `(venue, category, kind, base port)`. **The same tuple** as
 /// `reconcile::FeedKey`, which is what lets the reconciler pass its own keys to [`FeedHealth::liveness`]
@@ -208,23 +208,21 @@ impl FeedHealth {
     }
 
     /// The health of the engine behind wire Source ID `source_id`, named `venue`: its own
-    /// [`StatusKey`] when a registered row declares that ID, else the name-level `(venue, None)`
+    /// [`StatusKey`] when a row in `rows` declares that ID, else the name-level `(venue, None)`
     /// aggregate every undeclared row reports under. What a per-product `status` reads, since a
     /// product carries its own Source ID.
-    pub fn source_up(&self, venue: &str, source_id: u16) -> bool {
-        let state = self.lock();
-        let declared = state
-            .status_of
-            .values()
-            .find(|(v, id)| *v == venue && *id == Some(source_id));
-        match declared {
-            Some(&status) => status_up_in(&state, status),
-            None => state
-                .status_of
-                .values()
-                .find(|(v, id)| *v == venue && id.is_none())
-                .is_some_and(|&status| status_up_in(&state, status)),
-        }
+    ///
+    /// Decided from the **registry**, never from which receivers happen to be registered: an
+    /// engine whose declaring row is not running (unsubscribed, never bound, filtered out) must
+    /// read offline rather than borrow the health of an undeclared row sharing its name.
+    pub fn source_up(&self, rows: &[Feed], venue: &str, source_id: u16) -> bool {
+        let Some(row) = rows.iter().find(|f| f.venue == venue) else {
+            return false; // no row carries this name: nothing registers under it
+        };
+        let declared = rows
+            .iter()
+            .any(|f| f.venue == venue && f.source_id == Some(source_id));
+        self.status_up((row.venue, declared.then_some(source_id)))
     }
 
     /// This receiver's liveness as the reconciler's tape ownership orders it — a **three**-state
@@ -463,6 +461,21 @@ mod tests {
         h.register(k, id, |v| edge.set(Some(v)));
         edge.get()
     }
+    /// A registry row for `source_up`, which decides the status key from the rows.
+    fn row(venue: &'static str, category: &'static str, source_id: Option<u16>) -> Feed {
+        Feed {
+            venue,
+            category,
+            code: "c",
+            kind: FeedKind::TopOfBook,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 23),
+            publishers: &[],
+            emit_trades: true,
+            arbitration: crate::ingest::feeds::ArbitrationMode::Sticky,
+            mirror_offset: None,
+            source_id,
+        }
+    }
 
     /// The point of the status key: one live engine must not mask the other's outage.
     #[test]
@@ -480,8 +493,29 @@ mod tests {
         assert!(!h.status_up(("TwoEngines", Some(8))));
         assert!(h.status_up(("TwoEngines", Some(6))), "perp unaffected");
 
-        assert!(!h.source_up("TwoEngines", 8));
-        assert!(h.source_up("TwoEngines", 6));
+        let rows = [
+            row("TwoEngines", "usdsm", Some(6)),
+            row("TwoEngines", "spot", Some(8)),
+        ];
+        assert!(!h.source_up(&rows, "TwoEngines", 8));
+        assert!(h.source_up(&rows, "TwoEngines", 6));
+    }
+
+    /// An engine whose declaring row is not running must read offline, never borrow the health of
+    /// an undeclared row that shares its name and is streaming.
+    #[test]
+    fn a_declared_engine_not_running_does_not_borrow_the_name_level_health() {
+        let h = FeedHealth::new();
+        let rows = [row("Mixed", "usdsm", Some(6)), row("Mixed", "other", None)];
+        register_as(&h, ("Mixed", "other", FeedKind::TopOfBook, 9001), None);
+        assert!(
+            h.source_up(&rows, "Mixed", 7),
+            "an undeclared ID reads the name level"
+        );
+        assert!(
+            !h.source_up(&rows, "Mixed", 6),
+            "ID 6's row declares it and has no receiver registered"
+        );
     }
 
     /// A row that declares no ID keeps the name-level key, and a product whose ID no row declares
@@ -492,10 +526,11 @@ mod tests {
         let k = ("NameLevel", C, FeedKind::TopOfBook, 9001);
         assert_eq!(register_as(&h, k, None), Some(true));
         assert!(h.status_up(("NameLevel", None)));
-        assert!(h.source_up("NameLevel", 1), "any ID under the name");
-        assert!(h.source_up("NameLevel", 7));
+        let rows = [row("NameLevel", C, None)];
+        assert!(h.source_up(&rows, "NameLevel", 1), "any ID under the name");
+        assert!(h.source_up(&rows, "NameLevel", 7));
         set(&h, k, false);
-        assert!(!h.source_up("NameLevel", 1));
+        assert!(!h.source_up(&rows, "NameLevel", 1));
     }
 
     /// The reconciler passes its own `FeedKey` to `liveness`; the status key must not have changed

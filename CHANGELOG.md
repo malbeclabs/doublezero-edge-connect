@@ -346,7 +346,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `venue`, so a mismatch refuses the document). A row that declares one aggregates its health under
   `(venue, source_id)`, emits the wire `status` for that ID alone, and gets its own `/v1/status`
   entry carrying `source_id`, which `doublezero-edge status`/`diagnose` render as `VENUE (source N)`;
-  a product's `status` reads its own engine. Rows that declare none behave exactly as before.
+  a product's `status` reads its own engine — offline while that engine's declaring row is not
+  running, never borrowed from an undeclared row sharing the name. A row that declares none behaves
+  exactly as before, except that it no longer emits `status` for an ID another row declares.
   Metric labels: `category` on `dz_datagrams_received_total`, `dz_datagram_bytes_total`,
   `dz_socket_errors_total`, `dz_idle_rejoin_total`, `dz_receiver_up` and `dz_seq_events_total`;
   `source_id` on `dz_emit_total`, `dz_feed_up` and `dz_feed_stale_ms` (see `docs/metrics.md`).
