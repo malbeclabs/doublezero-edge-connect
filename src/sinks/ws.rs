@@ -44,8 +44,9 @@ struct PreparedFrame {
     kind: &'static str,
     /// The message's venue, for subscription filtering.
     venue: Arc<str>,
-    /// The message's wire Source ID, for subscription filtering: several IDs may share one venue
-    /// name, and this is what tells them apart.
+    /// The message's Source ID, for subscription filtering: several IDs may share one venue name,
+    /// and this is what tells them apart. For a `book`/`order_book` frame it is `book_market`'s
+    /// (collapsed) id rather than the wire field — see [`prepare`].
     source_id: u16,
     /// The message's symbol, or `None` for a venue-level `status` (matched by venue alone).
     symbol: Option<Arc<str>>,
@@ -179,11 +180,19 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
         ),
         _ => (None, 0),
     };
+    // ⚠️ A book frame filters on its replay key's id, never the wire field. The bootstrap
+    // (`replay_scoped`, `withheld_bootstrap`) only has the `SourceKey`, which collapses every ID
+    // past the unregistered-source cap to `0`; filtering the live frame on the wire id instead would
+    // hand a `{"source_id":N}` subscriber incremental batches for a market whose bootstrap it was
+    // refused — a book it does not hold.
+    let source_id = book_market
+        .as_ref()
+        .map_or_else(|| m.source_id(), |k| k.0.id());
     Some(Arc::new(PreparedFrame {
         payload,
         kind,
         venue,
-        source_id: m.source_id(),
+        source_id,
         symbol,
         channel: m.channel(),
         book_market,
@@ -1081,6 +1090,25 @@ mod tests {
         serde_json::from_str(json).expect("filter parses")
     }
 
+    /// The next text frame within `within`, skipping the server's heartbeat Pings; `None` on timeout.
+    async fn next_text<S>(ws: &mut S, within: Duration) -> Option<String>
+    where
+        S: futures_util::StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        timeout(within, async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(WsMessage::Text(t))) => return t.to_string(),
+                    Some(Ok(_)) => continue,
+                    other => panic!("stream ended: {other:?}"),
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
     #[test]
     fn venue_matches_case_insensitively() {
         // The wire venue is `Phoenix`; a filter spelled any case must still select it (the
@@ -1282,6 +1310,27 @@ mod tests {
                 .channel,
             None
         );
+    }
+
+    /// A book frame is filtered on the same `source_id` its bootstrap is: the replay key's. Past the
+    /// unregistered-source cap that key collapses every ID to `0`, so a live frame filtered on its
+    /// wire id would reach a `{"source_id":N}` subscriber whose bootstrap `replay_scoped` refused.
+    #[test]
+    fn a_book_frame_filters_on_its_replay_keys_source_id() {
+        use super::prepare;
+        let unregistered = crate::ingest::sources::UNREGISTERED;
+        let mut b = book_batch("X", Vec::new(), true);
+        b.venue = unregistered.into();
+        b.source_name = unregistered.into();
+        b.source_id = 4242;
+        let f = prepare(&FeedMessage::Book(b)).expect("serializes");
+        assert_eq!(f.book_market.as_ref().map(|k| k.0.id()), Some(0));
+        assert_eq!(f.source_id, 0, "the replay key's id, not the wire's");
+
+        let mut q = sample_quote();
+        q.source_id = 4242;
+        let f = prepare(&FeedMessage::Quote(q)).expect("serializes");
+        assert_eq!(f.source_id, 4242, "a non-book frame keeps its wire id");
     }
 
     #[test]
@@ -1517,26 +1566,6 @@ mod tests {
             .await
             .unwrap();
 
-        // The next text frame, skipping the server's heartbeat Pings.
-        async fn next_text<S>(ws: &mut S, within: Duration) -> Option<String>
-        where
-            S: futures_util::StreamExt<
-                    Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
-                > + Unpin,
-        {
-            timeout(within, async {
-                loop {
-                    match ws.next().await {
-                        Some(Ok(WsMessage::Text(t))) => return t.to_string(),
-                        Some(Ok(_)) => continue,
-                        other => panic!("stream ended: {other:?}"),
-                    }
-                }
-            })
-            .await
-            .ok()
-        }
-
         // Connect-time replay is unfiltered: both definitions arrive.
         let mut connect_replay = Vec::new();
         for _ in 0..2 {
@@ -1643,25 +1672,6 @@ mod tests {
             .await
             .unwrap();
 
-        async fn next_text<S>(ws: &mut S, within: Duration) -> Option<String>
-        where
-            S: futures_util::StreamExt<
-                    Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
-                > + Unpin,
-        {
-            timeout(within, async {
-                loop {
-                    match ws.next().await {
-                        Some(Ok(WsMessage::Text(t))) => return t.to_string(),
-                        Some(Ok(_)) => continue,
-                        other => panic!("stream ended: {other:?}"),
-                    }
-                }
-            })
-            .await
-            .ok()
-        }
-
         // The unfiltered connect replay carries both engines' definitions.
         for _ in 0..2 {
             next_text(&mut ws, Duration::from_secs(2))
@@ -1682,8 +1692,12 @@ mod tests {
         let replayed = next_text(&mut ws, Duration::from_secs(2))
             .await
             .expect("scoped replay frame");
+        // Parsed rather than substring-matched: `"source_id":8` is also a prefix of `"source_id":80`.
+        let source_id_of = |t: &str| {
+            serde_json::from_str::<serde_json::Value>(t).expect("json")["source_id"].as_u64()
+        };
         assert!(
-            replayed.contains("\"instrument\"") && replayed.contains("\"source_id\":8"),
+            replayed.contains("\"instrument\"") && source_id_of(&replayed) == Some(8),
             "got {replayed}"
         );
         assert_eq!(
@@ -1728,10 +1742,7 @@ mod tests {
             live.push(t);
         }
         assert_eq!(live.len(), 2, "only engine 8's quote and status: {live:?}");
-        assert!(
-            live.iter().all(|t| t.contains("\"source_id\":8")),
-            "{live:?}"
-        );
+        assert!(live.iter().all(|t| source_id_of(t) == Some(8)), "{live:?}");
 
         srv.abort();
     }
@@ -1796,25 +1807,6 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
             .unwrap();
-
-        async fn next_text<S>(ws: &mut S, within: Duration) -> Option<String>
-        where
-            S: futures_util::StreamExt<
-                    Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
-                > + Unpin,
-        {
-            timeout(within, async {
-                loop {
-                    match ws.next().await {
-                        Some(Ok(WsMessage::Text(t))) => return t.to_string(),
-                        Some(Ok(_)) => continue,
-                        other => panic!("stream ended: {other:?}"),
-                    }
-                }
-            })
-            .await
-            .ok()
-        }
 
         // Connect-time replay has no subscriptions to scope by: both definitions arrive.
         for _ in 0..2 {

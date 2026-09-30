@@ -963,8 +963,9 @@ Modules are grouped by role under `src/`:
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
   firehose) over five dimensions — `venue` (case-insensitive), `source_id` (the one that separates
   several Source IDs sharing a name, e.g. Binance's 6 and 8; `status` carries one too, so it gets
-  no carve-out), `symbol`, `channel` and message `type` — through **one** `SubFilter::matches` that both the symbol-bearing and the venue-level
-  (`status`) paths call, so a new dimension can't silently exempt half the feed; a channelless
+  no carve-out; a book frame matches on its replay key's id, since that is what its bootstrap is
+  matched on), `symbol`, `channel` and message `type` — through **one** `SubFilter::matches` that
+  both the symbol-bearing and the venue-level (`status`) paths call, so a new dimension can't silently exempt half the feed; a channelless
   message is excluded by an explicit `channel` filter, with `status` (venue-level) the one carve-out —
   `instrument` carries its own channel and is filtered like `book`, including on the replay path. Plus app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
   (max clients/subs/inbound-rate, broadcast backpressure where a slow client drops oldest). The

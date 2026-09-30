@@ -402,9 +402,10 @@ filter dimension (see [Subscriptions & filtering](#subscriptions--filtering)).
 Binance is the worked example: its USD-margined perpetuals are Source ID `6` and its spot market
 Source ID `8`, both named `BINANCE`, and both list `BTCUSDT`. `{"venue":"BINANCE","symbol":"BTCUSDT"}`
 delivers the perpetual's quotes *and* the spot quotes, interleaved, under one `venue` and one
-`symbol`; the two are told apart only by `source_id` (and, on `instrument`, by `channel`).
-`{"venue":"BINANCE","source_id":8,"symbol":"BTCUSDT"}` delivers the spot market alone, its `status`
-included.
+`symbol`; the two are told apart only by `source_id`. (`channel` is no substitute on `instrument`:
+nothing makes channel ids unique across engines, so both may use the same one.)
+`{"venue":"BINANCE","source_id":8,"symbol":"BTCUSDT"}` delivers the spot market alone, and only the
+`status` frames stamped `8`.
 
 **Planned for v2: `venue` names a matching engine, not a venue.** The edge-feed-spec glossary is explicit that a Source ID identifies one matching engine and that a venue may hold several IDs, so the field is misnamed as well as redundant. Retiring it — rather than merely deprecating it, which this release does — is a v2 change, and upstream's own `sources/spec.md` still describes the field the old way.
 
@@ -450,10 +451,13 @@ A subscription filter is `{ "source_name"?: string, "venue"?: string, "source_id
 
 `source_id` selects one Source ID — one matching engine — where several share a name (see
 [*Several Source IDs can share one name*](#source_name-source_id-and-the-deprecated-venue)). Every message carries a `source_id`,
-`status` included, so it has no venue-level carve-out: `{"source_id":8}` receives that engine's
-`status` and not its sibling's. It is additive: a bridge that predates it ignores the unknown key
-and delivers every engine under the name, which is why the `subscription_response` echo is worth
-checking — a bridge that honours the key echoes it back.
+`status` included, so it has no venue-level carve-out: `{"source_id":8}` receives the `status`
+frames stamped `8` and not those stamped `6`. ⚠️ A `status` is per engine only where the bridge's
+feed registry declares each engine's Source ID on its row; where it does not, liveness is
+aggregated per **name** and every ID under it carries the same `state`, so a `status` stamped `8`
+can read `ok` while only `6` is streaming. It is additive: a bridge that predates it ignores the
+unknown key and delivers every engine under the name, which is why the `subscription_response` echo
+is worth checking — a bridge that honours the key echoes it back.
 
 `source_name` and `venue` are aliases and are matched case-insensitively. The pre-rename `source` key
 is still accepted as a third spelling. All three are **ANDed**, so supplying any two that disagree
@@ -464,7 +468,7 @@ because an unknown filter key is *ignored*: dropping it would have widened a cli
 
 `venue`, `source_id`, `symbol` and `channel` are **scope** dimensions - which markets - and `type` is a **kind** dimension: which messages. The two behave differently on purpose.
 
-A scope dimension never excludes a message that is not about one market. A message type that carries no channel (everything except `book` and `instrument`) is excluded by an explicit `channel` filter, so `{"channel":2}` selects channel 2's book updates and channel 2's instrument definitions - enough to scale those books - and nothing else. The one carve-out is a venue-level message (`status`), which carries neither symbol nor channel and is matched on `venue` and `type` alone, so a `{"venue":"Hyperliquid","symbol":"SOL"}` subscriber still receives Hyperliquid status.
+A scope dimension other than `source_id` never excludes a message that is not about one market (`source_id` is carried by every message, `status` included, so it is matched on every type). A message type that carries no channel (everything except `book` and `instrument`) is excluded by an explicit `channel` filter, so `{"channel":2}` selects channel 2's book updates and channel 2's instrument definitions - enough to scale those books - and nothing else. The one carve-out is a venue-level message (`status`), which carries neither symbol nor channel and is matched on `venue`, `source_id` and `type` alone, so a `{"venue":"Hyperliquid","symbol":"SOL"}` subscriber still receives Hyperliquid status.
 
 A `type` filter is **absolute**: it delivers that message type and nothing else, including no `instrument` and no `status`. Filters are a union, so a consumer that wants books plus reference data and health subscribes to each - `{"type":"book"}`, `{"type":"order_book"}`, `{"type":"instrument"}`, `{"type":"status"}` - or omits `type` and scopes by `venue`/`symbol`/`channel` instead. A client that sets `type` and never asks for `instrument` gets the connect-time replay of the definitions that exist then, and no later ones; that is the filter it asked for.
 

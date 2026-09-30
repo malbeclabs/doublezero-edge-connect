@@ -459,7 +459,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subscription may now carry `"source_id": N` to follow one engine. It runs through the same single
   `SubFilter::matches` on the live and replay paths, applies to every kind including `status`
   (which carries its own `source_id`), and is additive: no protocol version change. PROTOCOL.md
-  documents it, with Binance as the worked example.
+  documents it, with Binance as the worked example. A `book`/`order_book` frame is matched on its
+  replay key's id, the one its bootstrap is matched on, so an ID past the unregistered-source cap
+  (collapsed to `0` there) can never receive incremental batches for a book it was not bootstrapped
+  with. `status` is stamped per ID; its liveness is per engine only where the feed registry
+  declares each engine's Source ID on its row, and per name otherwise.
 - A market withheld from the WebSocket bootstrap is now visible. `/v1/products` rows carry
   `book_complete` (`false`: no new subscriber gets this market's book), and
   `dz_book_bootstrap_lost_total` / `dz_book_bootstrap_withheld` are labelled by `venue`, `category`,
