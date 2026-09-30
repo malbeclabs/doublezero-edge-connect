@@ -146,6 +146,24 @@ Modules are grouped by role under `src/`:
   is the one place that announces which document actually won (`"feed registry resolved"`,
   `origin`/`version`/`rows`/`receivers`); `connect.sh` greps it after startup and echoes it, since
   the URL-failure fallback above is silent by design and that log line is the only signal.
+  **The document that URL serves is this file**, published by
+  `.github/workflows/release.feed-registry.yml` on every change to `registry.json` on `main` (the
+  bucket, distribution and OIDC role the `connect` one-liner already uses), so for a given commit the
+  `Url` and built-in copies are the same bytes and the `Origin` decides only *freshness*, not
+  content. It was hand-curated before that, and had drifted five weeks and six rows behind — which is
+  a production defect rather than an inconvenience, since a `Url` origin wins: the rows it was missing
+  simply did not run, and the `publisher_offset` it was missing doubled every mirrored Kalshi market
+  in the catalog. The cadence is the point that survives: a merge republishes, so a moved port
+  reaches the fleet at the next container start rather than the next image build. ⚠️ Which is also
+  why **any** document change an already-deployed binary rejects at parse or validation must be
+  released, and the fleet upgraded, *before* the document change merges: merging is the republish.
+  A `sources` assignment a deployed binary cannot resolve is one instance of that class, not the
+  class — the `version` check is an equality test rather than a floor, and `kind`/`arbitration` are
+  closed enums whose unknown variant fails the parse of the whole document — and every one of them
+  degrades that host to its built-in copy, losing the rest of the republish with it. ⚠️ The
+  workflow's own validation gate cannot catch the class, because it runs the loader from the commit
+  being published: a change bumping `SUPPORTED_VERSION` and the document `version` together passes
+  it and republishes to a fleet that rejects it. `docs/self-hosting.md` states the rule.
   There is deliberately **no `deny_unknown_fields`** anywhere in the module — same rule as
   `doublezero-edge/src/types.rs` — so an additive upstream change is ignored and reported by path at
   `warn`, never rejected; a *missing required* field stays fatal, so a typo cannot quietly default.

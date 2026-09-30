@@ -18,8 +18,10 @@ user-facing docs for all three.
 **Out, explicitly:**
 - Any change to how the bridge itself is deployed. It stays a container. The package carries the CLI
   and nothing else — no systemd unit, no dependencies, no maintainer scripts, nothing privileged.
-- The unified multi-repo feed registry. The hosted document is hand-curated for now; the plumbing to
-  combine feeds from several repos is a separate piece of work.
+- The unified multi-repo feed registry. The hosted document is this repo's own
+  `src/ingest/registry.json`, published by `release.feed-registry.yml` on every change to it (it was
+  hand-curated when this was written, and drifted five weeks and six rows behind before that
+  changed); the plumbing to combine feeds from several repos is a separate piece of work.
 - macOS and non-amd64. The installer is already Linux/amd64-only because the image is.
 
 ## Packaging

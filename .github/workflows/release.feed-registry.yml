@@ -1,0 +1,185 @@
+name: release.feed-registry
+
+# Publishes src/ingest/registry.json as the hosted feed-registry document behind
+# https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json — the URL the image
+# bakes into DZ_FEED_REGISTRY_URL. Same doublezero-install S3 bucket + CloudFront
+# distribution and the same OIDC deploy role as release.install-script.yml; only the key
+# differs.
+#
+# WHY THIS EXISTS. That document used to be hand-curated and uploaded by hand, and a
+# hand-curated document drifts: on 2026-09-18 the hosted copy was five weeks old and
+# carried three rows where the built-in copy carried nine (no Hyperliquid, no Phoenix, no
+# Kalshi elections), and no `publisher_offset` on any row. Drift is not a cosmetic problem
+# here, because a `Url` origin WINS over the copy compiled into the binary: a stale hosted
+# document silently downgrades every default container to whatever it says. The missing
+# `publisher_offset` alone made each mirrored Kalshi market appear in the catalog twice,
+# `products::resolve` report a bare `KALSHI:KXBTCPERP` as ambiguous, and `history::Key`
+# split each tape into two series — see `processor::tests::tob_mirror_offset_collapses_
+# catalog_identity`. Publishing the document from the file the tests validate is what
+# makes that class of drift impossible rather than merely noticed.
+#
+# The cadence is still the point of a hosted document: a merge to main republishes it, so
+# a new venue, a moved port or a channel-set change reaches the fleet at the next container
+# start with no image rebuild and no redeploy. It is the same cadence as the connect
+# scripts this repo already publishes.
+#
+# ⚠️ ORDERING, for any document change an ALREADY-DEPLOYED binary rejects. A document is
+# republished the moment it merges, and a rejection under a URL origin degrades the WHOLE
+# document to that host's built-in copy, losing every other change in the same republish. The
+# class is wider than the `sources` block it was first written for: a Source ID assignment a
+# deployed binary cannot resolve, a `version` bump (the loader's check is an equality test, not
+# a floor), and a new `kind` or `arbitration` value (closed enums — an unknown variant fails the
+# parse of the whole document, not of the row carrying it) all do it. So such a change is a
+# release FIRST, the fleet upgraded, and only then the document change merged.
+#
+# ⚠️ The validate step below does NOT cover that class and cannot: it runs the loader from THIS
+# commit, so a change that bumps `SUPPORTED_VERSION` and the document's `version` together
+# passes the gate and republishes a document the whole running fleet rejects. The gate proves
+# the document loads in the build it ships with; the ordering is what makes it load in the
+# builds already out there. docs/self-hosting.md states the rule; this comment is here because
+# this workflow is what makes "then" mean "on merge".
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/ingest/registry.json"
+      - ".github/workflows/release.feed-registry.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write # assume the AWS deploy role via OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  BUCKET: doublezero-install
+  KEY: feeds/doublezero-edge-feeds-latest.json
+  DOCUMENT: src/ingest/registry.json
+  # Account-scoped infra (deploy-role ARN incl. the AWS account ID, and the CloudFront
+  # distribution id) lives in repo Actions Variables so it is not baked into a public
+  # workflow — the same two variables release.install-script.yml reads.
+  DEPLOY_ROLE: ${{ vars.DEPLOY_ROLE }}
+  DISTRIBUTION_ID: ${{ vars.DISTRIBUTION_ID }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # `workflow_dispatch` runs the workflow definition from the ref it is dispatched on,
+    # and the deploy role trusts this repo rather than one ref of it — so without this a
+    # branch could dispatch its own edited copy of this file and publish whatever it liked
+    # to the production bucket. It does NOT make dispatch safe against someone who edits
+    # this line on their branch; what would is a ref-scoped trust policy or a protected
+    # deployment environment, and both live in the infra repo. This is the half that is
+    # ours: manual dispatch still works, but only against main.
+    if: github.ref == 'refs/heads/main'
+    # One lane for the moving key. Two pushes to main can otherwise validate
+    # concurrently and finish out of order, leaving `-latest` pointing at the older
+    # document while both runs report success. Modelled on the image publisher's lane
+    # (release.docker.edge-connect.build.yml), including why `queue: max` is the load-
+    # bearing part: by default a group holds one run plus ONE pending and a new arrival
+    # evicts that pending one, so a registry change could be silently dropped by a later
+    # unrelated push. With `queue: max` runs wait first-in-first-out and `-latest` ends up
+    # wherever the last arrival points.
+    concurrency:
+      group: edge-connect-feed-registry-publish
+      cancel-in-progress: false
+      # Not known to actionlint v1.7.12 (March 2026) — the key shipped in May 2026 — so
+      # .github/actionlint.yaml ignores that one message until a release knows it.
+      queue: max
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # The gate, and the reason this job compiles anything at all. A document the fleet
+      # cannot use is not rejected by the fleet: each host warns once and degrades to its
+      # own built-in copy, silently, one at a time as containers restart. So validation
+      # has to happen before the bytes leave, and it has to be the real loader rather
+      # than a JSON schema — `registry::tests::built_in_document_loads` runs the same
+      # parse + expand + validate path `feeds::init` runs at startup, and the rest of the
+      # module's tests cover the cross-row invariants (one arbitration mode per venue,
+      # global (group, port) uniqueness, one venue per MarketByOrder category, ...).
+      #
+      # Deliberately UNFILTERED. `--lib ingest::registry` reads as the tighter command and is
+      # the more dangerous one: a cargo test name filter that matches nothing exits 0
+      # ("0 passed; N filtered out"), so re-homing the module or renaming its tests would turn
+      # this gate into a no-op and publish unvalidated bytes with the run still green. The job
+      # already pays for the compile, so the whole lib suite costs the test runtime and removes
+      # the failure mode.
+      - name: Validate the document with the loader that will read it
+        run: cargo test --locked --lib
+
+      # Credentials are assumed only after the document has passed, so a job that is going
+      # to fail validation never holds a session that could write to the bucket.
+      - uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The immutable copy per commit is what makes the `-latest` in the moving key mean
+      # something: a rollback is a copy of a known-good key over -latest, and a host that
+      # must not move under a republish can pin DZ_FEED_REGISTRY_URL at one of these.
+      #
+      # It goes FIRST, and the order is the point rather than a preference: if -latest
+      # moved first and this upload then failed, the fleet would be serving a document
+      # whose promised pin and rollback target was never written — the one state an
+      # operator reaching for this key is already in trouble in.
+      - name: Upload the immutable per-commit copy
+        run: |
+          aws s3 cp "$DOCUMENT" "s3://${BUCKET}/feeds/doublezero-edge-feeds-${GITHUB_SHA}.json" \
+            --content-type application/json \
+            --cache-control "public,max-age=31536000,immutable"
+
+      # Byte-for-byte what the tests just validated and what `include_str!` compiles in,
+      # so "hosted" and "built-in" are the same document for this commit and the
+      # `origin` field in /v1/status stops being a thing that can disagree on content.
+      - name: Move -latest onto it
+        run: |
+          aws s3 cp "$DOCUMENT" "s3://${BUCKET}/${KEY}" \
+            --content-type application/json \
+            --cache-control "public,max-age=120"
+
+      # Only -latest needs invalidating; the per-commit key is new on every run.
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/${KEY}"
+
+      - name: Report what was published
+        run: |
+          python3 - "$DOCUMENT" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          rows = d["feeds"]
+
+          # Expanded the way `Loaded::info` counts receivers: one per explicit port
+          # block, one per DISTINCT derived channel id. These are the figures the startup
+          # log line and /v1/status report, so a host can be compared against them — which
+          # is exactly why the ids are deduped rather than summed. A published set is a
+          # human-edited list where a singleton overlapping a range is a plausible edit,
+          # and the loader collapses the repeat and merely warns
+          # (`published_set_entries`, pinned by `overlapping_published_set_entries_dedup`).
+          # Summing widths would print one receiver more than the host runs, and the
+          # difference would read as a host that lost one.
+          def receivers(f):
+              p = f["publishers"]
+              if "explicit" in p:
+                  return len(p["explicit"])
+              ids = set()
+              for c in p["derived"]["channels"]:
+                  if "range" in c:
+                      lo, hi = c["range"]
+                      ids.update(range(lo, hi + 1))
+                  else:
+                      ids.add(c["id"])
+              return len(ids)
+
+          print(f"version={d['version']} rows={len(rows)} receivers={sum(map(receivers, rows))}")
+          for f in rows:
+              print(f"  {f['venue']:12} {f['category']:12} {f['kind']:14} "
+                    f"{f['code']:32} receivers={receivers(f)}")
+          PY
