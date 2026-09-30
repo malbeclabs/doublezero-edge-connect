@@ -292,6 +292,10 @@ impl StickyAuthority {
         if self.path_ordinal(&scope_of(key), publisher) == OTHER_PATH {
             return;
         }
+        // Healthy is the absent default, so marking an untracked market healthy records nothing.
+        if healthy && !self.markets.contains_key(key) {
+            return;
+        }
         let m = self.market_mut(key);
         if healthy {
             m.unhealthy.remove(&publisher);
@@ -825,6 +829,13 @@ mod tests {
                 .contains_key(&(VENUE.into(), CATEGORY.into(), 2, 0)),
             "oldest evicted"
         );
+    }
+
+    #[test]
+    fn marking_an_absent_market_healthy_creates_no_entry() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        a.set_health(&key(), path(1), true);
+        assert!(a.markets.is_empty());
     }
 
     /// A path past the labelled cap is never authoritative, so a health report from one — the source IP address
