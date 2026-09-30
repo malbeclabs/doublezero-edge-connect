@@ -476,6 +476,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- **Binance feeds: USD-margined perpetuals and spot, Top-of-Book.** Two rows in the compiled-in
+  feed registry, `edge-binance-usdsm-tob` (group `233.84.178.23`, Source ID 6) and
+  `edge-binance-spot-tob` (`233.84.178.31`, Source ID 8), both `BINANCE`, both on ports
+  `30001`/`30002`, both `Sticky` and claiming the tape; each declares its `source_id`, so the two
+  engines keep separate health, `status` and `/v1/status` entries. Source IDs 6 and 8 join both the
+  document's `sources` block and the compiled-in fallback table, which a failed `Url` fetch degrades
+  to. A host activates a row only while subscribed to its code, so nothing changes on a host
+  subscribed to neither. Quotes only until the publisher sends `Trade`. The ports come from the
+  publisher's deployment inventory and the rows say they are unconfirmed until a capture checks them.
 - **`source_id` subscription filter dimension.** Several Source IDs may share one name — Binance's
   USD-margined perpetuals (6) and spot (8) are both `BINANCE` and both list `BTCUSDT` — and a
   `{"venue":"BINANCE","symbol":"BTCUSDT"}` subscriber receives both engines interleaved. A

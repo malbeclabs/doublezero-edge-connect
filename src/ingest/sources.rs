@@ -28,7 +28,7 @@ pub struct SourceAssignment {
 pub const HYPERLIQUID_SOURCE_ID: u16 = 1;
 
 /// The compiled-in mirror, used when the resolved document carries no `sources` block.
-const BUILT_IN: [SourceAssignment; 3] = [
+const BUILT_IN: [SourceAssignment; 5] = [
     SourceAssignment {
         id: HYPERLIQUID_SOURCE_ID,
         name: "HYPERLIQUID",
@@ -41,7 +41,21 @@ const BUILT_IN: [SourceAssignment; 3] = [
         id: 3,
         name: KALSHI,
     },
+    // Two matching engines under one name — USD-margined perpetuals and spot. Carried here as well
+    // as in the document because a `Url` failure degrades to the built-in copy, and the Binance
+    // rows must still resolve there.
+    SourceAssignment {
+        id: 6,
+        name: BINANCE,
+    },
+    SourceAssignment {
+        id: 8,
+        name: BINANCE,
+    },
 ];
+
+/// Source IDs 6 (USD-margined perpetuals) and 8 (spot)'s shared registry name.
+const BINANCE: &str = "BINANCE";
 
 /// The assignments in force, installed once by `ingest::feeds::init` alongside the feed rows.
 static INSTALLED: OnceLock<&'static [SourceAssignment]> = OnceLock::new();
@@ -193,7 +207,7 @@ mod tests {
         assert_eq!(source_name(2), Some("PHOENIX"));
     }
 
-    /// All three assigned production IDs resolve. The wire value is authoritative — a publisher
+    /// Every assigned production ID resolves. The wire value is authoritative — a publisher
     /// stamping the wrong ID is a publisher defect, fixed at the publisher; this crate reports what
     /// the wire says and never substitutes a row's own venue for it.
     #[test]
@@ -201,6 +215,14 @@ mod tests {
         assert_eq!(source_name(1), Some("HYPERLIQUID"));
         assert_eq!(source_name(2), Some("PHOENIX"));
         assert_eq!(source_name(3), Some(KALSHI));
+        assert_eq!(source_name(6), Some(BINANCE));
+        assert_eq!(source_name(8), Some(BINANCE));
+    }
+
+    /// Both Binance engines resolve under the one name, and neither swallows the other.
+    #[test]
+    fn both_binance_engines_resolve_under_one_name() {
+        assert_eq!(source_ids_of(BINANCE), vec![6, 8]);
     }
 
     /// Registry names are uppercase, so a consumer composing `SOURCE:SYMBOL` never has to case-fold

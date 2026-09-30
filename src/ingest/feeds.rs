@@ -471,6 +471,8 @@ mod tests {
                 ("KALSHI", "events", FeedKind::MarketByPrice) => "edge-kalshi-sports-mbp",
                 ("KALSHI", "elections", FeedKind::TopOfBook) => "edge-kalshi-elections-pol-tob",
                 ("KALSHI", "elections", FeedKind::MarketByPrice) => "edge-kalshi-elections-pol-mbp",
+                ("BINANCE", "usdsm", FeedKind::TopOfBook) => "edge-binance-usdsm-tob",
+                ("BINANCE", "spot", FeedKind::TopOfBook) => "edge-binance-spot-tob",
                 other => panic!("unexpected feed {other:?}"),
             };
             assert_eq!(f.code, expected, "{} {:?} has wrong code", f.venue, f.kind);
@@ -594,7 +596,10 @@ mod tests {
     /// no shared clock can declare it; a new such venue is the feature working, not a regression.
     #[test]
     fn existing_venues_are_coordinated() {
-        for f in feeds().iter().filter(|f| f.venue != "KALSHI") {
+        for f in feeds()
+            .iter()
+            .filter(|f| matches!(f.venue, "HYPERLIQUID" | "PHOENIX"))
+        {
             assert_eq!(f.arbitration, ArbitrationMode::Coordinated, "{}", f.venue);
         }
     }
@@ -799,6 +804,54 @@ mod tests {
         for f in [tob, mbp] {
             assert!(f.emit_trades, "{:?} must claim the tape", f.kind);
             assert_eq!(f.arbitration, ArbitrationMode::Sticky);
+        }
+    }
+
+    /// ⚠️ **Like the Kalshi test above, this pins document → expansion consistency and nothing
+    /// more.** Its literals were transcribed from the same place the document's were — the
+    /// publisher's deployment inventory — so it catches a later edit that moves a value and can never
+    /// catch one that was wrong when written. The external check is the packet capture under PORT
+    /// PROVENANCE in `CLAUDE.md`; until it passes, both rows say so in their `notes`.
+    ///
+    /// The two engines share a name, a kind and a port block, and differ in the group, the code, the
+    /// category and — the one thing their health and status are keyed on — the declared Source ID.
+    #[test]
+    fn the_binance_rows_expand_consistently_with_the_document() {
+        let row = |category| {
+            feeds()
+                .iter()
+                .find(|f| f.venue == "BINANCE" && f.category == category)
+                .unwrap_or_else(|| panic!("Binance {category} row"))
+        };
+        for (category, code, group, source_id) in [
+            (
+                "usdsm",
+                "edge-binance-usdsm-tob",
+                Ipv4Addr::new(233, 84, 178, 23),
+                6,
+            ),
+            (
+                "spot",
+                "edge-binance-spot-tob",
+                Ipv4Addr::new(233, 84, 178, 31),
+                8,
+            ),
+        ] {
+            let f = row(category);
+            assert_eq!(f.code, code);
+            assert_eq!(f.kind, FeedKind::TopOfBook);
+            assert_eq!(f.group, group);
+            assert_eq!(f.source_id, Some(source_id), "{category}");
+            assert_eq!(f.publishers.len(), 1, "{category}: one publisher");
+            let p = &f.publishers[0];
+            assert_eq!(
+                (p.ports.mktdata(), p.ports.refdata(), p.ports.snapshot()),
+                (30001, 30002, None)
+            );
+            assert_eq!(p.channel, None, "an explicit block carries no channel id");
+            assert!(f.emit_trades, "{category} must claim the tape");
+            assert_eq!(f.arbitration, ArbitrationMode::Sticky);
+            assert_eq!(f.mirror_offset, None);
         }
     }
 

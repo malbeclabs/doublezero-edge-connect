@@ -2091,6 +2091,28 @@ mod tests {
         assert!(loaded.rows.iter().all(|f| f.source_id.is_none()));
     }
 
+    /// The arbitration mode is keyed by venue alone, and the two Binance engines share one. The
+    /// built-in document with its spot row switched to `Coordinated` is refused rather than having
+    /// the venue's mode depend on which row the document happens to list last.
+    #[test]
+    fn the_binance_rows_disagreeing_on_arbitration_are_refused() {
+        let spot = r#""code": "edge-binance-spot-tob","#;
+        let at = BUILT_IN.find(spot).expect("the built-in spot row");
+        let (head, tail) = BUILT_IN.split_at(at);
+        let tail = tail.replacen(
+            r#""arbitration": "Sticky""#,
+            r#""arbitration": "Coordinated""#,
+            1,
+        );
+        let err = build(&format!("{head}{tail}"), "test")
+            .map(|_| ())
+            .expect_err("two modes for BINANCE");
+        assert!(
+            matches!(&err, RegistryError::ArbitrationDisagreement { venue } if venue == "BINANCE"),
+            "{err:?}"
+        );
+    }
+
     /// A document with no `sources` block checks the declared ID against the compiled-in table,
     /// the same table its `venue` resolves against.
     #[test]

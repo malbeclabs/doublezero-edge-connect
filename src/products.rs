@@ -311,6 +311,50 @@ mod tests {
         i
     }
 
+    /// The Binance shape: perps (Source ID 6, `channel_id` 0) and spot (8, `channel_id` 1) are both
+    /// `BINANCE`, and `BTCUSDT` is listed by both — here under the *same* instrument id, so only the
+    /// channel tells the suffixes apart. The bare id is ambiguous, both suffixed ids resolve back to
+    /// their own engine, and a symbol only spot lists stays bare.
+    #[test]
+    fn binance_btcusdt_needs_its_suffix_and_a_spot_only_symbol_does_not() {
+        let binance = |source_id, channel, symbol: &str, instrument_id| {
+            let mut i = instrument("c", symbol, channel, instrument_id);
+            i.source_id = source_id;
+            i.venue = "BINANCE".into();
+            i.source_name = "BINANCE".into();
+            i
+        };
+        let snap = snapshot(vec![
+            binance(6, 0, "BTCUSDT", 7),
+            binance(8, 1, "BTCUSDT", 7),
+            binance(8, 1, "ETHBTC", 9),
+        ]);
+
+        match resolve(&snap, &parse("BINANCE:BTCUSDT").unwrap()) {
+            Resolution::Ambiguous(mut rendered) => {
+                rendered.sort();
+                assert_eq!(rendered, vec!["BINANCE:BTCUSDT#0.7", "BINANCE:BTCUSDT#1.7"]);
+            }
+            other => panic!("both engines list BTCUSDT: {other:?}"),
+        }
+        for (raw, want) in [("BINANCE:BTCUSDT#0.7", 6), ("BINANCE:BTCUSDT#1.7", 8)] {
+            match resolve(&snap, &parse(raw).unwrap()) {
+                Resolution::One(p) => {
+                    assert_eq!(p.source_id, want, "{raw}");
+                    assert_eq!(p.render(true), raw);
+                }
+                other => panic!("{raw}: {other:?}"),
+            }
+        }
+        match resolve(&snap, &parse("BINANCE:ETHBTC").unwrap()) {
+            Resolution::One(p) => {
+                assert_eq!(p.source_id, 8);
+                assert_eq!(p.render(false), "BINANCE:ETHBTC");
+            }
+            other => panic!("a spot-only symbol is unique: {other:?}"),
+        }
+    }
+
     /// Distinct symbols under two IDs of one name resolve by name, each to its own ID.
     #[test]
     fn distinct_symbols_under_a_shared_name_resolve_to_their_own_id() {

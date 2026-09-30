@@ -90,7 +90,9 @@ generated from `edge-feed-spec/sources/spec.md`, which stays the authority for i
 "sources": [
   { "id": 1, "name": "HYPERLIQUID" },
   { "id": 2, "name": "PHOENIX" },
-  { "id": 3, "name": "KALSHI" }
+  { "id": 3, "name": "KALSHI" },
+  { "id": 6, "name": "BINANCE" },
+  { "id": 8, "name": "BINANCE" }
 ]
 ```
 
@@ -103,7 +105,7 @@ assign is not an error — the wire value is authoritative and gets a distinct s
 release.
 
 Where several ids share a name, a feed row may say which one it carries with an optional
-**`source_id`** (for example `"source_id": 6` on one row and `8` on its sibling). It never relabels
+**`source_id`** — Binance's USD-margined row declares `"source_id": 6` and its spot row `8`. It never relabels
 data — the wire value stays authoritative — it only keeps each engine's health, `status`,
 `/v1/status` entry and `dz_feed_up` series apart, so one live engine cannot mask the other's
 outage. It must be an id this document's `sources` block (or, with no block, the compiled-in table)

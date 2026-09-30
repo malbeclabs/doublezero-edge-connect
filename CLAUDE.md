@@ -248,7 +248,19 @@ Modules are grouped by role under `src/`:
   universes are separate because their `channel_id` ranges do not overlap — the allocation is
   mid-migration, the numbering is owned upstream and nothing here enforces it; the `category` is the
   only thing that separates them. Each expanded `FeedPublisher` records the `channel` it came from
-  (`None` on an explicit block) — the fact the channel filter below is built on.
+  (`None` on an explicit block) — the fact the channel filter below is built on. The two **Binance**
+  rows are the first venue where **several Source IDs share one name**: USD-margined perps
+  (`edge-binance-usdsm-tob`, group `233.84.178.23`, Source ID 6, category `usdsm`) and spot
+  (`edge-binance-spot-tob`, `233.84.178.31`, Source ID 8, category `spot`), both `BINANCE`, both
+  Top-of-Book on the **same** `30001`/`30002` block from one publisher host, both `Sticky` and
+  claiming the tape (quotes only until the publisher sends `Trade`). Nothing in the name, kind or
+  port tells them apart, so each row declares its **`source_id`** (see `ingest/health.rs`) and the
+  per-receiver metrics carry `category`; the two engines list overlapping symbols (`BTCUSDT`), which
+  is what the WS `source_id` filter and the `#channel.instrument` product-id suffix (channel `0` vs
+  `1`) exist for. ⚠️ Their ports come from the publisher's deployment inventory and are **not yet
+  confirmed by capture** — the rows' `notes` say so until PORT PROVENANCE's check passes. Only the
+  compiled-in rows carry `source_id` today: the hosted rows are copied from the publisher's fragments,
+  which gain it separately, and until then they report at the name-level `(BINANCE, None)` key.
 - **`ingest/channel_filter.rs`** — the **channel filter**: which channels of an activated feed this
   process decodes (`--channels`/`DZ_CHANNELS`, e.g. `edge-kalshi-sports-mbp=10,11`). It is an **allowlist**, not a
   threshold — the old name, "floor", implied a minimum, which is backwards: it restricts a set, and
