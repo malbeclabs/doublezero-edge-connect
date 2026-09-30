@@ -379,7 +379,11 @@ Modules are grouped by role under `src/`:
   never-binding receiver would otherwise flap `status` on every reconciler respawn) and deregisters
   on every exit path via `Drop`. The watchdog tracks the **mktdata** port only (refdata/snapshot keep
   ticking when market data is wedged). `DatagramCtx` carries the shared `arbiter` (not a raw `tx`);
-  `ctx.emit(msg)` routes through it tagged `Transport::Edge(src_ip)`.
+  `ctx.emit(msg)` routes through it tagged `Transport::Edge(src_ip)`. A receive waits at most
+  `TICK_INTERVAL` (the MBP `BOUNDARY_TIMEOUT_NS`); a timeout calls `DatagramProcessor::on_tick` (no-op
+  by default) and leaves the rejoin decision to the watchdog, so `MbpProcessor` closes the events a
+  **silent** block left open — without it a dead single-publisher channel held every consumer's
+  open event for good. The tick fires only when the whole port block is silent.
 - **`ingest/health.rs`** — `FeedHealth`: every receiver's liveness keyed `(venue, category, kind, base port)`
   (the same tuple as `reconcile::FeedKey`; `(venue, kind)` is not an identity once a venue carries two
   universes),
@@ -757,7 +761,9 @@ Modules are grouped by role under `src/`:
   computed (#163): an `InstrumentReset` purges `revealed` in the same message that reports unhealth,
   so the install that readmits the instrument has no venue to file under, and marking that report
   done would leave the path unhealthy at the gate with a `Ready` book — the market then sits on a
-  stale peer while a live path is on the wire. `send_book`'s own `Ready` gate is unchanged, so a path mid-rotation keeps the market
+  stale peer while a live path is on the wire. The memo also stores the `SourceKey` it filed under: a
+  report under a different one after a filed `false` first withdraws that unhealth, since an
+  `InstrumentReset` purges `revealed` and nothing would ever report on the old market again. `send_book`'s own `Ready` gate is unchanged, so a path mid-rotation keeps the market
   and publishes nothing until the install's re-baseline. ⚠️ **At every event close it asks the arbiter
   whether the replay entry is owed a republish** (`Arbiter::book_rebaselines_owed`: the entry is not
   `baselined()` and this path is `last_admitted`) and, if so, closes with `emit_rebaseline` instead of
@@ -773,7 +779,11 @@ Modules are grouped by role under `src/`:
   healthy peer or re-installs at its next rotation. Asked **only at a close**, never at a mid-event
   datagram end, or the republish would go out `last: true` holding an intermediate book. It also runs
   the shared `SeqTracker` per
-  publisher on the **market-data role only** and drops a `SeqCheck::Stale` datagram whole, as
+  publisher — **bounded** here alone (`SeqTracker::bounded`: an advance past `MAX_SEQ_ADVANCE`, 1,024,
+  is processed without moving the anchor, and `SEQ_RESEAT_NS`, 5 s, of such advances with none in
+  bound re-seats to the highest seen), so one forged high sequence cannot make every real boundary read
+  stale; top-of-book stays unbounded because its channel-0 sequence is global across groups and jumps
+  routinely — on the **market-data role only** and drops a `SeqCheck::Stale` datagram whole, as
   `TobProcessor` does: a stale datagram's deltas are refused as duplicates anyway, but a
   `BatchBoundary` carries no sequence of its own, so an old one moves `last_batch` backwards and
   closes every open event at a slot the venue has left — committing each consumer's buffer mid-event.

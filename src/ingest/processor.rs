@@ -30,7 +30,7 @@ use crate::{
             BeginOutcome, BookDelta, DeltaOp as PriceDeltaOp, DeltaOutcome, Divergence, PriceBook,
             Status as BookStatus, MAX_BUFFERED_DELTAS,
         },
-        receiver::{DatagramCtx, DatagramProcessor, SeqCheck, SeqTracker},
+        receiver::{DatagramCtx, DatagramProcessor, PortRole, SeqCheck, SeqTracker, TickCtx},
         reconcile::TapeOwner,
         sources::source_label,
         subscriber::{InstrumentDef, RefDataState},
@@ -82,7 +82,7 @@ impl WarnRateLimit {
 /// feed's lifetime), so the children are bound lazily on first use.
 #[derive(Default)]
 struct SeqEvents {
-    children: Option<[prometheus::IntCounter; 4]>,
+    children: Option<[prometheus::IntCounter; 6]>,
 }
 
 impl SeqEvents {
@@ -93,6 +93,8 @@ impl SeqEvents {
             SeqCheck::Ok => 1,
             SeqCheck::Reset => 2,
             SeqCheck::Stale => 3,
+            SeqCheck::Bounded => 4,
+            SeqCheck::Reseat => 5,
         }
     }
 
@@ -104,6 +106,8 @@ impl SeqEvents {
                 m.seq_events.with_label_values(&[venue, "ok"]),
                 m.seq_events.with_label_values(&[venue, "reset"]),
                 m.seq_events.with_label_values(&[venue, "stale"]),
+                m.seq_events.with_label_values(&[venue, "bounded"]),
+                m.seq_events.with_label_values(&[venue, "reseat"]),
             ]
         });
         children[Self::index(check)].inc();
@@ -132,6 +136,8 @@ struct PublisherSeq {
     trackers: HashMap<IpAddr, SeqTracker>,
     /// Insertion order of `trackers` keys, oldest at the front, for the eviction.
     order: VecDeque<IpAddr>,
+    /// Whether each tracker bounds its advance ([`SeqTracker::bounded`]).
+    bounded: bool,
 }
 
 impl PublisherSeq {
@@ -153,10 +159,17 @@ impl PublisherSeq {
             }
             self.order.push_back(publisher);
         }
+        let bounded = self.bounded;
         self.trackers
             .entry(publisher)
-            .or_default()
-            .check(channel_id, reset_count, sequence)
+            .or_insert_with(|| {
+                if bounded {
+                    SeqTracker::bounded()
+                } else {
+                    SeqTracker::default()
+                }
+            })
+            .check(channel_id, reset_count, sequence, now_mono_ns())
     }
 
     /// Drop every anchor for one publisher — for the caller that has just dropped the rest of that
@@ -505,7 +518,7 @@ impl DatagramProcessor for TobProcessor {
                     );
                     true
                 }
-                SeqCheck::First | SeqCheck::Ok => true,
+                SeqCheck::First | SeqCheck::Ok | SeqCheck::Bounded | SeqCheck::Reseat => true,
             }
         } else {
             true
@@ -2060,7 +2073,7 @@ const MAX_CHANNEL_KEYS: usize = 256;
 /// *inside* one busy slot, where it would fire mid-event and re-expose the intermediate books this
 /// closing exists to hide. Time has no such collision: the publisher emits one boundary per slot
 /// boundary, so five missed slots is not a slow venue, it is a venue that has stopped batching.
-const BOUNDARY_TIMEOUT_NS: u64 = 2_000_000_000;
+pub(crate) const BOUNDARY_TIMEOUT_NS: u64 = 2_000_000_000;
 
 /// Datagram backstop for the one case [`BOUNDARY_TIMEOUT_NS`] cannot be evaluated: `recv_ts_ns` is
 /// `0`, the crate-wide "not available" sentinel, so there is no clock to measure against. Set far
@@ -2237,9 +2250,11 @@ pub struct MbpProcessor {
     /// O(1) rather than a scan over `books` per datagram — which would cost most during exactly the
     /// cold start the budget exists for.
     buffered_total: usize,
-    /// Last `Ready`-ness reported per book, so health reaches the authority on transitions only.
-    /// Evicted in lockstep with `books`, so its keys are always a subset of `books`' keys.
-    health_reported: HashMap<PriceBookKey, bool>,
+    /// Last `Ready`-ness reported per book and the Source ID it was filed under, so health reaches
+    /// the authority on transitions only and an unhealthy entry left under a Source ID the book no
+    /// longer carries can be withdrawn. Evicted in lockstep with `books`, so its keys are always a
+    /// subset of `books`' keys.
+    health_reported: HashMap<PriceBookKey, (SourceKey, bool)>,
     /// Reused buffer for the levels a `BookClear` removed, so the clear path never allocates.
     cleared: Vec<(u8, i64)>,
     /// The wire Source ID revealed for a book key — absent until the FIRST message that carries one
@@ -2304,7 +2319,12 @@ impl MbpProcessor {
             reanchor_warn: WarnRateLimit::default(),
             shrink_warn: WarnRateLimit::default(),
             tape,
-            seq: PublisherSeq::default(),
+            // Bounded: its sequence is per channel, and a forged high one would otherwise make
+            // every real boundary read as stale.
+            seq: PublisherSeq {
+                bounded: true,
+                ..PublisherSeq::default()
+            },
             seq_events: SeqEvents::default(),
         }
     }
@@ -2614,9 +2634,6 @@ impl MbpProcessor {
     }
 
     fn report_health(&mut self, ctx: &DatagramCtx, key: &PriceBookKey, healthy: bool) {
-        if self.health_reported.get(key) == Some(&healthy) {
-            return;
-        }
         // `self.wire_venue(key)` — not `ctx.venue` — to match the `MarketKey` the arbiter itself
         // builds off the emitted `book`'s own venue field on admission (`b.venue.clone()`): a
         // health report keyed by the feed row's static venue would target a `MarketKey` no book
@@ -2635,18 +2652,29 @@ impl MbpProcessor {
         let Some(venue) = self.wire_venue(key) else {
             return;
         };
-        self.health_reported.insert(*key, healthy);
+        let filed = self.health_reported.insert(*key, (venue.clone(), healthy));
+        if filed.as_ref() == Some(&(venue.clone(), healthy)) {
+            return;
+        }
         // `ctx.category` for the same reason: the arbiter keys the market on the emitting row's
         // instrument universe, so a report filed without it targets nothing the gate ever admitted.
         // `ctx.canonical_channel`, not the raw `key.1`, so a mirror path's health report lands on
         // the SAME `MarketKey` `send_book` admits its `book` under — see `DatagramCtx::canonical_channel`.
-        let market: MarketKey = (
-            venue,
-            category_arc(ctx.category),
-            ctx.canonical_channel(key.1),
-            key.2,
-        );
-        lock(ctx.arbiter).set_book_health(&market, Transport::Edge(key.0), healthy);
+        let market = |venue| -> MarketKey {
+            (
+                venue,
+                category_arc(ctx.category),
+                ctx.canonical_channel(key.1),
+                key.2,
+            )
+        };
+        let mut arbiter = lock(ctx.arbiter);
+        // Unhealth filed under a Source ID the book has since moved off would otherwise stand for
+        // the life of the process: nothing reports on that market again.
+        if let Some((old, false)) = filed.filter(|(old, _)| *old != venue) {
+            arbiter.set_book_health(&market(old), Transport::Edge(key.0), true);
+        }
+        arbiter.set_book_health(&market(venue), Transport::Edge(key.0), healthy);
     }
 
     /// §4.9: discard everything a `Reset Count` change invalidated for one `(publisher, channel)` —
@@ -2854,6 +2882,35 @@ impl MbpProcessor {
         }
     }
 
+    /// Close every event still open on this channel once its boundaries have lapsed — a republish
+    /// for the markets in `owed`, an empty closing batch for the rest.
+    fn close_open(&mut self, ctx: &DatagramCtx, channel: u8, owed: &BTreeSet<u32>) {
+        let mut refused: BTreeSet<u32> = BTreeSet::new();
+        for id in self.take_open(ctx.publisher, channel) {
+            let published = if owed.contains(&id) {
+                self.emit_rebaseline(ctx, channel, id)
+            } else {
+                self.send_book(ctx, channel, id, Vec::new(), false, true)
+            };
+            if !published {
+                // ⚠️ This runs only once the boundaries have already lapsed, so a refused close
+                // that is forgotten here is the wedge the fallback exists to end: nothing re-opens
+                // the instrument, every later drain finds it gone, and the consumer buffers that
+                // event for the life of the session. Owed until it is published.
+                refused.insert(id);
+            }
+        }
+        if !refused.is_empty() {
+            metrics()
+                .mbp_closes_refused
+                .with_label_values(&[ctx.venue])
+                .inc_by(refused.len() as u64);
+            if let Some(state) = self.batching.get_mut(&(ctx.publisher, channel)) {
+                state.open.extend(refused);
+            }
+        }
+    }
+
     /// Take the instruments still owed a closing batch on this channel, leaving none behind.
     fn take_open(&mut self, publisher: IpAddr, channel: u8) -> BTreeSet<u32> {
         self.batching
@@ -2935,6 +2992,36 @@ fn divergence_label(d: Divergence) -> &'static str {
 }
 
 impl DatagramProcessor for MbpProcessor {
+    /// The boundary fallback for a channel that has gone silent: with no datagram arriving, the
+    /// datagram path never runs to close what the vanished boundaries left open.
+    fn on_tick(&mut self, tick: &TickCtx) {
+        let overdue: Vec<(IpAddr, u8)> = self
+            .batching
+            .iter()
+            .filter(|(_, b)| b.seen && !b.open.is_empty() && b.boundary_overdue(tick.now_ns))
+            .map(|(k, _)| *k)
+            .collect();
+        for (publisher, channel) in overdue {
+            let ctx = DatagramCtx {
+                venue: tick.venue,
+                category: tick.category,
+                arbiter: tick.arbiter,
+                instruments: tick.instruments,
+                kernel_rx_ts_ns: 0,
+                recv_ts_ns: tick.now_ns,
+                role: PortRole::Mktdata,
+                publisher,
+                mirror_offset: tick.mirror_offset,
+            };
+            if let Some(state) = self.batching.get_mut(&(publisher, channel)) {
+                state.slot_lapsed = true;
+            }
+            let open = self.batching[&(publisher, channel)].open.clone();
+            let owed = self.rebaselines_owed(&ctx, channel, open);
+            self.close_open(&ctx, channel, &owed);
+        }
+    }
+
     fn on_datagram(&mut self, buf: &[u8], ctx: &DatagramCtx) {
         let (header, messages) = match codec_mbp::decode_datagram(buf) {
             Ok(v) => v,
@@ -3813,30 +3900,7 @@ impl DatagramProcessor for MbpProcessor {
         // whatever the vanished boundaries left open is closed with them rather than held by a
         // consumer for the life of the session.
         if closes_event {
-            let mut refused: BTreeSet<u32> = BTreeSet::new();
-            for id in self.take_open(ctx.publisher, channel) {
-                let published = if owed.contains(&id) {
-                    self.emit_rebaseline(ctx, channel, id)
-                } else {
-                    self.send_book(ctx, channel, id, Vec::new(), false, true)
-                };
-                if !published {
-                    // ⚠️ This path runs only once the boundaries have already lapsed, so a refused
-                    // close that is forgotten here is the wedge the fallback exists to end: nothing
-                    // re-opens the instrument, every later drain finds it gone, and the consumer
-                    // buffers that event for the life of the session. Owed until it is published.
-                    refused.insert(id);
-                }
-            }
-            if !refused.is_empty() {
-                metrics()
-                    .mbp_closes_refused
-                    .with_label_values(&[ctx.venue])
-                    .inc_by(refused.len() as u64);
-                if let Some(state) = self.batching.get_mut(&(ctx.publisher, channel)) {
-                    state.open.extend(refused);
-                }
-            }
+            self.close_open(ctx, channel, &owed);
         }
         for id in touched {
             let key = (ctx.publisher, channel, id);
@@ -3888,7 +3952,7 @@ mod tests {
             codec_mbp::{self, tests as mbp_wire, SIDE_ASK as MBP_ASK, SIDE_BID as MBP_BID},
             codec_midpoint::{self, tests as midpoint_wire},
             pricebook::{BookDelta, DeltaOp as PriceDeltaOp, Status as BookStatus},
-            receiver::{DatagramCtx, DatagramProcessor, PortRole},
+            receiver::{DatagramCtx, DatagramProcessor, PortRole, TickCtx},
         },
         metrics::metrics,
         model::{
@@ -7846,8 +7910,8 @@ mod tests {
         );
         let _ = drain_books(&mut rx);
         assert_eq!(
-            proc.health_reported.get(&key),
-            Some(&true),
+            proc.health_reported.get(&key).map(|r| r.1),
+            Some(true),
             "precondition: the market is serving"
         );
 
@@ -7864,8 +7928,8 @@ mod tests {
             "precondition: the rotation was accepted over the live book"
         );
         assert_eq!(
-            proc.health_reported.get(&key),
-            Some(&true),
+            proc.health_reported.get(&key).map(|r| r.1),
+            Some(true),
             "a rotation over a live book must file no unhealth"
         );
 
@@ -7882,7 +7946,7 @@ mod tests {
 
         proc.on_datagram(&mbp_wire::datagram(0, 0, 13, rest), &snap());
         assert_eq!(mbp_status(&proc, TEST_PUB, 0, 41), Some(BookStatus::Ready));
-        assert_eq!(proc.health_reported.get(&key), Some(&true));
+        assert_eq!(proc.health_reported.get(&key).map(|r| r.1), Some(true));
         assert!(
             !drain_books(&mut rx).is_empty(),
             "the install re-baselines the market — one publisher-driven re-baseline per rotation"
@@ -7952,6 +8016,56 @@ mod tests {
         );
     }
 
+    /// An instrument reset under Source ID 0 and readmitted under ID 1: the unhealth filed under
+    /// the old market must be withdrawn, or that entry says this path is gapped there for good.
+    #[test]
+    fn an_instrument_readmitted_under_a_new_source_id_clears_the_old_markets_unhealth() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
+        let market = |id: u16| -> MarketKey {
+            (
+                crate::model::SourceKey::from_id(id),
+                category_arc("testcategory"),
+                0,
+                41,
+            )
+        };
+        let healthy = |id: u16| {
+            lock(&arbiter)
+                .authority()
+                .healthy(&market(id), Transport::Edge(TEST_PUB))
+        };
+        let mkt = || make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 10, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &mkt(),
+        );
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 11, &[mbp_reset(41, 11)]), &mkt());
+        assert!(!healthy(0), "precondition: unhealth filed under ID 0");
+
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                12,
+                &mbp_snapshot(41, 2, 11, 0, &[(MBP_BID, 6300, 20)]),
+            ),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                13,
+                &[mbp_level_with_source(41, 1, MBP_BID, 6400, 30, 7_002, 1)],
+            ),
+            &mkt(),
+        );
+        let _ = drain_books(&mut rx);
+        assert!(healthy(1), "the new market is served by this path");
+        assert!(healthy(0), "the old market's unhealth was withdrawn");
+    }
+
     /// The converse, and what keeps a broken book off the wire: a group assembling over a book that
     /// was **not** being served is a cold rebuild, so the market stays unhealthy — and with it, on
     /// the peer — until the group installs.
@@ -7972,7 +8086,7 @@ mod tests {
         );
         let _ = drain_books(&mut rx);
         assert_eq!(mbp_status(&proc, TEST_PUB, 0, 41), Some(BookStatus::Gap));
-        assert_eq!(proc.health_reported.get(&key), Some(&false));
+        assert_eq!(proc.health_reported.get(&key).map(|r| r.1), Some(false));
 
         let rotation = mbp_snapshot(41, 2, 500, 9, &[(MBP_BID, 6300, 20)]);
         let (begin, rest) = rotation.split_first().unwrap();
@@ -7982,12 +8096,12 @@ mod tests {
             &snap(),
         );
         assert_eq!(
-            proc.health_reported.get(&key),
-            Some(&false),
+            proc.health_reported.get(&key).map(|r| r.1),
+            Some(false),
             "the group is assembling over an empty book: nothing to serve yet"
         );
         proc.on_datagram(&mbp_wire::datagram(0, 0, 13, rest), &snap());
-        assert_eq!(proc.health_reported.get(&key), Some(&true));
+        assert_eq!(proc.health_reported.get(&key).map(|r| r.1), Some(true));
     }
 
     /// ⚠️ **The sequence anchor is per-publisher state on an unauthenticated wire, so it goes when
@@ -8664,6 +8778,87 @@ mod tests {
         );
     }
 
+    fn tick_at<'a>(
+        arbiter: &'a SharedArbiter,
+        instruments: &'a crate::model::InstrumentSnapshot,
+        now_ns: u64,
+    ) -> TickCtx<'a> {
+        TickCtx {
+            venue: "TV",
+            category: "testcategory",
+            arbiter,
+            instruments,
+            now_ns,
+            mirror_offset: None,
+        }
+    }
+
+    const TICK_T0: u64 = 1_700_000_000_000_000_000;
+
+    /// 41's event opened at `TICK_T0 + 1` after a boundary at `TICK_T0`, and then the channel went
+    /// silent: no datagram left to run the fallback.
+    fn dead_channel_with_an_open_event() -> (
+        SharedArbiter,
+        broadcast::Receiver<std::sync::Arc<FeedMessage>>,
+        crate::model::InstrumentSnapshot,
+        MbpProcessor,
+    ) {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
+        let at = |ns: u64| {
+            let mut c = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+            c.recv_ts_ns = ns;
+            c
+        };
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 0)]),
+            &at(TICK_T0),
+        );
+        let boundary = mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+            batch_id: 900,
+            batch_time: 5,
+        });
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 4, &[boundary]), &at(TICK_T0));
+        let _ = drain_books(&mut rx);
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 5, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &at(TICK_T0 + 1),
+        );
+        let opened = drain_books(&mut rx);
+        assert!(
+            !opened.is_empty() && opened.iter().all(|b| !b.last),
+            "precondition: 41's event is open"
+        );
+        (arbiter, rx, instruments, proc)
+    }
+
+    #[test]
+    fn mbp_a_tick_closes_an_event_a_dead_channel_left_open() {
+        let (arbiter, mut rx, instruments, mut proc) = dead_channel_with_an_open_event();
+        proc.on_tick(&tick_at(
+            &arbiter,
+            &instruments,
+            TICK_T0 + super::BOUNDARY_TIMEOUT_NS + 2,
+        ));
+        let closed = drain_books(&mut rx);
+        assert_eq!(closed.len(), 1, "exactly one closing batch, got {closed:?}");
+        assert!(closed[0].last && closed[0].changes.is_empty());
+        assert_eq!(closed[0].batch_id, None, "the boundaries have lapsed");
+        assert!(proc.batching[&(TEST_PUB, 0)].open.is_empty());
+    }
+
+    #[test]
+    fn mbp_a_tick_before_the_timeout_closes_nothing() {
+        let (arbiter, mut rx, instruments, mut proc) = dead_channel_with_an_open_event();
+        proc.on_tick(&tick_at(
+            &arbiter,
+            &instruments,
+            TICK_T0 + super::BOUNDARY_TIMEOUT_NS,
+        ));
+        assert!(drain_books(&mut rx).is_empty());
+        assert!(proc.batching[&(TEST_PUB, 0)].open.contains(&41));
+    }
+
     /// The datagram backstop, which is reachable only where `recv_ts_ns` is the `0` sentinel and
     /// there is no clock to measure the timeout on. Same outcome, counted rather than timed.
     #[test]
@@ -9286,6 +9481,37 @@ mod tests {
             "no close was a re-baseline"
         );
         assert!(m.replay_baselined());
+    }
+
+    /// The serving path owes a republish and then goes silent mid-event: the tick's close is that
+    /// republish, not an empty batch.
+    #[test]
+    fn mbp_a_tick_close_republishes_an_owed_market() {
+        let mut m = MirroredMarket::new();
+        let mut ctx = make_ctx(&m.arbiter, &m.instruments, PortRole::Mktdata);
+        ctx.publisher = PATH_A;
+        ctx.recv_ts_ns = TICK_T0;
+        m.proc
+            .on_datagram(&mbp_wire::datagram(0, 0, 5, &[m.boundary(901)]), &ctx);
+        let mut seq = 10;
+        m.requote(PATH_A, &mut seq, 0, PAST_THE_CAP);
+        assert!(!m.replay_baselined(), "precondition: the republish is owed");
+        let _ = drain_books(&mut m.rx);
+
+        m.proc.on_tick(&tick_at(
+            &m.arbiter,
+            &m.instruments,
+            TICK_T0 + super::BOUNDARY_TIMEOUT_NS + 1,
+        ));
+        let closed = drain_books(&mut m.rx);
+        assert_eq!(closed.len(), 1);
+        assert!(closed[0].last);
+        assert_eq!(closed[0].changes[0].action, BookAction::Clear);
+        let bootstrap = new_subscriber_bootstrap(&m.replay, &m.key).expect("released");
+        assert_eq!(
+            consumer_levels(&bootstrap),
+            price_book_levels(&m.proc, PATH_A, 41)
+        );
     }
 
     /// An owed republish waits for the venue's consistency point. Published at a datagram's end
@@ -11173,8 +11399,8 @@ mod tests {
             "the short book stops being served rather than being republished as complete"
         );
         assert_eq!(
-            proc.health_reported.get(&(TEST_PUB, 0, 41)),
-            Some(&false),
+            proc.health_reported.get(&(TEST_PUB, 0, 41)).map(|r| r.1),
+            Some(false),
             "the path is reported unhealthy, so the gate hands the market to its peer"
         );
         assert!(
@@ -11197,8 +11423,8 @@ mod tests {
             "Clear plus all 548 levels"
         );
         assert_eq!(
-            proc.health_reported.get(&(TEST_PUB, 0, 41)),
-            Some(&true),
+            proc.health_reported.get(&(TEST_PUB, 0, 41)).map(|r| r.1),
+            Some(true),
             "and the path takes the market back"
         );
     }

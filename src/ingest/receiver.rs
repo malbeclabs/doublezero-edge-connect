@@ -281,6 +281,32 @@ pub trait DatagramProcessor {
     /// Decode and handle one received datagram. Errors are the processor's own concern (it logs
     /// and drops); the driver only deals with socket/transport errors.
     fn on_datagram(&mut self, buf: &[u8], ctx: &DatagramCtx);
+
+    /// Called when no datagram has arrived on any of the receiver's ports for [`TICK_INTERVAL`], so
+    /// time-driven work (the MBP boundary fallback) still runs on a silent block.
+    fn on_tick(&mut self, _ctx: &TickCtx) {}
+}
+
+/// The longest the receive loop waits without calling [`DatagramProcessor::on_tick`]: the MBP
+/// boundary fallback's own timeout, so a dead channel closes its open events at most one interval
+/// late.
+pub(crate) const TICK_INTERVAL: Duration =
+    Duration::from_nanos(crate::ingest::processor::BOUNDARY_TIMEOUT_NS);
+
+/// How long one receive waits: the watchdog's remaining idle time, capped at [`TICK_INTERVAL`].
+fn recv_deadline(remaining: Duration) -> Duration {
+    remaining.min(TICK_INTERVAL)
+}
+
+/// What [`DatagramProcessor::on_tick`] gets: the receiver's shared sinks and the host clock, with no
+/// datagram behind it.
+pub struct TickCtx<'a> {
+    pub venue: &'static str,
+    pub category: &'static str,
+    pub arbiter: &'a SharedArbiter,
+    pub instruments: &'a InstrumentSnapshot,
+    pub now_ns: u64,
+    pub mirror_offset: Option<u8>,
 }
 
 /// Materialize the feed-health gauges for `venue` in their at-rest state at receiver setup, so a
@@ -610,14 +636,38 @@ pub enum SeqCheck {
     /// datagram carrying a now-superseded update. Dropped, so an old message never overwrites
     /// a fresher one.
     Stale,
+    /// An advance past [`MAX_SEQ_ADVANCE`] on a bounded tracker. Accepted, but the anchor stays, so
+    /// one forged high sequence cannot make the channel's real datagrams read as stale.
+    Bounded,
+    /// Advances past the bound for [`SEQ_RESEAT_NS`] with no in-bound datagram between: the anchor
+    /// re-seats to the highest sequence seen. Accepted.
+    Reseat,
+}
+
+/// The furthest one datagram may move a bounded tracker's anchor. Real losses are one or two
+/// datagrams an event; a longer outage re-seats through [`SEQ_RESEAT_NS`].
+pub(crate) const MAX_SEQ_ADVANCE: u64 = 1_024;
+
+/// How long a bounded tracker refuses every advance before re-seating, which is also the longest a
+/// forged sequence can hold a legitimate channel's staleness check off its real anchor.
+pub(crate) const SEQ_RESEAT_NS: u64 = 5_000_000_000;
+
+#[derive(Clone, Copy)]
+struct SeqAnchor {
+    reset_count: u8,
+    sequence: u64,
+    /// When the current run of out-of-bound advances began, and the highest sequence it has seen.
+    bounded: Option<(u64, u64)>,
 }
 
 /// Per-`channel_id` datagram-sequence state for gap detection and stale-datagram rejection on the
 /// market-data feed, implementing the edge-feed-spec sequence/reset contract (see [`SeqCheck`]).
 #[derive(Default)]
 pub struct SeqTracker {
-    /// channel_id -> (last reset_count, last accepted sequence)
-    last: HashMap<u8, (u8, u64)>,
+    last: HashMap<u8, SeqAnchor>,
+    /// Whether an advance is bounded by [`MAX_SEQ_ADVANCE`]. Off where the sequence is not per
+    /// channel: a counter shared across groups jumps routinely.
+    bounded: bool,
 }
 
 impl SeqTracker {
@@ -632,25 +682,53 @@ impl SeqTracker {
         self.last.remove(&channel_id);
     }
 
-    pub fn check(&mut self, channel_id: u8, reset_count: u8, sequence: u64) -> SeqCheck {
-        match self.last.get_mut(&channel_id) {
-            None => {
-                self.last.insert(channel_id, (reset_count, sequence));
-                SeqCheck::First
-            }
-            Some(entry) => {
-                let (last_reset, last_seq) = *entry;
-                if reset_count != last_reset {
-                    *entry = (reset_count, sequence);
-                    SeqCheck::Reset
-                } else if sequence < last_seq {
-                    SeqCheck::Stale // do not advance: keep the anchor on the freshest sequence
-                } else {
-                    *entry = (reset_count, sequence);
-                    SeqCheck::Ok // forward progress or a duplicate of the last sequence
-                }
-            }
+    /// A tracker whose anchor moves at most [`MAX_SEQ_ADVANCE`] per datagram.
+    pub fn bounded() -> Self {
+        Self {
+            bounded: true,
+            ..Self::default()
         }
+    }
+
+    /// `now_ns` is a monotonic clock, read only by a bounded tracker's re-seat.
+    pub fn check(
+        &mut self,
+        channel_id: u8,
+        reset_count: u8,
+        sequence: u64,
+        now_ns: u64,
+    ) -> SeqCheck {
+        let anchor = |sequence| SeqAnchor {
+            reset_count,
+            sequence,
+            bounded: None,
+        };
+        let Some(entry) = self.last.get_mut(&channel_id) else {
+            self.last.insert(channel_id, anchor(sequence));
+            return SeqCheck::First;
+        };
+        if reset_count != entry.reset_count {
+            *entry = anchor(sequence);
+            return SeqCheck::Reset;
+        }
+        if sequence < entry.sequence {
+            return SeqCheck::Stale; // do not advance: keep the anchor on the freshest sequence
+        }
+        if !self.bounded || sequence - entry.sequence <= MAX_SEQ_ADVANCE {
+            *entry = anchor(sequence);
+            return SeqCheck::Ok; // forward progress or a duplicate of the last sequence
+        }
+        let (since, highest) = entry
+            .bounded
+            .map_or((now_ns, sequence), |(since, highest)| {
+                (since, highest.max(sequence))
+            });
+        if now_ns.saturating_sub(since) >= SEQ_RESEAT_NS {
+            *entry = anchor(highest);
+            return SeqCheck::Reseat;
+        }
+        entry.bounded = Some((since, highest));
+        SeqCheck::Bounded
     }
 }
 
@@ -805,24 +883,25 @@ async fn drive<P: DatagramProcessor>(
             }
 
             let (role, idx, n, kernel_ns, recv_ns, publisher) =
-                match timeout(remaining, recv_any(&mut channels)).await {
+                match timeout(recv_deadline(remaining), recv_any(&mut channels)).await {
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => {
                         warn!(%group, "recv error: {e}; rejoining");
                         socket_errors.inc();
                         continue 'rejoin;
                     }
+                    // Tick, then let the watchdog at the top of the loop decide whether the idle
+                    // interval has run out.
                     Err(_) => {
-                        warn!(%group, venue, kind = kind_label, publisher = publisher_name,
-                              idle_s = idle.as_secs(),
-                              "no market data; re-resolving interface and rejoining");
-                        idle_rejoin.inc();
-                        if !down {
-                            down = true;
-                            reg.set(false, last_mkt.elapsed().as_millis() as u64);
-                        }
-                        idle = escalate_idle(idle);
-                        continue 'rejoin;
+                        processor.on_tick(&TickCtx {
+                            venue,
+                            category,
+                            arbiter: &arbiter,
+                            instruments: &instruments,
+                            now_ns: now_ns(),
+                            mirror_offset,
+                        });
+                        continue;
                     }
                 };
 
@@ -1396,6 +1475,76 @@ mod tests {
         );
     }
 
+    /// A receive never waits past the tick, so a silent block still runs time-driven closes; a
+    /// shorter idle remainder still wins, so the watchdog is never delayed.
+    #[test]
+    fn the_receive_timeout_is_capped_at_the_boundary_tick() {
+        use super::{recv_deadline, Duration, TICK_INTERVAL};
+        assert_eq!(TICK_INTERVAL, Duration::from_secs(2));
+        assert_eq!(recv_deadline(Duration::from_secs(30)), TICK_INTERVAL);
+        assert_eq!(
+            recv_deadline(Duration::from_millis(500)),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn a_sequence_jump_past_the_bound_does_not_move_the_anchor() {
+        use super::{SeqCheck, SeqTracker, MAX_SEQ_ADVANCE};
+        let mut s = SeqTracker::bounded();
+        assert_eq!(s.check(0, 0, 100, 0), SeqCheck::First);
+        assert_eq!(
+            s.check(0, 0, u64::MAX, 1),
+            SeqCheck::Bounded,
+            "a forged sequence"
+        );
+        assert_eq!(
+            s.check(0, 0, 101, 2),
+            SeqCheck::Ok,
+            "the real channel is not stale"
+        );
+        assert_eq!(s.check(0, 0, 100, 3), SeqCheck::Stale);
+        assert_eq!(
+            SeqTracker::default().check(0, 0, 100 + MAX_SEQ_ADVANCE + 1, 0),
+            SeqCheck::First
+        );
+        let mut unbounded = SeqTracker::default();
+        unbounded.check(0, 0, 100, 0);
+        assert_eq!(
+            unbounded.check(0, 0, u64::MAX, 1),
+            SeqCheck::Ok,
+            "unbounded as before"
+        );
+    }
+
+    #[test]
+    fn a_two_datagram_loss_still_advances() {
+        use super::{SeqCheck, SeqTracker, MAX_SEQ_ADVANCE};
+        let mut s = SeqTracker::bounded();
+        s.check(0, 0, 100, 0);
+        assert_eq!(s.check(0, 0, 103, 1), SeqCheck::Ok);
+        assert_eq!(s.check(0, 0, 103 + MAX_SEQ_ADVANCE, 2), SeqCheck::Ok);
+        assert_eq!(s.check(0, 0, 104, 3), SeqCheck::Stale, "the anchor moved");
+    }
+
+    /// A real outage longer than the bound re-seats once every advance has been refused for the
+    /// whole window, so the channel is never pinned to its pre-outage anchor.
+    #[test]
+    fn a_bounded_channel_reseats_after_the_hatch() {
+        use super::{SeqCheck, SeqTracker, SEQ_RESEAT_NS};
+        let mut s = SeqTracker::bounded();
+        s.check(0, 0, 100, 0);
+        assert_eq!(s.check(0, 0, 50_000, 1), SeqCheck::Bounded);
+        assert_eq!(s.check(0, 0, 50_001, SEQ_RESEAT_NS), SeqCheck::Bounded);
+        assert_eq!(s.check(0, 0, 50_002, SEQ_RESEAT_NS + 1), SeqCheck::Reseat);
+        assert_eq!(s.check(0, 0, 50_001, SEQ_RESEAT_NS + 2), SeqCheck::Stale);
+        assert_eq!(s.check(0, 0, 50_003, SEQ_RESEAT_NS + 3), SeqCheck::Ok);
+        // An in-bound datagram ends a run, so the window restarts.
+        s.check(0, 0, 90_000, 10 * SEQ_RESEAT_NS);
+        s.check(0, 0, 50_004, 10 * SEQ_RESEAT_NS + 1);
+        assert_eq!(s.check(0, 0, 90_001, 11 * SEQ_RESEAT_NS), SeqCheck::Bounded);
+    }
+
     /// The idle interval doubles per fruitless rejoin and stops at the cap, so a permanently-silent
     /// block settles at one rejoin per `IDLE_REJOIN_MAX` instead of one per 30s forever. The first
     /// escalation happens only *after* the first timeout, so a publisher going silent is still
@@ -1442,15 +1591,15 @@ mod tests {
     #[test]
     fn first_datagram_on_a_channel() {
         let mut s = SeqTracker::default();
-        assert_eq!(s.check(0, 0, 0), SeqCheck::First); // sequence starts at 0 per spec
+        assert_eq!(s.check(0, 0, 0, 0), SeqCheck::First); // sequence starts at 0 per spec
     }
 
     #[test]
     fn contiguous_sequence_is_ok() {
         let mut s = SeqTracker::default();
-        assert_eq!(s.check(0, 0, 0), SeqCheck::First);
-        assert_eq!(s.check(0, 0, 1), SeqCheck::Ok);
-        assert_eq!(s.check(0, 0, 2), SeqCheck::Ok);
+        assert_eq!(s.check(0, 0, 0, 0), SeqCheck::First);
+        assert_eq!(s.check(0, 0, 1, 0), SeqCheck::Ok);
+        assert_eq!(s.check(0, 0, 2, 0), SeqCheck::Ok);
     }
 
     #[test]
@@ -1458,47 +1607,47 @@ mod tests {
         // The channel-0 sequence is global across groups, so a per-group jump is expected, not
         // loss: a forward jump is plain Ok (no gap accounting).
         let mut s = SeqTracker::default();
-        assert_eq!(s.check(0, 0, 10), SeqCheck::First);
-        assert_eq!(s.check(0, 0, 13), SeqCheck::Ok);
-        assert_eq!(s.check(0, 0, 14), SeqCheck::Ok);
+        assert_eq!(s.check(0, 0, 10, 0), SeqCheck::First);
+        assert_eq!(s.check(0, 0, 13, 0), SeqCheck::Ok);
+        assert_eq!(s.check(0, 0, 14, 0), SeqCheck::Ok);
     }
 
     #[test]
     fn lower_sequence_is_stale_and_anchor_holds() {
         let mut s = SeqTracker::default();
-        assert_eq!(s.check(0, 0, 10), SeqCheck::First);
-        assert_eq!(s.check(0, 0, 9), SeqCheck::Stale); // reordered/duplicated old datagram
-        assert_eq!(s.check(0, 0, 3), SeqCheck::Stale);
+        assert_eq!(s.check(0, 0, 10, 0), SeqCheck::First);
+        assert_eq!(s.check(0, 0, 9, 0), SeqCheck::Stale); // reordered/duplicated old datagram
+        assert_eq!(s.check(0, 0, 3, 0), SeqCheck::Stale);
         // The anchor stayed at 10 (stale datagrams don't advance it), so 11 is the next contiguous one.
-        assert_eq!(s.check(0, 0, 11), SeqCheck::Ok);
+        assert_eq!(s.check(0, 0, 11, 0), SeqCheck::Ok);
     }
 
     #[test]
     fn duplicate_of_last_is_not_stale() {
         // Equal sequence is a duplicate full-state update (idempotent); only strictly-lower is stale.
         let mut s = SeqTracker::default();
-        assert_eq!(s.check(0, 0, 7), SeqCheck::First);
-        assert_eq!(s.check(0, 0, 7), SeqCheck::Ok);
+        assert_eq!(s.check(0, 0, 7, 0), SeqCheck::First);
+        assert_eq!(s.check(0, 0, 7, 0), SeqCheck::Ok);
     }
 
     #[test]
     fn reset_count_change_is_a_reset() {
         let mut s = SeqTracker::default();
-        assert_eq!(s.check(0, 0, 100), SeqCheck::First);
+        assert_eq!(s.check(0, 0, 100, 0), SeqCheck::First);
         // Transport reset the channel: reset_count bumped, sequence legitimately restarts at 0.
         // Without the reset_count check this 0 would be misread as a stale datagram.
-        assert_eq!(s.check(0, 1, 0), SeqCheck::Reset);
-        assert_eq!(s.check(0, 1, 1), SeqCheck::Ok);
+        assert_eq!(s.check(0, 1, 0, 0), SeqCheck::Reset);
+        assert_eq!(s.check(0, 1, 1, 0), SeqCheck::Ok);
         // Within the new era, lower sequences are stale again.
-        assert_eq!(s.check(0, 1, 0), SeqCheck::Stale);
+        assert_eq!(s.check(0, 1, 0, 0), SeqCheck::Stale);
     }
 
     #[test]
     fn channels_are_tracked_independently() {
         let mut s = SeqTracker::default();
-        assert_eq!(s.check(0, 0, 10), SeqCheck::First);
-        assert_eq!(s.check(1, 0, 2), SeqCheck::First); // a different channel has its own counter
-        assert_eq!(s.check(0, 0, 9), SeqCheck::Stale); // channel 0 still drops its own stale datagram
-        assert_eq!(s.check(1, 0, 3), SeqCheck::Ok);
+        assert_eq!(s.check(0, 0, 10, 0), SeqCheck::First);
+        assert_eq!(s.check(1, 0, 2, 0), SeqCheck::First); // a different channel has its own counter
+        assert_eq!(s.check(0, 0, 9, 0), SeqCheck::Stale); // channel 0 still drops its own stale datagram
+        assert_eq!(s.check(1, 0, 3, 0), SeqCheck::Ok);
     }
 }

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - A market whose elected book path gapped no longer ping-pongs between the other paths. The health override now holds the market on the first healthy alternate and returns it to the leader only after 15 s of continuous leader health and the leader's own re-baseline of that market, or after 60 s. One lost leader datagram on a three-path venue cost a consumer up to 15 re-baselines in 6 s; it now costs one each way. New counter `dz_book_revert_holds_total{venue,release}`.
+- A market-by-price channel whose publisher goes silent mid-event now closes the open event after the boundary timeout. The close used to run only when another datagram arrived, so a dead single-publisher channel left every consumer buffering. The receive loop now ticks its processor when the whole port block is silent.
+- One forged or corrupt market-by-price datagram with a sequence far ahead can no longer make its channel's real datagrams read as stale. An advance past 1,024 no longer moves the anchor, and a real outage re-seats after 5 s (`dz_seq_events_total{kind="bounded"|"reseat"}`).
+- A market-by-price instrument readmitted under a new Source ID withdraws the unhealth its path filed under the old one.
 
 ### Added
 - Registry rows may declare `shared_batch_id` (default false, one value per venue and category), set on `edge-phoenix-mbp`. In a declared scope, a book failover between paths at the same committed slot holding identical levels goes out as an ordinary delta rather than a re-baseline; a mismatch counts `dz_book_path_divergence_total{venue}` and re-baselines as before.
