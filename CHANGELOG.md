@@ -453,6 +453,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- **`source_id` subscription filter dimension.** Several Source IDs may share one name — Binance's
+  USD-margined perpetuals (6) and spot (8) are both `BINANCE` and both list `BTCUSDT` — and a
+  `{"venue":"BINANCE","symbol":"BTCUSDT"}` subscriber receives both engines interleaved. A
+  subscription may now carry `"source_id": N` to follow one engine. It runs through the same single
+  `SubFilter::matches` on the live and replay paths, applies to every kind including `status`
+  (which carries its own `source_id`), and is additive: no protocol version change. PROTOCOL.md
+  documents it, with Binance as the worked example.
 - A market withheld from the WebSocket bootstrap is now visible. `/v1/products` rows carry
   `book_complete` (`false`: no new subscriber gets this market's book), and
   `dz_book_bootstrap_lost_total` / `dz_book_bootstrap_withheld` are labelled by `venue`, `category`,
