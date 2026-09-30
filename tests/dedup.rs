@@ -779,7 +779,7 @@ fn interleaved_book_paths_publish_one_coherent_feed() {
     }
     let full = acc.to_book(
         &(
-            BOOK_VENUE.into(),
+            doublezero_edge_connect::model::SourceKey::new(0, BOOK_VENUE.into()),
             BOOK_CATEGORY.into(),
             BOOK_CHANNEL,
             BOOK_INSTRUMENT,

@@ -869,7 +869,7 @@ impl Reconciler {
         // departing row's own universe — see the doc above.
         let category = category_arc(feed.category);
         crate::model::lock(&self.cfg.instruments)
-            .retain(|k, _| !(k.0.as_ref() == feed.venue && k.1 == category && k.2 == channel));
+            .retain(|k, _| !(k.0.name() == feed.venue && k.1 == category && k.2 == channel));
 
         // The book: routed through the arbiter, never hand-deleted from the replay map directly, so
         // the accumulator, the replay entry and `StickyAuthority::last_admitted` drop together —
@@ -880,12 +880,11 @@ impl Reconciler {
             channel,
         );
 
-        let history_dropped = match sources::source_id_of(feed.venue) {
-            Some(source_id) => {
-                crate::model::lock(&self.cfg.history).forget_channel(source_id, &category, channel)
-            }
-            None => 0,
-        };
+        let history_dropped = crate::model::lock(&self.cfg.history).forget_channel(
+            &sources::source_ids_of(feed.venue),
+            &category,
+            channel,
+        );
 
         if history_dropped > 0 || books_dropped > 0 {
             info!(
@@ -1100,7 +1099,7 @@ async fn feed_history(
                     // silently unattributable, invisible in both the API and Prometheus, so it is
                     // counted and dropped rather than trusted blind.
                     let known = crate::model::lock(&instruments).contains_key(&(
-                        t.venue.clone(),
+                        crate::model::SourceKey::of(t),
                         t.category.clone(),
                         t.channel,
                         t.instrument_id,
@@ -2041,10 +2040,18 @@ mod tests {
             ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "events", FeedKind::MarketByPrice, 34010u16);
-        let catalog_key: (Arc<str>, Arc<str>, u8, u32) =
-            ("KALSHI".into(), "events".into(), 10u8, 1u32);
-        let book_key: crate::ingest::authority::MarketKey =
-            (Arc::from("KALSHI"), Arc::from("events"), 10, 1);
+        let catalog_key: (crate::model::SourceKey, Arc<str>, u8, u32) = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            "events".into(),
+            10u8,
+            1u32,
+        );
+        let book_key: crate::ingest::authority::MarketKey = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            Arc::from("events"),
+            10,
+            1,
+        );
         let hist_key = history::Key {
             source_id: 3,
             category: "events".into(),
@@ -2150,10 +2157,18 @@ mod tests {
             ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "events", FeedKind::MarketByPrice, 34010u16);
-        let catalog_key: (Arc<str>, Arc<str>, u8, u32) =
-            ("KALSHI".into(), "events".into(), 10u8, 1u32);
-        let book_key: crate::ingest::authority::MarketKey =
-            (Arc::from("KALSHI"), Arc::from("events"), 10, 1);
+        let catalog_key: (crate::model::SourceKey, Arc<str>, u8, u32) = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            "events".into(),
+            10u8,
+            1u32,
+        );
+        let book_key: crate::ingest::authority::MarketKey = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            Arc::from("events"),
+            10,
+            1,
+        );
         let hist_key = history::Key {
             source_id: 3,
             category: "events".into(),
@@ -2264,8 +2279,12 @@ mod tests {
             ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "events", FeedKind::MarketByPrice, 34010u16);
-        let catalog_key: (Arc<str>, Arc<str>, u8, u32) =
-            ("KALSHI".into(), "events".into(), 10u8, 1u32);
+        let catalog_key: (crate::model::SourceKey, Arc<str>, u8, u32) = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            "events".into(),
+            10u8,
+            1u32,
+        );
 
         // Tick 1: both channels admitted (spawns real, never-polled receivers).
         r.tick().await;
@@ -2359,6 +2378,7 @@ mod tests {
                 max_inbound_per_min: 1,
                 broadcast_capacity: 1,
                 lag_repair_min_interval: crate::sinks::ws::LAG_REPAIR_MIN_INTERVAL,
+                bootstrap_release_deadline: crate::sinks::ws::BOOTSTRAP_RELEASE_DEADLINE,
             },
             api_bind: String::new(),
             history: Arc::new(Mutex::new(Store::new())),

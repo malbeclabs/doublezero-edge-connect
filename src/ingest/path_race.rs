@@ -308,12 +308,18 @@ mod tests {
 
     /// One venue, one universe: the scope a pair has to share to form.
     fn scope() -> ScopeKey {
-        (Arc::from("KALSHI"), Arc::from(CATEGORY))
+        (
+            crate::model::SourceKey::unassigned("KALSHI"),
+            Arc::from(CATEGORY),
+        )
     }
 
     /// A second universe under the **same** Source ID, publishing an unrelated instrument set.
     fn other_scope() -> ScopeKey {
-        (Arc::from("KALSHI"), Arc::from("sports"))
+        (
+            crate::model::SourceKey::unassigned("KALSHI"),
+            Arc::from("sports"),
+        )
     }
 
     /// One trade, both paths: path(1) 10us ahead.
@@ -497,7 +503,13 @@ mod tests {
     #[test]
     fn venues_do_not_cross_match() {
         let mut r = PathRace::new(1_000_000_000);
-        let (a, b): (ScopeKey, ScopeKey) = (scope(), (Arc::from("Other"), Arc::from(CATEGORY)));
+        let (a, b): (ScopeKey, ScopeKey) = (
+            scope(),
+            (
+                crate::model::SourceKey::unassigned("Other"),
+                Arc::from(CATEGORY),
+            ),
+        );
         r.on_trade(&a, &sym(), 6_200.0, 150.0, Side::Buy, path(1), 1_000);
         assert_eq!(
             r.on_trade(&b, &sym(), 6_200.0, 150.0, Side::Buy, path(2), 2_000),
@@ -624,7 +636,13 @@ mod tests {
     #[test]
     fn unmatched_evictions_are_attributed_per_scope_and_path() {
         let mut r = PathRace::new(1_000_000_000);
-        let (a, b): (ScopeKey, ScopeKey) = (scope(), (Arc::from("Other"), Arc::from(CATEGORY)));
+        let (a, b): (ScopeKey, ScopeKey) = (
+            scope(),
+            (
+                crate::model::SourceKey::unassigned("Other"),
+                Arc::from(CATEGORY),
+            ),
+        );
         r.on_trade(&a, &sym(), 6_200.0, 150.0, Side::Buy, path(1), 1_000);
         r.on_trade(&a, &sym(), 6_201.0, 150.0, Side::Buy, path(1), 1_000);
         r.on_trade(&b, &sym(), 6_200.0, 150.0, Side::Buy, path(2), 1_000);

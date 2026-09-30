@@ -291,13 +291,17 @@ The two granularities are **two message types**, not one type with a flag. `book
 | `kernel_rx_ts_ns` | uint64 | Kernel RX timestamp (`SO_TIMESTAMPNS`); `0` if unavailable. |
 | `ws_send_ts_ns` | uint64 | Wall clock the instant this batch is serialized; shared by all consumers of this message. `0` if unset. |
 
-**Identity: key on `(venue, channel, instrument_id)`, not on `symbol`.** The upstream `symbol` is a fixed 16-byte field the publisher fills by keeping the ticker's rightmost 16 bytes — silently, with no hash and no length check — so on venues with long tickers distinct markets collide on it, and a consumer keying on `symbol` merges two books into one. `symbol` is for display, and for the convenience of venues where it happens to be unique. `instrument` messages carry `channel` and `instrument_id` too, so a consumer joins a book to its definition on the same identity, and learns the mapping from the connect-time replay of the definitions.
+**Identity: key on `(source_id, channel, instrument_id)`, not on `symbol`.** The upstream `symbol` is a fixed 16-byte field the publisher fills by keeping the ticker's rightmost 16 bytes — silently, with no hash and no length check — so on venues with long tickers distinct markets collide on it, and a consumer keying on `symbol` merges two books into one. `symbol` is for display, and for the convenience of venues where it happens to be unique. `instrument` messages carry `channel` and `instrument_id` too, so a consumer joins a book to its definition on the same identity, and learns the mapping from the connect-time replay of the definitions.
 
 **Re-baselining is structural: `changes[0].action == "clear"`.** Do **not** key it off `snapshot`. A rebuild (on connect, after a recovery, or when the producer's authoritative path changes) arrives as a `clear` followed by the complete level set, with `snapshot: true` and `last: true` on the final batch. `snapshot` exists only so a consumer can tell a rebuild from ordinary activity; a consumer that ignores it stays correct.
 
-**Same-slot comparison: `batch_id` is the venue's own committed slot**, truncated to 32 bits by the upstream feed, taken from the most recent batch boundary the producer saw on this market's channel. It is what lets a consumer compare this book against a slot-stamped venue snapshot at the *same* slot; a comparison over a time window measures sampling skew instead, which alone produces phantom disagreements of several ticks. Two limits: the field is **absent** — never `0` — until a boundary has been seen for the market, so it is missing for the first batches after a connect, on feeds whose venue publishes no boundary at all (Market-by-Order markets, served as `order_book`, carry none today), and again after the upstream publisher restarts or ends its session, since the slot is only monotonic within one publisher era and the previous era's number would name a slot the book cannot be at; and a batch that straddles a boundary reports the slot last committed, so the state it carries is *at least* that slot's, occasionally a little past it. A consumer comparing at a slot boundary should treat a mismatch as inconclusive rather than as a defect.
+**Same-slot comparison: `batch_id` is the venue's own committed slot**, truncated to 32 bits by the upstream feed, taken from the most recent batch boundary the producer saw on this market's channel. It is what lets a consumer compare this book against a slot-stamped venue snapshot at the *same* slot; a comparison over a time window measures sampling skew instead, which alone produces phantom disagreements of several ticks. Two limits: the field is **absent** — never `0` — until a boundary has been seen for the market, so it is missing for the first batches after a connect, on feeds whose venue publishes no boundary at all (Market-by-Order markets, served as `order_book`, carry none today), and again after the upstream publisher restarts or ends its session, since the slot is only monotonic within one publisher era and the previous era's number would name a slot the book cannot be at, and again once the boundaries stop arriving (see the next paragraph), since the last one seen names a slot the venue has already moved past, and again while a batch would name a slot below the one this market has already published — a boundary at or below the committed slot is ignored outright, and a **failover to a publisher whose own boundary stream sits behind** withholds the field until that path passes it, since **the field never moves backwards within an era** and absent is the only honest answer meanwhile; and a batch that straddles a boundary reports the slot last committed, so the state it carries is *at least* that slot's, occasionally a little past it. A consumer comparing at a slot boundary should treat a mismatch as inconclusive rather than as a defect.
+
+**A rebuild terminates whatever event was in flight.** A `clear`-led rebuild always carries `last: true`, and on a batching channel it can arrive while an event of ordinary deltas is still open — the producer's recovery does not wait for the venue's next boundary. A consumer buffering that event therefore folds the rebuild into it, and must key the rebuild on **any** `clear` in the folded batch rather than on `changes[0]` of what it accumulated: the `clear` discards everything before it, which is exactly what makes the fold safe.
 
 **`last` is mandatory and must be honored.** A consumer that buffers a logical event until its final batch will wait forever if it is dropped — including on a re-baseline whose only change is the `clear`.
+
+**On a batching channel the final batch arrives at the venue's own batch boundary, not at the end of every batch.** Where the upstream feed publishes a batch boundary — one per committed slot, the same signal `batch_id` is read from — a venue event's level changes routinely span more than one producer batch, and the intermediate ones carry `last: false`. The closing batch at the boundary carries `last: true` and may carry no `changes` at all, which is legal and is the ordinary case: what it delivers is the `last`. A consumer that publishes only on `last` therefore never sees the locked or crossed inside market an event passes through mid-flight. ⚠️ **The buffer that asks for is one venue slot of changes, not one message** — and up to the two seconds the producer waits before it gives up on the boundaries and closes each batch itself. Where the feed publishes no boundary, every batch still closes itself. Nothing here changes for a consumer already honoring `last`; one that publishes on every batch regardless is the one that was seeing those intermediate states.
 
 **Gap detection is the producer's job.** The producer runs the upstream feed's snapshot+delta recovery internally, per publisher, and re-serves only sequences it has verified as contiguous. There are no sequence numbers on the wire and a consumer needs no gap machinery of its own: a recovery surfaces as a re-baseline.
 
@@ -352,6 +356,10 @@ quote or trade.
 | `stale_ms`  | uint64 | Milliseconds the quote feed had been silent (`0` when `"ok"`).  |
 | `ts_ns`     | uint64 | Wall clock (ns since epoch) the status was emitted.             |
 
+Each Source ID gets its own `status`, but its health is that of the feed carrying it: every ID one
+feed carries goes `down` and `ok` together, so one ID falling silent while another on the same feed
+streams produces no `status`.
+
 Quote delivery is **not gated** on status - it is advisory health, and because every `quote` is
 full state the feed self-heals on the next quote regardless. A consumer that ignores `status`
 (per the forward-compatibility rule) simply forgoes the gray-out.
@@ -382,6 +390,13 @@ string matching.
 
 An unregistered Source ID yields a stable synthesized name (`SOURCE_<id>`) rather than being dropped,
 so data always flows and an unrecognised Source ID is visible rather than silent.
+
+**Several Source IDs can share one name.** The registry may give more than one ID the same
+`source_name` (one venue running several matching engines). Their data is never merged: each ID keeps
+its own books, depth and `status`. A name is therefore not an identity. Key per-engine state on
+`source_id`: `(source_id, channel, instrument_id)` for `book`, `order_book` and `instrument`, and
+`(source_id, symbol)` for `quote`, `trade`, `midpoint` and `depth`. A `source_name`/`venue`
+subscription filter matches every ID under the name; to follow one, filter on `source_id` client-side.
 
 **Planned for v2: `venue` names a matching engine, not a venue.** The edge-feed-spec glossary is explicit that a Source ID identifies one matching engine and that a venue may hold several IDs, so the field is misnamed as well as redundant. Retiring it — rather than merely deprecating it, which this release does — is a v2 change, and upstream's own `sources/spec.md` still describes the field the old way.
 

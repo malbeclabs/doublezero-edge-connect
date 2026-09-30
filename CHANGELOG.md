@@ -80,6 +80,149 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   substitute for that ordering: it runs the loader from the commit being published, so a change
   bumping `SUPPORTED_VERSION` and the document `version` together passes it and republishes a
   document the whole running fleet rejects. `docs/self-hosting.md` states the rule.
+- `MidpointProcessor` held one `SeqTracker` for every publisher, where `TobProcessor` and
+  `MbpProcessor` key theirs per publisher. Datagram sequence is scoped to `(source_ip, group, port)`,
+  so under a shared port block two mirrored publishers' independent sequence spaces interleaved onto
+  one anchor and whichever ran lower read as stale on every datagram: its mids were dropped outright
+  while `dz_seq_events_total{kind="stale"}` climbed on a perfectly healthy feed. It now uses the same
+  bounded `PublisherSeq`. Latent — no feed row selects `FeedKind::Midpoint`. **Enabling one now
+  also requires giving `Midpoint` a `(venue, symbol)` staleness floor in the arbiter**, where it is
+  a bare passthrough: with both mirrors unblocked, a slower one's older mid overwrites the fresher.
+  Which clock that floor latches on is undecidable until this codec's offsets are validated against
+  a live datagram, so it is recorded alongside that precondition rather than guessed at. (#109)
+- A price-book market no longer goes dark to new subscribers after one very large event. An
+  event carrying more than 8,192 changes before its `last` un-baselines the WebSocket replay entry,
+  and only a `Clear`-led batch from the serving path could restore it: a book that stays `Ready` sends
+  none, and the peer path's snapshot install is dropped by the single-path gate. On 2026-09-24 Phoenix
+  UNI hit it and was bootstrapped for no new subscriber for 2 h 12 min, though the bridge held a
+  correct book, until something incidental released it. The serving path now republishes its whole book at the market's next
+  event close, so recovery takes about one slot. Connected consumers see one extra `Clear`-led
+  re-baseline per overflow.
+- **A market-by-price re-anchor now needs two short rotations, not one.** A book that
+  legitimately *shrank* since a rotation was captured — a whole-side `BookClear`, or enough deletes
+  applied past that rotation's `last_instrument_seq` — is indistinguishable from the short install
+  the re-anchor exists for, and would take the market off its path for a rotation. The rotation
+  after such a clear is captured post-clear and declares the true smaller total, so requiring two
+  costs one extra rotation on a genuinely short book and removes the false-positive class. The two
+  strikes are keyed on `snapshot_id`: a multicast wire redelivers datagrams, and one rotation must
+  never be its own confirmation. "Two" means two complete rotations with no agreeing one in
+  between — nothing expires a first strike by elapsed time, since the cost of acting on stale
+  evidence is the same single bounded failover as acting on fresh evidence.
+- ⚠️ **A publisher restart could truncate a market-by-price book for the life of the publisher era,
+  and every later subscriber inherited it.** A restart is a `Reset Count` change, which discards
+  that publisher's books; the new era's first snapshot rotation is served from a book the publisher
+  is still refilling, and it installs. From then on the book is `Ready` and every later rotation is
+  declined for having been captured behind us, so nothing ever replaces the short install — and it
+  is republished to consumers, and into the WebSocket bootstrap, as a *complete* `Clear`-led
+  re-baseline. Measured on the Oregon bridge 2026-09-23: Phoenix BTC lost about 100 bid and 7–11 ask
+  levels at the ams publisher's restart and never recovered, with the far tail (lowest bid 82000
+  where the venue goes to 100) missing at every later sample, while both wire sources carried the
+  full book throughout.
+
+  A declined rotation that claims a **complete** book (`depth_bound == 0`) and declares materially
+  more levels than we hold now takes the book out of `Ready` instead of simply declining. The
+  triggering rotation cannot install itself — its sequence is behind what the live book applied, so
+  the deltas in between were applied rather than buffered and a replay would gap — so the repair is
+  deferred one rotation (~18.5 s on the flagship Phoenix markets) while the peer path holds the
+  market through the existing health override. "Materially" is a jitter bound and nothing more: the
+  shortfall must exceed both 8 levels and 10% of the declared total, against the 1–3% a rotation
+  captured a few hundred milliseconds early shows on a ~550-level book. One re-anchor per market per
+  60 s; a bounded group never triggers one, and an oversized `total_levels` is still refused first,
+  so a wire-supplied figure cannot take a market out of `Ready` on its own.
+- New market-by-price series: `dz_mbp_reanchor_total{venue,reason}` (the re-anchor above),
+  `dz_mbp_declined_rotation_shortfall_levels{venue}` (every declined complete rotation's shortfall,
+  so a publisher shipping short complete-flagged groups is visible before one crosses the bound),
+  `dz_mbp_snapshot_installs_total{venue,completeness}`, `dz_mbp_install_shrank_book_total{venue}` and
+  `dz_mbp_book_clears_total{venue,scope}`.
+- ⚠️ **A fresh WebSocket subscriber could receive no book at all for a live market, for tens of minutes**, while quotes and trades for that same market kept flowing. A market that was mid-event at the instant of the join was withheld — correctly, since the batches buffered behind their `last` are in no bootstrap — but released only by the market's next producer re-baseline, which is one or two an hour. Reproduced on 5 of 8 joins against the Oregon bridge; it is also what an external reviewer read as a maker's ladder missing from our feed, when our wire carried it. A withheld market is now released at its next *completed event*, under a second, bounded by `BOOTSTRAP_RELEASE_DEADLINE` (5s) for a channel whose events stop closing at all. Before: a subscriber saw an empty book for that market and no way to tell it from a market that was not trading. After: it is bootstrapped at the venue's next slot boundary and streams from there. A market with no complete book anywhere in the process is still withheld rather than bootstrapped with a partial one.
+- **The same withhold could take a market off a client that had already been bootstrapped**, since the lag repair re-runs the same replay pass and re-armed the withhold for whatever was mid-event at that moment. That is the "bootstrap then silence" half of the report above, and the same release rule closes it.
+- **A join watermark can no longer silence a market for the life of a connection.** It exists to drop the batches queued behind a bootstrap that already contains them, and it is now spent by the first frame that passes it (broadcast order is wire order, so everything after that frame is newer than the bootstrap) and expires at the same 5s bound regardless — so a `recv_ts_ns` that lands above the live feed, which a backwards host-clock step is enough to produce, costs a bounded prefix instead of the market.
+- **A market a client narrowed away from no longer counts as one it is dark on.** A market the unfiltered connect replay withheld and a later `subscribe` put out of scope stayed on the withhold list for the life of the connection: no consumer-visible corruption, since the client's own filter excluded those frames, but every one of them was reported as a withheld book and the per-client sweep held the shared book mutex once a second for it. `unsubscribe` now runs the same book bootstrap `subscribe` does, for the markets coming back into scope.
+- Both shapes are now on the dashboard: `dz_ws_bootstrap_withheld_total{venue,release}` (`complete`/`deadline`) and `dz_ws_frames_dropped_total{venue,reason}` (`watermark`/`awaiting`).
+- ⚠️ **A publisher's own snapshot rotation was reported to the book gate as an unhealthy path**,
+  so every rotation moved the market to the mirror and straight back, at two full book re-sends per
+  rotation per market. Book health is now `PriceBook::serves_a_book()` — `Ready`, or a group
+  assembling over levels that are still complete — while a group over a book that was *not* being
+  served stays unhealthy. A subscriber now gets one publisher-driven re-baseline per rotation instead
+  of two more, and a book that stands still for the length of an assembly. An assembly that loses
+  buffered deltas to the per-book cap leaves that served state again — the levels it would be
+  claiming are provably incomplete, so the market fails over rather than freezing on a path that
+  cannot complete it (`dz_mbp_book_buffer_overflows_total`).
+- ⚠️ **A batch dropped from the path a consumer was following left its book with a permanent
+  hole**, and served a crossed book for minutes: with the peer silent for that market the gate's
+  `last_admitted` never moved, so the path resuming read as a continuation and the dropped changes
+  were never republished. Such a drop now forces a re-baseline of that market, discharged off the
+  serving path's own accumulator and counted as
+  `dz_mbo_forced_rebaselines_total{reason="dropped_batch"}`.
+- ⚠️ **A `BatchBoundary` naming a slot at or below the one its channel had already committed closed
+  every open market's event and stamped it backwards.** Seen live after a 1.5 s stall: 30 markets
+  took an empty closing batch five slots behind their own previous one, the observed cause being
+  the publisher relaying the slot of a block executed late on an abandoned fork. Such a boundary is
+  now ignored, no event closes on it, and a failover to a path whose own boundary stream is behind
+  withholds `batch_id` until it passes — a committed slot never moves backwards, whatever produced
+  it (`dz_mbp_slot_regressions_total`).
+- ⚠️ **A closing batch the publish gate refused was forgotten, leaving every consumer buffering that
+  event for good** — routine now that a path keeps a market through its own snapshot rotation. The
+  instrument stays owed its close and is retried (`dz_mbp_closes_refused_total`), a rebuild records
+  the close it performs, and a rotation that never installs gives the market up after 3 s rather
+  than holding it unpublished — the bound trades a stall of at most that long against the pair of
+  re-baselines a failover and its return cost. A client is no longer bootstrapped mid-event either:
+  a market whose event is still open is withheld until it re-baselines instead of handed a book it
+  cannot complete.
+- ⚠️ **A market both publishers reset stayed on whichever path readmitted it last.** The reset
+  purges the instrument's wire Source ID in the same message that reports its book unhealthy, so the
+  readmitting snapshot's healthy report had no venue to file the report under — and the
+  transition memo recorded it as filed regardless, leaving the path unhealthy at the gate while its
+  book was `Ready`. The memo now records only a report that was actually filed, so a subscriber's
+  book unfreezes when the *first* publisher readmits rather than when the last one does.
+- ⚠️ **A reordered or duplicated market-data datagram closed every open book event on its
+  channel**, at a slot the venue had already left: Market-by-Price ran no stale-datagram check and a
+  `BatchBoundary` carries no sequence of its own. It now runs the shared `SeqTracker` per publisher
+  on the market-data role and drops a stale datagram whole, reporting `dz_seq_events_total` for the
+  first time, so a consumer's buffered event is no longer committed mid-flight. The boundary-timeout
+  fallback drops the channel's committed slot too, leaving `batch_id` absent rather than stale.
+- ⚠️ **Every per-datagram `book` batch was published as a finished logical event, exposing locked
+  and crossed intermediate books to every consumer that honours `last`.** A venue event's level
+  changes routinely span two datagrams — the bid lifts in one, the ask moves away in the next — so
+  closing each datagram published the state in between as if the venue stood there. Ellipsis
+  measured 2,546 such states in 30 minutes across BTC, ETH and SOL on the Phoenix feed, one of them
+  SOL at bid 118.63 = ask 118.63 for 4.4 microseconds.
+
+  The Market-by-Price processor already parsed the venue's `BatchBoundary` for `batch_id`; it is now
+  the consistency point it is on the wire. On a channel where one has been observed, per-datagram
+  batches carry `last: false` and the boundary emits a closing batch, possibly with no changes, per
+  instrument touched since the previous one. A channel whose venue publishes no boundary keeps a
+  datagram as the event. Re-baselines are complete state and stay `last: true`. PROTOCOL.md documents
+  the contract under `last`; nothing changes for a consumer already honouring it.
+
+  Guarded against the wedge that field warns about: a channel that emitted boundaries and then
+  stopped reverts to closing each datagram 2 s — five slots — after the last one, and whatever that
+  channel left open is closed with it. The bound is wall clock rather than a datagram count because
+  the publishers run a mean ~210 market-data datagrams/s per host against a two-minute-average peak
+  near 1,250/s, so a single 400 ms slot carries ~500 datagrams: any count tight enough to bound the
+  wedge would fire inside one busy slot and re-expose the intermediate books. A datagram cap
+  survives only for a datagram whose `recv_ts_ns` is the not-available sentinel.
+- ⚠️ **A client joining mid-stream was sent a `book` bootstrap and then the batches it already
+  contained, walking its book backwards.** A client's broadcast receiver is subscribed in the accept
+  loop, before `serve_client` finishes the WebSocket handshake and reads the replay caches, so every
+  batch published in that window is queued *behind* a snapshot that already carries it. Applying
+  them in arrival order corrupts the consumer: measured against the Phoenix venue's own API, SOL
+  showed a bid and an ask both at 118.06 after a snapshot at slot 449077018 was followed by deltas
+  labelled 449077013. `quote` and `depth` race the same way and are unaffected — both are full state
+  and correct themselves on the next message — so only the incremental `book`/`order_book` pair
+  could be left permanently wrong.
+
+  The bootstrap now carries a per-market watermark, the `recv_ts_ns` of the newest batch the
+  replayed accumulator has **folded** in, and a queued batch strictly older than it is discarded.
+  Folded, not merely applied, is the load-bearing half: an event still waiting for its `last` is not
+  in the materialized state, so counting its batches would drop exactly the ones the bootstrap is
+  missing. Strictly older for the same reason: one datagram straddling a venue batch boundary emits
+  two batches for a market at one stamp, only the first of them folded, so a tie is re-delivered —
+  which costs nothing, since a change carries an absolute size and re-applying lands on the same
+  state.
+  The lag-triggered repair replays through the same path and takes the same watermark. Moving the
+  subscribe after the snapshot would close the overlap by opening a gap, where a batch published in
+  the window reaches nobody, and was rejected for that reason.
 - ⚠️ **A lagging WebSocket client was answered with a full state replay, which re-armed the lag that
   asked for it** (#149). The `book`/`order_book` products are incremental, so a client the broadcast
   had to drop messages for does need a re-baseline — but the repair replayed the *whole* instrument
@@ -194,6 +337,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A market-by-price `InstrumentReset` discarded its own recovery snapshot group.** A publisher withholding and then re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin` follows its own reset by ~0.1 ms on a different port — resets ride mktdata, snapshot groups the snapshot port, on independent sequence series — so which is processed first is a coin flip. When the begin won, both the book's assembly and the processor's level route were torn out, the market waited a full snapshot rotation to heal, and the group's levels were counted on `dz_mbp_snapshot_levels_dropped_total{reason="reset"}`. A group anchored at or after the reset's `New Anchor Seq` is now kept — the same test a `SnapshotBegin` is already judged by — and only one that predates the reset is dropped and tombstoned. Observed on a live Phoenix feed at roughly two flaps per hour per market; expect that `reason="reset"` series to fall substantially.
 
 ### Changed
+- A `sources` block may give several Source IDs one name. Each ID keeps its own state and
+  `status`; product ids use the shared name. A `status` carries its feed's health, so IDs on one
+  feed go down together. Consumers must key on `source_id`, not the name (see PROTOCOL.md).
+- Internal per-source state is keyed by Source ID and name, not name alone. No behavior change
+  while names are unique.
+- **`dz_path_authority_transfers_total` gains a `rebaselined` label (`yes`/`no`) and a
+  `reason="health_revert"` value, and every transfer now logs one line naming the market and both
+  paths.** ⚠️ The new label changes series identity: aggregating queries keep working, but an
+  instant selector pinning `{venue,reason}` now returns two series. Existing `reason` values are
+  unchanged.
 - **`edge-kalshi-sports-mbp`'s `category` is now `events`, and its group `code` is unchanged.** The
   universe that row carries is event markets, of which sport is one kind, so `sports` named it too
   narrowly; the group name is the ledger's and a subscriber matches `doublezero status` on it, so
@@ -300,6 +453,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- A market withheld from the WebSocket bootstrap is now visible. `/v1/products` rows carry
+  `book_complete` (`false`: no new subscriber gets this market's book), and
+  `dz_book_bootstrap_lost_total` / `dz_book_bootstrap_withheld` are labelled by `venue`, `category`,
+  `channel` and `instrument_id`. The cap's WARN line now names the symbol.
 - ⚠️ **Kalshi elections, a pair of rows the registry did not have.** The political event markets are
   activated on the ledger and running on their own two groups, separate from perps and events:
   top-of-book on `233.84.178.21` and market-by-price on `233.84.178.22`, six channels each (`50`-`55`,
