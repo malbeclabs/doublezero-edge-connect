@@ -262,7 +262,7 @@ fn render_status(body: &Value) -> Result<String, String> {
     let rows: Vec<Vec<String>> = parsed
         .venues
         .iter()
-        .map(|v| vec![v.venue.clone(), v.status.clone()])
+        .map(|v| vec![v.label(), v.status.clone()])
         .collect();
     out.push_str(&table(&headers, &rows));
 
@@ -518,6 +518,28 @@ mod tests {
                 "late_drops": 0
             }
         })
+    }
+
+    /// Two engines sharing a name arrive as two entries carrying `source_id`; each must render
+    /// distinguishably, while a name-level entry renders exactly as before.
+    #[test]
+    fn engines_sharing_a_name_render_with_their_source_id() {
+        let mut body = fixture_status_healthy();
+        body["venues"] = serde_json::json!([
+            {"venue": "BINANCE", "status": "online", "source_id": 6},
+            {"venue": "BINANCE", "status": "offline", "source_id": 8},
+            {"venue": "KALSHI", "status": "online"},
+        ]);
+        let out = render_status(&body).unwrap();
+        let row = |needle: &str| {
+            out.lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or("")
+                .to_string()
+        };
+        assert!(row("BINANCE (source 6)").contains("online"), "{out}");
+        assert!(row("BINANCE (source 8)").contains("offline"), "{out}");
+        assert!(row("KALSHI").starts_with("KALSHI "), "{out}");
     }
 
     /// The at-cap marker is the operator's signal to narrow the channel filter, so it must be

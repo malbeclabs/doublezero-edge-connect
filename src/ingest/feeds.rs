@@ -230,6 +230,15 @@ pub struct Feed {
     /// Ports are unaffected: the mirror sends to the identical port block, so this never factors
     /// into `FeedPublisher::base_port()` or the derived-port arithmetic.
     pub mirror_offset: Option<u8>,
+    /// The Source ID this row's publishers stamp, when the document declares it. **Never relabels
+    /// data** — the wire Source ID stays authoritative (`ingest::sources`) — it only says which
+    /// engine this row's health, `status` and metrics belong to.
+    ///
+    /// Needed only where several Source IDs share one registry name: two engines under one `venue`
+    /// are otherwise indistinguishable to everything keyed on the row, and one live engine masks
+    /// the other's outage. `None` keeps today's name-level behaviour (`health::StatusKey`'s
+    /// `(venue, None)`); validation guarantees a declared ID is assigned to this row's `venue`.
+    pub source_id: Option<u16>,
 }
 
 /// Every feed row known to the bridge, resolved once at startup from the registry document.

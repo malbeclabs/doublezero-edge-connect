@@ -172,7 +172,7 @@ Modules are grouped by role under `src/`:
   overflow, and a **port shape matching the protocol** — `MarketByPrice`/`MarketByOrder` bind three
   port roles, `TopOfBook`/`Midpoint` two, which is what turns a misspelled optional `snapshot` key
   from a
-  silently two-port block whose book never syncs into a startup error) **and the five cross-row
+  silently two-port block whose book never syncs into a startup error) **and the six cross-row
   invariants** — `(venue, category, kind)` uniqueness,
   one arbitration mode per **venue** (the granularity `Arbiter::set_mode` keys on, so disagreement
   cannot resolve last-write-wins by document order), `emit_trades` agreeing with
@@ -180,7 +180,9 @@ Modules are grouped by role under `src/`:
   `MarketByOrder` category** (a departing receiver releases its publishers' book standing by
   category — the one scope it and the `MarketKey` provably share, see
   `Arbiter::forget_publisher_books` — so two venues carrying that kind under one category would have
-  each exit release the other's live paths). The first four used to be
+  each exit release the other's live paths), plus **one declared `source_id` per `(venue,
+  category)`** (tape ownership and the book authority key on that pair, never on the Source ID, so
+  two engines declared in one universe would let one row mute the other's trades). The first four used to be
   `#[cfg(test)]` assertions over the built-in document, which stopped being sufficient the moment a
   document could be supplied at runtime. The rest is upstream policy this process cannot verify.
   `publishers` is a tagged union: `explicit` lists port blocks verbatim, `derived` carries a published
@@ -402,7 +404,12 @@ Modules are grouped by role under `src/`:
   (the same tuple as `reconcile::FeedKey`; `(venue, kind)` is not an identity once a venue carries two
   universes),
   aggregated to the **venue**-level `status`/`dz_feed_up` PROTOCOL.md promises, so one wedged
-  publisher never takes a venue down while a peer streams. Only quote-bearing kinds count
+  publisher never takes a venue down while a peer streams. "Venue" is a `StatusKey`
+  `(venue, source_id)`: a row that declares its optional `source_id` (validated against the
+  resolving `sources` table under its own `venue`) aggregates, emits its wire `status`, lists in
+  `/v1/status` and labels `dz_feed_up` under that ID alone, so two engines sharing a name (Binance's
+  6 and 8) never mask each other's outage; an undeclared row keeps `(venue, None)`. `ReceiverKey`
+  stays the reconciler's `FeedKey` — the status key is recorded once, at `register`. Only quote-bearing kinds count
   (`carries_venue_status`; MBO is depth-only and must neither declare an outage nor mask one), with a
   fallback to any registered receiver for a venue this process runs **no** quote-bearing receiver for
   — gated on a sticky per-venue carrier set, since a carrier that *stopped* leaves the liveness map

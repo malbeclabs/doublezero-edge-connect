@@ -1635,8 +1635,18 @@ fn pub_idx(p: Transport) -> usize {
 /// Pre-resolved `dz_*` metric children for one venue. Built once per venue via [`VenueMetrics::new`];
 /// every field is a cheap-to-`inc()` handle, so the per-message emit path pays no label lookup.
 struct VenueMetrics {
-    /// `dz_emit_total{kind}` indexed by kind: quote/trade/instrument/midpoint/depth/status/book.
-    emit: [IntCounter; 7],
+    /// This venue's label, for resolving [`Self::emit`] children on first use.
+    venue: Arc<str>,
+    /// `dz_emit_total{source_id, kind}` per Source ID, indexed by kind:
+    /// quote/trade/instrument/midpoint/depth/status/book. Keyed per ID because several IDs may
+    /// share one name; bounded by the IDs sharing this label, since every ID past the unregistered
+    /// cap shares `UNREGISTERED` and is collapsed to `0` here exactly as `SourceKey` does. A `Vec`
+    /// scanned linearly rather than a map: it holds one entry for nearly every name, and this is
+    /// read on every emitted message under the arbiter mutex.
+    emit: Vec<(u16, [IntCounter; 7])>,
+    /// Whether [`Self::venue`] is the shared `UNREGISTERED` label, decided once rather than by a
+    /// string comparison per message.
+    unregistered: bool,
     /// `dz_quotes_admitted_total{publisher}` / `dz_trades_admitted_total{publisher}`, `[edge, public]`.
     quotes_admitted: [IntCounter; 2],
     trades_admitted: [IntCounter; 2],
@@ -1671,9 +1681,36 @@ struct VenueMetrics {
 }
 
 impl VenueMetrics {
-    fn new(venue: &str) -> Self {
+    /// The `dz_emit_total` children for wire `source_id` under this venue, resolved on first use.
+    fn emit_for(&mut self, source_id: u16) -> &[IntCounter; 7] {
+        let id = if self.unregistered { 0 } else { source_id };
+        let idx = match self.emit.iter().position(|(have, _)| *have == id) {
+            Some(idx) => idx,
+            None => {
+                let label = id.to_string();
+                let emit_kind = |k: &str| {
+                    metrics()
+                        .emit
+                        .with_label_values(&[self.venue.as_ref(), label.as_str(), k])
+                };
+                let children = [
+                    emit_kind("quote"),
+                    emit_kind("trade"),
+                    emit_kind("instrument"),
+                    emit_kind("midpoint"),
+                    emit_kind("depth"),
+                    emit_kind("status"),
+                    emit_kind("book"),
+                ];
+                self.emit.push((id, children));
+                self.emit.len() - 1
+            }
+        };
+        &self.emit[idx].1
+    }
+
+    fn new(venue: &Arc<str>) -> Self {
         let m = metrics();
-        let emit_kind = |k: &str| m.emit.with_label_values(&[venue, k]);
         // Pre-resolve the `[edge, public]` children of a `{venue, publisher}` counter, in `pub_idx`
         // order (edge=0, public=1) so the emit path indexes with `pub_idx(publisher)`.
         let by_pub = |c: &prometheus::IntCounterVec| {
@@ -1691,15 +1728,9 @@ impl VenueMetrics {
             ]
         };
         Self {
-            emit: [
-                emit_kind("quote"),
-                emit_kind("trade"),
-                emit_kind("instrument"),
-                emit_kind("midpoint"),
-                emit_kind("depth"),
-                emit_kind("status"),
-                emit_kind("book"),
-            ],
+            venue: venue.clone(),
+            emit: Vec::new(),
+            unregistered: venue.as_ref() == crate::ingest::sources::UNREGISTERED,
             quotes_admitted: by_pub(&m.quotes_admitted),
             trades_admitted: by_pub(&m.trades_admitted),
             quote_ticks_won: by_pub(&m.quote_ticks_won),
@@ -1945,7 +1976,7 @@ impl Arbiter {
     }
 
     /// The pre-resolved metric children for `venue`, created on first use.
-    fn vm(&mut self, venue: &Arc<str>) -> &VenueMetrics {
+    fn vm(&mut self, venue: &Arc<str>) -> &mut VenueMetrics {
         self.venue_metrics
             .entry(venue.clone())
             .or_insert_with(|| VenueMetrics::new(venue))
@@ -2689,7 +2720,7 @@ impl Arbiter {
                 .entry(key.clone())
                 .or_default()
                 .rebaselined(&[], seed_ts, &mut self.guard);
-            self.vm(&b.venue).emit[EMIT_BOOK].inc();
+            self.vm(&b.venue).emit_for(b.source_id)[EMIT_BOOK].inc();
             let _ = self.tx.send(Arc::new(FeedMessage::Book(cleared)));
             return true;
         };
@@ -2697,7 +2728,7 @@ impl Arbiter {
             .entry(key.clone())
             .or_default()
             .rebaselined(&full.changes, seed_ts, &mut self.guard);
-        self.vm(&b.venue).emit[EMIT_BOOK].inc();
+        self.vm(&b.venue).emit_for(b.source_id)[EMIT_BOOK].inc();
         let _ = self.tx.send(Arc::new(FeedMessage::Book(full)));
         true
     }
@@ -2750,7 +2781,7 @@ impl Arbiter {
             self.track_book_market(key);
         }
         self.apply_book_replay(key, &b);
-        self.vm(&b.venue).emit[EMIT_BOOK].inc();
+        self.vm(&b.venue).emit_for(b.source_id)[EMIT_BOOK].inc();
         let _ = self.tx.send(Arc::new(FeedMessage::Book(b)));
     }
 
@@ -3096,7 +3127,7 @@ impl Arbiter {
                 if q.source_ts_ns == 0 {
                     let vm = self.vm(&q.venue);
                     vm.quotes_no_source_ts.inc();
-                    vm.emit[EMIT_QUOTE].inc();
+                    vm.emit_for(q.source_id)[EMIT_QUOTE].inc();
                     let _ = self.tx.send(Arc::new(msg));
                     return;
                 }
@@ -3126,7 +3157,7 @@ impl Arbiter {
                 let vm = self.vm(&q.venue);
                 match decision {
                     Admit::Emitted { opened_tick } => {
-                        vm.emit[EMIT_QUOTE].inc();
+                        vm.emit_for(q.source_id)[EMIT_QUOTE].inc();
                         // Attribute the admitted quote to its winning publisher. A rise in
                         // `publisher="public"` is the direct signal of the public backstop filling
                         // an edge gap (in steady state the edge publisher leads every tick).
@@ -3189,7 +3220,7 @@ impl Arbiter {
                     let conflict = !sticky && self.claim_no_id_tape(t, publisher);
                     let vm = self.vm(&t.venue);
                     vm.trades_no_id.inc();
-                    vm.emit[EMIT_TRADE].inc();
+                    vm.emit_for(t.source_id)[EMIT_TRADE].inc();
                     if conflict {
                         vm.trades_no_id_conflict.inc();
                     }
@@ -3211,7 +3242,7 @@ impl Arbiter {
                 let vm = self.vm(&t.venue);
                 match decision {
                     Admit::Emitted { .. } => {
-                        vm.emit[EMIT_TRADE].inc();
+                        vm.emit_for(t.source_id)[EMIT_TRADE].inc();
                         vm.trades_admitted[pub_idx(publisher)].inc();
                         let _ = self.tx.send(Arc::new(msg));
                     }
@@ -3253,7 +3284,7 @@ impl Arbiter {
                     vm.instruments_dropped.inc();
                     return;
                 }
-                vm.emit[EMIT_INSTRUMENT].inc();
+                vm.emit_for(i.source_id)[EMIT_INSTRUMENT].inc();
                 let _ = self.tx.send(Arc::new(msg));
             }
             FeedMessage::Midpoint(mp) => {
@@ -3262,7 +3293,7 @@ impl Arbiter {
                 // overwrites the fresher. Which of `book_ts`/`compute_ts` a floor could latch on is
                 // undecidable until this codec's offsets are validated; both are preconditions of
                 // enabling a `FeedKind::Midpoint` row (CLAUDE.md's Midpoint note).
-                self.vm(&mp.venue).emit[EMIT_MIDPOINT].inc();
+                self.vm(&mp.venue).emit_for(mp.source_id)[EMIT_MIDPOINT].inc();
                 let _ = self.tx.send(Arc::new(msg));
             }
             FeedMessage::Depth(d) => {
@@ -3291,7 +3322,7 @@ impl Arbiter {
                 match decision {
                     Admit::Emitted { opened_tick } => {
                         let vm = self.vm(&d.venue);
-                        vm.emit[EMIT_DEPTH].inc();
+                        vm.emit_for(d.source_id)[EMIT_DEPTH].inc();
                         // Attribute the admitted depth to its winning publisher — the depth mirror of
                         // `quotes_admitted`. A rise for a given transport shows which publisher currently
                         // leads the reconstructed book (and, were a public depth backstop ever added,
@@ -3464,7 +3495,7 @@ impl Arbiter {
                 }
                 if rebaseline_now {
                     let re = self.rebaseline_book(&key, publisher);
-                    self.vm(&b.venue).emit[EMIT_BOOK].inc();
+                    self.vm(&b.venue).emit_for(b.source_id)[EMIT_BOOK].inc();
                     match re {
                         // The path's whole book, this batch included, so it replaces it on the wire.
                         Some(mut full) => {
@@ -3483,7 +3514,7 @@ impl Arbiter {
                 } else {
                     self.apply_book_replay(&key, b);
                 }
-                self.vm(&b.venue).emit[EMIT_BOOK].inc();
+                self.vm(&b.venue).emit_for(b.source_id)[EMIT_BOOK].inc();
                 // Withheld only when this path's slot is behind what the market has published —
                 // a handover between publishers whose boundary streams sit slots apart. The clone
                 // is that case alone; the steady state sends the message it was handed.
@@ -3504,7 +3535,7 @@ impl Arbiter {
             // {kind="status"}` is unreachable in practice today. The path is kept for match
             // exhaustiveness and stays correct if a future call site ever emits status through here.
             FeedMessage::Status(s) => {
-                self.vm(&s.venue).emit[EMIT_STATUS].inc();
+                self.vm(&s.venue).emit_for(s.source_id)[EMIT_STATUS].inc();
                 let _ = self.tx.send(Arc::new(msg));
             }
         }
@@ -3536,6 +3567,23 @@ mod tests {
     /// the whole suite must behave exactly as it did before the tape gate was scoped, which is what
     /// makes the two category tests below evidence of the scope change and not of a rewrite.
     const TEST_CATEGORY: &str = "testcategory";
+
+    /// Two engines under one name count apart on `dz_emit_total`, by the message's own Source ID;
+    /// one merged series would hide one engine going quiet behind the other's volume.
+    #[test]
+    fn emit_counts_each_source_id_under_a_name_apart() {
+        let venue = "EmitPerSourceTest";
+        let mut vm = VenueMetrics::new(&Arc::from(venue));
+        vm.emit_for(6)[EMIT_QUOTE].inc();
+        vm.emit_for(8)[EMIT_QUOTE].inc_by(2);
+        let get = |id| {
+            metrics()
+                .emit
+                .with_label_values(&[venue, id, "quote"])
+                .get()
+        };
+        assert_eq!((get("6"), get("8")), (1, 2));
+    }
 
     #[test]
     fn quote_first_sample_admits() {

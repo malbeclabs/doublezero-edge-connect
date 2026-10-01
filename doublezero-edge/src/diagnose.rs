@@ -37,7 +37,7 @@ pub fn render_diagnose(body: &Value) -> Result<String, String> {
     } else {
         let rows: Vec<Vec<String>> = venues
             .iter()
-            .map(|v| vec![v.venue.clone(), v.status.clone()])
+            .map(|v| vec![v.label(), v.status.clone()])
             .collect();
         out.push_str(&render::table(&["VENUE", "STATUS"], &rows));
     }
