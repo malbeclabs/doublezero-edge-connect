@@ -22,12 +22,11 @@ use tracing::warn;
 use crate::{
     ingest::{
         arbiter::{lock, SharedArbiter, Transport},
-        public_input::{self, instrument_known, parse_decimal, resolve_instrument, PublicVenue},
+        public_input::{self, parse_decimal, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
     model::{
-        category_arc, now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedQuote,
-        NormalizedTrade, Side,
+        now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedQuote, NormalizedTrade, Side,
     },
 };
 
@@ -47,18 +46,24 @@ fn hl_venue() -> &'static str {
     crate::ingest::sources::source_label(HL_SOURCE_ID)
 }
 
-/// The instrument **universe** this backstop mirrors, in the same vocabulary as `Feed::category`,
-/// handed to the arbiter on every emit.
-///
-/// **Inert on this venue today**, and the comment should not pretend otherwise: `category` is read
-/// only by the `Sticky` tape gate, and this backstop serves a `Coordinated` venue, where the value
-/// is passed and ignored. It becomes load-bearing the day this venue is declared `Sticky` — the gate
-/// keys on `(venue, category)`, so a value disagreeing with the mirrored row's would make this
-/// backstop its own universe rather than another path of the same one, and the gate would stop
-/// collapsing the two copies of one fill. What survives that is whatever the `trade_id` window
-/// cannot collapse on its own, i.e. a public copy stamped with a different id than the edge copy;
-/// those would reach the wire twice. `category_names_the_row_this_backstop_mirrors` pins the value.
-const HL_CATEGORY: &str = "hl-perps";
+// The instrument **universe** each message is filed under is read off the catalog entry the coin
+// resolves to (`public_input::resolve_instrument`), never a constant. Hyperliquid's native perps
+// (`hl-perps`) and its `xyz:` builder DEX (`xyz-perps`) both arrive as Source ID 1 on this one public
+// socket, so a constant filed every `xyz:` coin under the native universe: history then looked its
+// trades up in the wrong category and dropped them as unattributable, and the day this venue turns
+// `Sticky` the tape gate (keyed on `(venue, category)`) would treat the backstop as a universe of
+// its own and stop collapsing the two copies of one fill.
+
+/// The registry row's own `&'static` spelling of a catalog `category`, which is what
+/// `Arbiter::emit` takes. Every catalog entry was defined by a row, so `None` only means the
+/// document changed under a running process (it cannot: there is no hot reload); the message is
+/// then dropped rather than filed under a universe no row names.
+fn row_category(category: &str) -> Option<&'static str> {
+    crate::ingest::feeds::feeds()
+        .iter()
+        .find(|f| f.venue == hl_venue() && f.category == category)
+        .map(|f| f.category)
+}
 
 /// Hyperliquid documents a cap of 1000 subscriptions per WebSocket connection. We fan out two
 /// subscriptions (`bbo` + `trades`) per coin over a single connection and log if the configured coin
@@ -218,9 +223,11 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
     let (Some(bid), Some(ask)) = (&d.bbo[0], &d.bbo[1]) else {
         return; // one-sided book; cannot form a two-sided quote
     };
-    if !instrument_known(instruments, HL_SOURCE_ID, &d.coin) {
+    let Some(category) = resolve_instrument(instruments, HL_SOURCE_ID, &d.coin)
+        .and_then(|r| row_category(&r.category))
+    else {
         return; // precision unknown; drop until the edge refdata defines this instrument
-    }
+    };
     let (Some((bid_px, bid_sz, bid_n)), Some((ask_px, ask_sz, ask_n))) =
         (parse_level(bid), parse_level(ask))
     else {
@@ -251,15 +258,17 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         .ws_input_messages
         .with_label_values(&[hl_venue(), "quote"])
         .inc();
-    lock(arbiter).emit(FeedMessage::Quote(quote), Transport::PublicWs, HL_CATEGORY);
+    lock(arbiter).emit(FeedMessage::Quote(quote), Transport::PublicWs, category);
 }
 
 /// Build a `NormalizedTrade` from a public `trades` element and emit it through the arbiter.
 fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) {
     // Resolves precision AND the (channel, instrument_id) identity in one scan — see
     // `resolve_instrument`'s doc for why a bare symbol match is safe for this venue.
-    let Some((channel, instrument_id)) = resolve_instrument(instruments, HL_SOURCE_ID, &t.coin)
-    else {
+    let Some(resolved) = resolve_instrument(instruments, HL_SOURCE_ID, &t.coin) else {
+        return;
+    };
+    let Some(category) = row_category(&resolved.category) else {
         return;
     };
     let (Some(price), Some(size)) = (parse_decimal(&t.px), parse_decimal(&t.sz)) else {
@@ -273,9 +282,9 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         source_name: venue_arc(hl_venue()),
         source_id: HL_SOURCE_ID,
         symbol: t.coin.into(),
-        channel,
-        instrument_id,
-        category: category_arc(HL_CATEGORY),
+        channel: resolved.channel,
+        instrument_id: resolved.instrument_id,
+        category: resolved.category.clone(),
         price,
         size,
         // HL trade side: "B" = aggressing buy, "A" = aggressing sell.
@@ -295,7 +304,7 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         .ws_input_messages
         .with_label_values(&[hl_venue(), "trade"])
         .inc();
-    lock(arbiter).emit(FeedMessage::Trade(trade), Transport::PublicWs, HL_CATEGORY);
+    lock(arbiter).emit(FeedMessage::Trade(trade), Transport::PublicWs, category);
 }
 
 #[cfg(test)]
@@ -309,33 +318,39 @@ mod tests {
 
     use super::*;
 
-    /// [`HL_CATEGORY`] must name the universe of the row this backstop actually mirrors — the
-    /// venue's top-of-book row, the row that carries both the quotes and the prints it emits.
-    ///
-    /// Deliberately **not** "every row under this venue agrees": one venue carrying two disjoint
-    /// universes is the case `Feed::category` exists to express, so that assertion would fail a
-    /// legitimate registry change and leave deleting the test as the only fix. This one still fails
-    /// if the constant drifts, because then no row matches it.
+    /// Every Hyperliquid universe the registry carries resolves to its row's own spelling, which
+    /// is what the arbiter is handed. If one did not, every message for that universe's coins would
+    /// be dropped at `row_category`.
     #[test]
-    fn category_names_the_row_this_backstop_mirrors() {
-        let mirrored = crate::ingest::feeds::feeds().iter().find(|f| {
-            f.venue == hl_venue()
-                && f.category == HL_CATEGORY
-                && f.kind == crate::ingest::feeds::FeedKind::TopOfBook
-        });
-        assert!(
-            mirrored.is_some(),
-            "no {} top-of-book row carries category {HL_CATEGORY:?}: this backstop claims to \
-             mirror a universe the registry does not publish",
-            hl_venue()
+    fn every_hyperliquid_universe_maps_to_its_row() {
+        let universes: Vec<&str> = crate::ingest::feeds::feeds()
+            .iter()
+            .filter(|f| f.venue == hl_venue())
+            .map(|f| f.category)
+            .collect();
+        assert!(universes.contains(&"hl-perps") && universes.contains(&"xyz-perps"));
+        for c in universes {
+            assert_eq!(row_category(c), Some(c));
+        }
+        assert_eq!(
+            row_category("perps"),
+            None,
+            "the pre-rename universe names no row"
         );
     }
     use crate::{ingest::arbiter::Arbiter, model::NormalizedInstrument};
 
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
+        insert(&map, symbol, "hl-perps");
+        map
+    }
+
+    /// One catalog entry for `symbol` under `category`, at channel 0 / instrument 1 — the same
+    /// identity pair in every universe, so only the category can tell two entries apart.
+    fn insert(map: &InstrumentSnapshot, symbol: &str, category: &str) {
         map.lock().unwrap().insert(
-            (hl_venue().into(), HL_CATEGORY.into(), 0u8, 1u32),
+            (hl_venue().into(), category.into(), 0u8, 1u32),
             NormalizedInstrument {
                 tick_size: 0,
                 venue: hl_venue().into(),
@@ -344,12 +359,43 @@ mod tests {
                 symbol: symbol.into(),
                 channel: 0,
                 instrument_id: 1,
-                category: HL_CATEGORY.into(),
+                category: category.into(),
                 price_exponent: -2,
                 qty_exponent: -2,
             },
         );
-        map
+    }
+
+    /// An `xyz:` coin arrives as Source ID 1 on the same public socket as the native perps, so its
+    /// trade must be filed under the universe its catalog entry belongs to, not the native one —
+    /// the two share `(channel, instrument_id)` here, so a wrong category lands on the other
+    /// market's history or none at all.
+    #[test]
+    fn an_xyz_trade_is_filed_under_its_own_universe() {
+        let (arbiter, mut rx) = arbiter_with_rx();
+        let instruments: InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        insert(&instruments, "BTC", "hl-perps");
+        insert(&instruments, "xyz:GOLD", "xyz-perps");
+        for (coin, tid) in [("xyz:GOLD", 1u64), ("BTC", 2)] {
+            let frame = format!(
+                r#"{{"channel":"trades","data":[{{"coin":"{coin}","side":"B","px":"10.0",
+                "sz":"1.0","time":1700000000000,"tid":{tid}}}]}}"#
+            );
+            handle_text(&frame, &arbiter, &instruments);
+        }
+        let mut got = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Trade(t) = &*m {
+                got.push((t.symbol.to_string(), t.category.to_string()));
+            }
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("xyz:GOLD".to_string(), "xyz-perps".to_string()),
+                ("BTC".to_string(), "hl-perps".to_string()),
+            ]
+        );
     }
 
     fn arbiter_with_rx() -> (

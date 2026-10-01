@@ -45,8 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `HL_CATEGORY` was still `perps` after the hosted feed registry renamed Hyperliquid's native
   universe to `hl-perps`, so with `--ws-input-coins` set the backstop's quotes and trades were keyed
   as a universe of their own — harmless while Hyperliquid arbitrates `Coordinated`, and a duplicate
-  tape the day it turns `Sticky`. It is now `hl-perps`, and
-  `category_names_the_row_this_backstop_mirrors` holds it to the compiled-in document again.
+  tape the day it turns `Sticky`. The category is now read off the catalog entry the coin resolves to rather than a constant, since
+  the native perps and the `xyz:` builder DEX (`xyz-perps`) both arrive as Source ID 1 on the one
+  public socket: an `xyz:` coin in `--ws-input-coins` had its trades filed under the native universe,
+  where history dropped them as unattributable or credited them to a market sharing the identity.
 - ⚠️ **The hosted feed-registry document was hand-curated, and had drifted five weeks and six rows
   behind the document this repo tests.** It is now published from `src/ingest/registry.json` by
   `.github/workflows/release.feed-registry.yml` on every change to that file on `main` — the same

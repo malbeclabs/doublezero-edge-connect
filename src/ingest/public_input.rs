@@ -25,7 +25,10 @@
 //! decode/socket error is logged and swallowed, so neither a reconnect storm nor a malformed frame
 //! can ever wedge the multicast hot path.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -177,6 +180,19 @@ pub fn instrument_known(instruments: &InstrumentSnapshot, source_id: u16, symbol
         .any(|i| i.source_id == source_id && i.symbol.as_ref() == symbol)
 }
 
+/// What [`resolve_instrument`] reads off a catalog entry: the identity a message built at this seam
+/// must carry, plus the universe it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedInstrument {
+    pub channel: u8,
+    pub instrument_id: u32,
+    /// The matched entry's `category` — the universe the edge row that defined it carries. One
+    /// public input can span several universes under its one Source ID (Hyperliquid's native perps
+    /// and the `xyz:` builder DEX both arrive as ID 1 on one public socket), so a constant would
+    /// file every symbol under one of them and history would drop the rest as unattributable.
+    pub category: Arc<str>,
+}
+
 /// Resolve the `(channel, instrument_id)` identity a trade built here must carry, from the same
 /// shared catalog [`instrument_known`] gates on. The public JSON these inputs decode has no
 /// channel/instrument_id of its own — only a bare symbol — so a `NormalizedTrade` built at this
@@ -199,11 +215,15 @@ pub fn resolve_instrument(
     instruments: &InstrumentSnapshot,
     source_id: u16,
     symbol: &str,
-) -> Option<(u8, u32)> {
+) -> Option<ResolvedInstrument> {
     crate::model::lock(instruments)
         .values()
         .find(|i| i.source_id == source_id && i.symbol.as_ref() == symbol)
-        .map(|i| (i.channel, i.instrument_id))
+        .map(|i| ResolvedInstrument {
+            channel: i.channel,
+            instrument_id: i.instrument_id,
+            category: i.category.clone(),
+        })
 }
 
 /// Parse a non-negative, finite `f64` from a decimal string, or `None`. Rejects `NaN`/`±inf`
@@ -260,7 +280,10 @@ mod tests {
         let snap = catalog(&[(4, "A", 1), (10, "dex:A", 2)]);
         assert!(instrument_known(&snap, 4, "A"));
         assert!(!instrument_known(&snap, 4, "dex:A"));
-        assert_eq!(resolve_instrument(&snap, 10, "dex:A"), Some((0, 2)));
+        assert_eq!(
+            resolve_instrument(&snap, 10, "dex:A").map(|r| (r.channel, r.instrument_id)),
+            Some((0, 2))
+        );
         assert_eq!(resolve_instrument(&snap, 4, "dex:A"), None);
     }
 
