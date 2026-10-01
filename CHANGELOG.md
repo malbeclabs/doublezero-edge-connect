@@ -485,7 +485,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BINANCE` key. A consumer follows one engine with the `source_id` subscription filter (#175).
   Source IDs 6 and 8 join both the
   document's `sources` block and the compiled-in fallback table, which a failed `Url` fetch degrades
-  to. A host activates a row only while subscribed to its code, so nothing changes on a host
+  to. Both now carry every ID `edge-feed-spec/sources/spec.md` assigns, adding the three they were
+  missing: 4 (`SETAI_FINANCIALS`), 5 (`SETAI_COMMODITIES`) and 7 (`HYPERLIQUID`, the XYZ builder
+  DEX). Without them a document with no `sources` block refused a valid row declaring one, and ID
+  7's traffic was labelled `SOURCE_7` instead of `HYPERLIQUID`. A host activates a row only while subscribed to its code, so nothing changes on a host
   subscribed to neither. Quotes only until the publisher sends `Trade`. The ports come from the
   publisher's deployment inventory and the rows say they are unconfirmed until a capture checks them.
 - **`source_id` subscription filter dimension.** Several Source IDs may share one name — Binance's

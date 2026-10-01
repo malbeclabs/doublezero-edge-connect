@@ -91,7 +91,10 @@ generated from `edge-feed-spec/sources/spec.md`, which stays the authority for i
   { "id": 1, "name": "HYPERLIQUID" },
   { "id": 2, "name": "PHOENIX" },
   { "id": 3, "name": "KALSHI" },
+  { "id": 4, "name": "SETAI_FINANCIALS" },
+  { "id": 5, "name": "SETAI_COMMODITIES" },
   { "id": 6, "name": "BINANCE" },
+  { "id": 7, "name": "HYPERLIQUID" },
   { "id": 8, "name": "BINANCE" }
 ]
 ```
