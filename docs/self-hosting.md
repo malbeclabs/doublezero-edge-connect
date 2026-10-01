@@ -71,12 +71,13 @@ The image sets `DZ_FEED_REGISTRY_URL` to the hosted document
 source instead gets the `clap` default, which is empty — no network call unless you pass
 `--feed-registry-url`/`DZ_FEED_REGISTRY_URL` yourself.
 
-The hosted document is `src/ingest/registry.json` from this repo, published by
-`.github/workflows/release.feed-registry.yml` on every change to it on `main`, with an immutable
-per-commit copy alongside at `…/feeds/doublezero-edge-feeds-<sha>.json` to pin or roll back to. It
-is published only after the loader that reads it has validated it, because a document the fleet
-cannot use is not rejected by the fleet: each host warns once and degrades to its own built-in
-copy, silently, one at a time as containers restart. Override with a different URL, or with
+The hosted document is assembled by `malbeclabs/infra`'s `scripts/feed-registry` from each
+venue's published fragment (listed in its `feeds/manifest.toml`) and republished every 30 minutes,
+with an immutable timestamped copy alongside under `…/feeds/` to pin or roll back to. It is
+validated before it is published, because a document the fleet cannot use is not rejected by the
+fleet: each host warns once and degrades to its own built-in copy, silently, one at a time as
+containers restart. This repo's `src/ingest/registry.json` is that built-in copy, not the source of
+the hosted one. Override with a different URL, or with
 `--feed-registry <path>`/`DZ_FEED_REGISTRY <path>` (a bind-mounted file, in Docker) — note the
 bridge tries the URL first when it's non-empty, so pass an empty `--feed-registry-url ""` alongside
 the file if you've also set a URL. A URL that can't be reached or fails validation falls back to
@@ -135,12 +136,11 @@ that host to its built-in copy, whatever the field.** The others the schema allo
 So until the fleet is upgraded, a document may only use values every deployed binary already
 accepts; introducing one is a release *and* a republish, in that order.
 
-Since the document is published from `main`, "in that order" means the release has to be out and the
-fleet upgraded **before the document change merges** — merging is the republish, and there is no
-later step at which to hold it back.
+Since the aggregator republishes on its own schedule, "in that order" means the release has to be out
+and the fleet upgraded **before the change reaches a fragment or the manifest** — that is the
+republish, and there is no later step at which to hold it back.
 
-⚠️ **The publisher's validation gate does not cover this class**, and cannot: it runs the loader
-from the commit being published, so a change that bumps `SUPPORTED_VERSION` and the document's
-`version` together compiles a binary that supports the new value, passes the gate, and republishes a
-document the whole *running* fleet rejects. The gate proves the document loads in the build it
-shipped with; the ordering above is what makes it load in the builds already out there.
+⚠️ **The aggregator's validation does not cover this class**, and cannot: it checks the document
+against the rules it knows today, not against every binary already deployed. A document that passes
+can still be one the *running* fleet rejects; the ordering above is what makes it load in the builds
+already out there.
