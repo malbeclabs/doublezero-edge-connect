@@ -54,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     refuses a category whose tape-claiming rows mix the two shapes (`MixedChannelShape`).
   - **The channel-filter purge.** Narrowing one row off a channel erased that channel's catalog,
     book and history while the sibling row's receiver for it kept running — history lost, and idle
+    books gone from new clients' bootstrap. A sibling the filter still admits on that channel now
+    keeps the catalog and history, and a book-building one keeps the book — judged on admission
+    rather than on which receivers run, so an unsubscribed sibling keeps its state exactly as a lone
+    row's subscription loss does. And a purge no longer runs while any receiver for that channel is
+    still draining: it is handed to that entry and reruns once the receiver has stopped, so its
+    final write cannot restore what was removed.
     books gone from new clients' bootstrap. A running sibling now keeps the catalog and history,
     and a book-building one keeps the book.
 - **The Hyperliquid public backstop emitted under a category no row carries.** `ws_input`'s

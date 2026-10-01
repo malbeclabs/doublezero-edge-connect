@@ -407,10 +407,14 @@ Modules are grouped by role under `src/`:
   that departing row's own `(venue, category, channel)` slice from all three: the catalog
   (`InstrumentSnapshot`, a `retain`), the book (routed through `Arbiter::forget_channel_books`, never
   a direct replay-map delete, so the accumulator/replay/`StickyAuthority` triple drops together), and
-  `history::Store::forget_channel` — **except what a sibling row still running that channel
-  supplies**: two derived rows of one category share that key and the filter narrows each alone, so
-  any running sibling keeps the catalog and history, and a book-building one keeps the book too
-  (`a_channel_a_sibling_row_still_runs_is_not_purged`). Category-precise throughout so a departing channel can never
+  `history::Store::forget_channel` — **except what a sibling row the filter still admits on that
+  channel supplies**: two derived rows of one category share that key and the filter narrows each
+  alone, so any admitted sibling keeps the catalog and history, and a book-building one keeps the
+  book too (`a_channel_a_sibling_row_still_admits_is_not_purged`). Admission, not "running": the
+  purge is the filter's decision, and an unsubscribed sibling keeps its state just as a lone row's
+  subscription loss does. A purge also never runs while any receiver on that channel is still
+  draining — it sets that entry's `purge` and reruns when the receiver is reaped, so a final write
+  cannot restore what it removed (`a_purge_waits_for_a_draining_sibling_on_its_channel`). Category-precise throughout so a departing channel can never
   over-drop a live peer universe sharing the same numeric id — see `ingest/feeds.rs`'s
   mid-migration warning on `channel_id`.
 - **`ingest/receiver.rs`** — the ingest hot path. All socket plumbing is **protocol-agnostic and shared**:
