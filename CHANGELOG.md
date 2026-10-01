@@ -41,6 +41,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- **Two derived rows of one category lost trades and state under an uneven channel filter.** A
+  top-of-book and a market-by-price row over the same channels (the Kalshi elections pair today,
+  and the events pair once the hosted rows land) share a universe, and two things were keyed on
+  `(venue, category)` that are really per channel:
+  - **Tape ownership.** The top-of-book row owned every channel's tape while running only the
+    channels its filter admitted, or only the ones still alive, so each market-by-price receiver of
+    the rest decoded its prints and dropped them. Ownership is now elected per `(venue, category,
+    channel)` for a derived row (`reconcile::Universe`), and the arbiter's `Sticky` tape gate is
+    keyed per channel to match, so a channel served from another host is not muted by a leader
+    streaming a different one. Shared-block rows keep category-level ownership, and the registry
+    refuses a category whose tape-claiming rows mix the two shapes (`MixedChannelShape`).
+  - **The channel-filter purge.** Narrowing one row off a channel erased that channel's catalog,
+    book and history while the sibling row's receiver for it kept running — history lost, and idle
+    books gone from new clients' bootstrap. A running sibling now keeps the catalog and history,
+    and a book-building one keeps the book.
 - **The Hyperliquid public backstop emitted under a category no row carries.** `ws_input`'s
   `HL_CATEGORY` was still `perps` after the hosted feed registry renamed Hyperliquid's native
   universe to `hl-perps`, so with `--ws-input-coins` set the backstop's quotes and trades were keyed

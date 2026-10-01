@@ -150,6 +150,13 @@ pub enum RegistryError {
         venue: String,
         category: String,
     },
+    /// Two tape-claiming rows of one `(venue, category)` disagree on shape: one derives a port per
+    /// channel and the other shares one port block. Tape ownership pairs derived rows per channel and
+    /// shared-block rows per category, so a mix would elect an owner on each and print twice.
+    MixedChannelShape {
+        venue: String,
+        category: String,
+    },
     /// A row's `emit_trades` contradicts whether its kind can ever own a tape.
     EmitTradesDisagrees {
         venue: String,
@@ -264,6 +271,12 @@ impl std::fmt::Display for RegistryError {
                 "{venue}/{category}: rows declare different `source_id`s; rows sharing a category \
                  are one universe to tape ownership, so one engine's row would mute the other's \
                  trades — give each engine its own category"
+            ),
+            RegistryError::MixedChannelShape { venue, category } => write!(
+                f,
+                "{venue}/{category}: tape-claiming rows mix a per-channel (`derived`) shape with a \
+                 shared port block; tape ownership pairs the first per channel and the second per \
+                 category, so each would elect its own owner and the tape would print twice"
             ),
             RegistryError::ArbitrationDisagreement { venue } => write!(
                 f,
@@ -847,6 +860,8 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
         std::collections::HashMap::new();
     let mut declared: std::collections::HashMap<(&str, &str), Option<u16>> =
         std::collections::HashMap::new();
+    let mut shapes: std::collections::HashMap<(&str, &str), bool> =
+        std::collections::HashMap::new();
     let mut group_ports = std::collections::HashSet::new();
     let mut mbo_categories: std::collections::HashMap<&str, &str> =
         std::collections::HashMap::new();
@@ -893,6 +908,25 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
             std::collections::hash_map::Entry::Occupied(_) => {}
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(f.source_id);
+            }
+        }
+
+        // Tape ownership is elected per `(venue, category, channel)` for a derived row and per
+        // `(venue, category)` for a shared-block one (`reconcile::Universe`), which is only sound if
+        // a category's tape-claiming rows are all one or all the other.
+        if crate::ingest::reconcile::tape_rank_is_some(f.kind) {
+            let derived = f.publishers.iter().any(|p| p.channel.is_some());
+            match shapes.entry((f.venue, f.category)) {
+                std::collections::hash_map::Entry::Occupied(e) if *e.get() != derived => {
+                    return Err(RegistryError::MixedChannelShape {
+                        venue: f.venue.to_string(),
+                        category: f.category.to_string(),
+                    })
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(derived);
+                }
             }
         }
 
@@ -2078,6 +2112,31 @@ mod tests {
             &format!("{rows}{}", sibling(r#","source_id":6"#)),
         );
         build(&doc, "test").expect("a sibling agreeing on the ID loads");
+    }
+
+    /// A category whose tape-claiming rows mix a derived row with a shared-block one is refused:
+    /// ownership would be elected per channel for one and per category for the other, and both would
+    /// print. Two derived rows (the Kalshi events and elections pairs) load.
+    #[test]
+    fn a_category_mixing_channel_shapes_is_refused() {
+        let flat_tob = r#"{
+            "venue":"KALSHI","category":"sports","code":"t","kind":"TopOfBook",
+            "group":"233.84.178.17","emit_trades":true,"arbitration":"Sticky",
+            "publishers":{"explicit":[{"mktdata":33000,"refdata":43000}]}}"#;
+        let err = build(&doc_with(&format!("{SPORTS_ROW},{flat_tob}")), "test")
+            .map(|_| ())
+            .expect_err("a derived and a shared-block row in one category");
+        assert!(
+            matches!(&err, RegistryError::MixedChannelShape { category, .. } if category == "sports"),
+            "{err:?}"
+        );
+        let derived_tob = r#"{
+            "venue":"KALSHI","category":"sports","code":"t","kind":"TopOfBook",
+            "group":"233.84.178.17","emit_trades":true,"arbitration":"Sticky",
+            "publishers":{"derived":{"channels":[{"range":[10,12]},{"id":49}],
+                "ports":{"mktdata":35000,"refdata":45000}}}}"#;
+        build(&doc_with(&format!("{SPORTS_ROW},{derived_tob}")), "test")
+            .expect("two derived rows share a category");
     }
 
     /// Optional: a row declaring none loads exactly as before, at the name-level status key.

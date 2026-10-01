@@ -1447,15 +1447,23 @@ pub struct Arbiter {
     /// Bounded like `instrument_defs`: one entry per `(source, symbol)` that ever carries a zero-id
     /// print, which no live feed does today.
     no_id_owner: HashMap<(SourceKey, Arc<str>), (Transport, u64)>,
-    /// Which **path** serves each `Sticky` universe's tape, keyed on `(source, category)`. See
-    /// [`Arbiter::tape_path_admits`]. One entry per `Sticky` universe that has ever printed.
+    /// Which **path** serves each `Sticky` universe's tape, keyed on `(source, category)` plus the
+    /// print's canonical `channel`. See [`Arbiter::tape_path_admits`]. One entry per `Sticky`
+    /// universe and channel that has ever printed — bounded by 256 channels per universe.
+    ///
+    /// Per channel because a universe's channels need not come off the same paths: a derived
+    /// row's league channels pair with a sibling row's per channel (`reconcile::Universe`), and the
+    /// reconciler can hand channel 11's tape to a market-by-price receiver on one host while a
+    /// top-of-book receiver on another serves channel 10. One leader per category would then drop
+    /// every channel-11 print, and the silence handover would never fire while channel 10 streams.
+    /// Mirrored paths still collapse: they stamp the same canonical channel.
     ///
     /// Venue alone would let a publisher on one universe mute a publisher on a disjoint one: a
     /// single Source ID can carry universes that mirror nothing, and the gate below drops every
     /// print from a path that is not the leader. That drop has no bound in practice — the silence
     /// handover only fires once the incumbent stops, and an incumbent streaming its own universe
     /// never does — so the loser's tape goes dark for the life of the process.
-    tape_leader: HashMap<ScopeKey, TapeLead>,
+    tape_leader: HashMap<(ScopeKey, u8), TapeLead>,
     /// Whether the zero-id double-print warning has fired; the metric carries the ongoing rate.
     no_id_conflict_logged: bool,
     /// Whether the "batches carry no `last`" warning has fired.
@@ -2955,12 +2963,12 @@ impl Arbiter {
     /// venue with **no `book` traffic** the authority tracks and elects nobody, so a forged publisher that
     /// prints first holds the tape until it goes quiet for a window — the same primitive
     /// [`StickyAuthority::admit`]'s no-dark-start already exposes for the `book` product, and not
-    /// closable without an identity the wire does not carry. And the gate spans a whole **category**:
-    /// it assumes the rows sharing one carry mirrored tapes, so if two of them instead sharded prints
-    /// between them the non-serving path's exclusive fills would be dropped — the registry's job is to
-    /// give sharded rows distinct categories. `dz_tape_path_dropped_total` is what makes either visible
-    /// — deliberately its own counter, not folded into `dz_trades_dropped_total`, whose steady state
-    /// here is the challenger's whole feed.
+    /// closable without an identity the wire does not carry. And the gate spans a whole category's
+    /// **channel**: it assumes the paths printing one canonical channel carry mirrored tapes, so if
+    /// two of them instead sharded that channel's prints the non-serving path's exclusive fills would
+    /// be dropped. Sharding *by channel* is safe — each channel has its own leader.
+    /// `dz_tape_path_dropped_total` is what makes either visible — deliberately its own counter, not
+    /// folded into `dz_trades_dropped_total`, whose steady state here is the challenger's whole feed.
     ///
     /// The two `books` lookups below read the authority at the **same** `(source, category)` grain
     /// this gate runs at, so the deferral can only ever name a path elected on *this* universe. While
@@ -2977,9 +2985,11 @@ impl Arbiter {
     ) -> bool {
         // Interned, so the per-print key is two refcount bumps rather than an allocation. One key for
         // the tape gate and the authority alike: they must not disagree about what a universe is.
-        let key: ScopeKey = (SourceKey::of(t), category_arc(category));
-        let elected = self.books.scope_leader(&key);
-        let tracked = self.books.tracks_path(&key, publisher);
+        let scope: ScopeKey = (SourceKey::of(t), category_arc(category));
+        let elected = self.books.scope_leader(&scope);
+        let tracked = self.books.tracks_path(&scope, publisher);
+        let books = &self.books;
+        let key = (scope, t.channel);
         let Some(lead) = self.tape_leader.get_mut(&key) else {
             self.tape_leader.insert(
                 key,
@@ -2993,7 +3003,7 @@ impl Arbiter {
         };
         let transfer = lead.path != publisher;
         if transfer {
-            let displaces_uncorroborated = tracked && !self.books.tracks_path(&key, lead.path);
+            let displaces_uncorroborated = tracked && !books.tracks_path(&key.0, lead.path);
             let new_election = elected == Some(publisher) && lead.honored_election != elected;
             let silent = t.recv_ts_ns.saturating_sub(lead.last_ns) > NO_ID_TAPE_HANDOVER_NS;
             if !(displaces_uncorroborated || new_election || silent) {
@@ -6134,6 +6144,28 @@ mod tests {
             a.emit(FeedMessage::Trade(t), p, TEST_CATEGORY);
         }
         assert_eq!(drain_trades(&mut rx), 2);
+    }
+
+    /// A universe's channels need not come off the same paths: the reconciler can hand channel 11's
+    /// tape to a market-by-price receiver on one host while a top-of-book receiver on another serves
+    /// channel 10. Each channel elects its own leader, so neither mutes the other — while a second
+    /// path on a channel that already has one is still collapsed.
+    #[test]
+    fn each_channel_of_a_sticky_universe_has_its_own_tape_leader() {
+        let venue = "TapePerChannel";
+        let (mut a, mut rx) = sticky_tape(venue);
+        let print = |a: &mut Arbiter, p, channel, id| {
+            let mut t = trade(id);
+            t.venue = venue.into();
+            t.channel = channel;
+            t.recv_ts_ns = 1_000;
+            a.emit(FeedMessage::Trade(t), p, TEST_CATEGORY);
+        };
+        print(&mut a, path(1), 10, 1);
+        print(&mut a, path(2), 11, 2);
+        assert_eq!(drain_trades(&mut rx), 2, "one leader per channel");
+        print(&mut a, path(2), 10, 3);
+        assert_eq!(drain_trades(&mut rx), 0, "channel 10 already has a leader");
     }
 
     /// A dead leader must not mute the tape: past the handover window the challenger takes it, and the
