@@ -4018,6 +4018,33 @@ mod tests {
         assert_eq!(drain_quotes(&mut rx).len(), 2);
     }
 
+    /// The Binance shape: perps (6) and spot (8) are both `BINANCE`, both list `BTCUSDT`, and both
+    /// are published by one host — so they arrive from the **same** source IP address, under their
+    /// own categories. Neither latches the other's floor: both copies at one `source_ts` are
+    /// admitted, and one engine running ahead never makes the other's later tick look stale.
+    #[test]
+    fn binance_engines_quoting_one_symbol_keep_separate_floors() {
+        let host = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let btc = |source_id, ts, bid| {
+            let mut q = quote(ts, bid, bid + 1.0);
+            q.source_id = source_id;
+            q.venue = "BINANCE".into();
+            q.source_name = "BINANCE".into();
+            q.symbol = "BTCUSDT".into();
+            FeedMessage::Quote(q)
+        };
+        a.emit(btc(6, 1000, 100.0), host, "usdsm");
+        a.emit(btc(8, 1000, 100.0), host, "spot");
+        a.emit(btc(6, 2000, 101.0), host, "usdsm");
+        a.emit(btc(8, 1500, 99.0), host, "spot");
+        assert_eq!(
+            drain_quotes(&mut rx),
+            vec![(1000, 100.0), (1000, 100.0), (2000, 101.0), (1500, 99.0)]
+        );
+    }
+
     /// Same for trades: one ID's trade_id window does not swallow the other's.
     #[test]
     fn identical_trades_from_two_ids_sharing_a_name_both_emit() {

@@ -28,14 +28,29 @@ the narrowing to one venue.
 > its own socket requesting `--recv-buf` (default 8 MiB): the eleven-publisher Hyperliquid fleet
 > binds 55 sockets (11 × 2 Top-of-Book + 11 × 3 Market-by-Order), 60 with Phoenix's two rows
 > (2 Top-of-Book + 3 Market-by-Price), 65 with Kalshi's two single-publisher perps rows
-> (2 Top-of-Book + 3 Market-by-Price), and 158 with Kalshi's derived 31-channel events row
-> (`edge-kalshi-sports-mbp`, 31 × 3 Market-by-Price), so a fully-subscribed host's requested
-> `SO_RCVBUF` total is ~1.24 GiB where a single-publisher deployment requested ~40 MiB.
+> (2 Top-of-Book + 3 Market-by-Price), 158 with Kalshi's derived 31-channel events row
+> (`edge-kalshi-sports-mbp`, 31 × 3 Market-by-Price), 188 with Kalshi's two derived six-channel
+> elections rows (`edge-kalshi-elections-pol-tob` and `-mbp`, 6 × 2 + 6 × 3), and 192 with
+> Binance's two single-publisher Top-of-Book rows (`edge-binance-usdsm-tob` and
+> `edge-binance-spot-tob`, 2 × 2), so a fully-subscribed host's requested `SO_RCVBUF` total is
+> ~1.5 GiB where a single-publisher deployment requested ~40 MiB.
 > `net.core.rmem_max` clamps each socket individually and will not catch the aggregate — and the
 > value every installer sets (`268435456`) is a per-socket ceiling well above the 8 MiB default, so
 > it will not bound this either. Lower `DZ_RECV_BUF` or narrow `--publisher-port` if that exceeds the
 > host's or container's memory budget. Market-by-Order additionally holds one independent L3 book set
 > per publisher, so book memory also scales with the publisher count.
+
+**Binance** is two matching engines under one registry name, `BINANCE`: USD-margined perpetuals
+(Source ID 6, group code `edge-binance-usdsm-tob`) and spot (Source ID 8, `edge-binance-spot-tob`).
+Both are Top-of-Book on their own group and the same two ports (`30001` mktdata, `30002` refdata),
+each row activated only while the host is subscribed to its own code, so a host may carry either
+engine without the other. Both engines list symbols such as `BTCUSDT`; each row in the built-in
+document declares its `source_id`, so their health, `status`, `/v1/status` entries and `dz_feed_up`
+series stay apart. A row that declares none (the hosted document's, until the publisher's fragments
+gain the field) reports both engines under the one name-level `BINANCE` key, where one live engine
+masks the other's outage. A `source_name`/`venue` subscription filter matches both engines; a
+consumer follows one with the `source_id` filter (see PROTOCOL.md). Quotes only for now: the rows already claim the tape, so trades flow as
+soon as the publisher sends them.
 
 **Market-by-Order** (datagram magic `0x4444`) serves **both** book products from the one reconstructed L3 book: the full-state top-10 `depth` it has always served, and — new — the order-level **`order_book`**, carrying the venue's own `order_id` on every change. The two are arbitrated differently because the wire allows it. `depth` races on its content, per publisher; `order_book` races on the **venue event identity** every publisher stamps identically, so each event is published once from whichever publisher was fastest for *that event*, rather than one publisher being elected to serve the market. What makes that safe is a per-order guard at the merge point rather than the dedup window (`--arb-book-dedup-window-ms`, 1 s): a change for an order already published as gone is refused, and so is one older than the last change published for that order or older than the channel's retention window (`--arb-book-retention-secs`, 30 s). A late copy therefore costs a redundant emission at worst, and a link returning with minutes of buffered backlog reaches no consumer at all. Watch `dz_book_resurrections_dropped_total` (the guard working, rising with how far one publisher lags) and `dz_mbo_path_disagreement_total` (a book that has drifted) — see [Metrics](metrics.md).
 

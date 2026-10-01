@@ -30,8 +30,10 @@
     "The signal for the last two is dz_datagrams_received_total{role} pinned at 0.",
     "",
     "SOURCES. `sources` is the optional Source ID -> name allocation. A name is emitted verbatim as",
-    "`venue`/`source_name` on the wire and as every `venue=` metric label, so it must be uppercase, and",
-    "an id or a name may appear only once - two rows sharing either collapse into one identity. An id",
+    "`venue`/`source_name` on the wire and as every `venue=` metric label, so it must be uppercase. An",
+    "id may appear only once; several ids may share a name (one venue running several matching",
+    "engines), and a row then says which id it carries with `source_id`, so each engine keeps its own",
+    "health and status. `source_id` must be an id this block assigns to the row's own `venue`. An id",
     "this block does not assign is not an error: it gets a synthesized SOURCE_<id> label. Id 0 and the",
     "SOURCE_<id>/UNREGISTERED names are reserved for that and refused here. A row's own `venue` is only",
     "the default for Source IDs this document does not assign; the Source ID on the wire is",
@@ -51,7 +53,12 @@
   "sources": [
     { "id": 1, "name": "HYPERLIQUID" },
     { "id": 2, "name": "PHOENIX" },
-    { "id": 3, "name": "KALSHI" }
+    { "id": 3, "name": "KALSHI" },
+    { "id": 4, "name": "SETAI_FINANCIALS" },
+    { "id": 5, "name": "SETAI_COMMODITIES" },
+    { "id": 6, "name": "BINANCE" },
+    { "id": 7, "name": "HYPERLIQUID" },
+    { "id": 8, "name": "BINANCE" }
   ],
   "feeds": [
     {
@@ -372,6 +379,63 @@
           "channels": [{ "range": [50, 55] }],
           "ports": { "mktdata": 36000, "refdata": 46000, "snapshot": 56000 }
         }
+      }
+    },
+    {
+      "venue": "BINANCE",
+      "category": "usdsm",
+      "code": "edge-binance-usdsm-tob",
+      "kind": "TopOfBook",
+      "group": "233.84.178.23",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "source_id": 6,
+      "notes": [
+        "USD-margined perpetual futures: best bid and offer. Trades are not sent yet.",
+        "",
+        "Top-of-Book & Trades wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/spec.md",
+        "",
+        "PORTS. One block, read verbatim.",
+        "",
+        "PUBLISHERS. 1, on this one port block.",
+        "",
+        "SOURCE. Source ID 6. The spot row below is Source ID 8 under the same name, BINANCE, and both list",
+        "symbols such as BTCUSDT: tell them apart by `source_id`, never by `venue` and `symbol` alone.",
+        "",
+        "STATUS. Not yet confirmed from a subscriber. A permanently-zero dz_receiver_up here is a wrong value",
+        "in this row, not a quiet feed."
+      ],
+      "publishers": {
+        "explicit": [{ "mktdata": 30001, "refdata": 30002 }]
+      }
+    },
+    {
+      "venue": "BINANCE",
+      "category": "spot",
+      "code": "edge-binance-spot-tob",
+      "kind": "TopOfBook",
+      "group": "233.84.178.31",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "source_id": 8,
+      "notes": [
+        "Spot: best bid and offer. Trades are not sent yet.",
+        "",
+        "Top-of-Book & Trades wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/spec.md",
+        "",
+        "PORTS. One block, read verbatim. The same ports as the USD-margined row, on a different group.",
+        "",
+        "PUBLISHERS. 1, on this one port block.",
+        "",
+        "SOURCE. Source ID 8; see the USD-margined row above for the shared name.",
+        "",
+        "STATUS. Not yet confirmed from a subscriber. A permanently-zero dz_receiver_up here is a wrong value",
+        "in this row, not a quiet feed."
+      ],
+      "publishers": {
+        "explicit": [{ "mktdata": 30001, "refdata": 30002 }]
       }
     }
   ]

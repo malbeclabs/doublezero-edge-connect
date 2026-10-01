@@ -476,6 +476,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- **Binance feeds: USD-margined perpetuals and spot, Top-of-Book.** Two rows in the compiled-in
+  feed registry, `edge-binance-usdsm-tob` (group `233.84.178.23`, Source ID 6) and
+  `edge-binance-spot-tob` (`233.84.178.31`, Source ID 8), both `BINANCE`, both on ports
+  `30001`/`30002`, both `Sticky` and claiming the tape; each declares its `source_id`, so the two
+  engines keep separate health, `status` and `/v1/status` entries — under the built-in document only:
+  the hosted document's rows do not declare it yet, and report both engines under one name-level
+  `BINANCE` key. A consumer follows one engine with the `source_id` subscription filter (#175).
+  Source IDs 6 and 8 join both the
+  document's `sources` block and the compiled-in fallback table, which a failed `Url` fetch degrades
+  to. Both now carry every ID `edge-feed-spec/sources/spec.md` assigns, adding the three they were
+  missing: 4 (`SETAI_FINANCIALS`), 5 (`SETAI_COMMODITIES`) and 7 (`HYPERLIQUID`, the XYZ builder
+  DEX). Without them a document with no `sources` block refused a valid row declaring one, and ID
+  7's traffic was labelled `SOURCE_7` instead of `HYPERLIQUID`. A host activates a row only while subscribed to its code, so nothing changes on a host
+  subscribed to neither. Quotes only until the publisher sends `Trade`. The ports come from the
+  publisher's deployment inventory and the rows say they are unconfirmed until a capture checks them.
 - **`source_id` subscription filter dimension.** Several Source IDs may share one name — Binance's
   USD-margined perpetuals (6) and spot (8) are both `BINANCE` and both list `BTCUSDT` — and a
   `{"venue":"BINANCE","symbol":"BTCUSDT"}` subscriber receives both engines interleaved. A

@@ -27,8 +27,11 @@ pub struct SourceAssignment {
 /// Hyperliquid-schema sink (`sinks::hyperliquid`) so the two cannot drift apart.
 pub const HYPERLIQUID_SOURCE_ID: u16 = 1;
 
-/// The compiled-in mirror, used when the resolved document carries no `sources` block.
-const BUILT_IN: [SourceAssignment; 3] = [
+/// The compiled-in mirror, used when the resolved document carries no `sources` block. It carries
+/// **every** ID `edge-feed-spec/sources/spec.md` assigns, not only the ones a built-in row uses: a
+/// document with no block validates every row against this table, so a missing ID refuses a valid
+/// row declaring it, and labels that ID's traffic `SOURCE_<id>` instead of its name.
+const BUILT_IN: [SourceAssignment; 8] = [
     SourceAssignment {
         id: HYPERLIQUID_SOURCE_ID,
         name: "HYPERLIQUID",
@@ -41,7 +44,36 @@ const BUILT_IN: [SourceAssignment; 3] = [
         id: 3,
         name: KALSHI,
     },
+    // Setai's two platforms. They predate the rule that a `Code` names the venue, so each keeps its
+    // engine-level name (`sources/spec.md`).
+    SourceAssignment {
+        id: 4,
+        name: "SETAI_FINANCIALS",
+    },
+    SourceAssignment {
+        id: 5,
+        name: "SETAI_COMMODITIES",
+    },
+    // Two matching engines under one name — USD-margined perpetuals and spot. Carried here as well
+    // as in the document because a `Url` failure degrades to the built-in copy, and the Binance
+    // rows must still resolve there.
+    SourceAssignment {
+        id: 6,
+        name: BINANCE,
+    },
+    // Hyperliquid's XYZ builder DEX: a second engine sharing ID 1's name.
+    SourceAssignment {
+        id: 7,
+        name: "HYPERLIQUID",
+    },
+    SourceAssignment {
+        id: 8,
+        name: BINANCE,
+    },
 ];
+
+/// Source IDs 6 (USD-margined perpetuals) and 8 (spot)'s shared registry name.
+const BINANCE: &str = "BINANCE";
 
 /// The assignments in force, installed once by `ingest::feeds::init` alongside the feed rows.
 static INSTALLED: OnceLock<&'static [SourceAssignment]> = OnceLock::new();
@@ -193,7 +225,7 @@ mod tests {
         assert_eq!(source_name(2), Some("PHOENIX"));
     }
 
-    /// All three assigned production IDs resolve. The wire value is authoritative — a publisher
+    /// Every assigned production ID resolves. The wire value is authoritative — a publisher
     /// stamping the wrong ID is a publisher defect, fixed at the publisher; this crate reports what
     /// the wire says and never substitutes a row's own venue for it.
     #[test]
@@ -201,6 +233,17 @@ mod tests {
         assert_eq!(source_name(1), Some("HYPERLIQUID"));
         assert_eq!(source_name(2), Some("PHOENIX"));
         assert_eq!(source_name(3), Some(KALSHI));
+        assert_eq!(source_name(4), Some("SETAI_FINANCIALS"));
+        assert_eq!(source_name(5), Some("SETAI_COMMODITIES"));
+        assert_eq!(source_name(6), Some(BINANCE));
+        assert_eq!(source_name(7), Some("HYPERLIQUID"));
+        assert_eq!(source_name(8), Some(BINANCE));
+    }
+
+    /// Both Binance engines resolve under the one name, and neither swallows the other.
+    #[test]
+    fn both_binance_engines_resolve_under_one_name() {
+        assert_eq!(source_ids_of(BINANCE), vec![6, 8]);
     }
 
     /// Registry names are uppercase, so a consumer composing `SOURCE:SYMBOL` never has to case-fold
@@ -294,7 +337,7 @@ mod tests {
 
     #[test]
     fn names_map_back_to_their_registry_ids() {
-        assert_eq!(source_ids_of("HYPERLIQUID"), vec![1]);
+        assert_eq!(source_ids_of("HYPERLIQUID"), vec![1, 7]);
         assert_eq!(source_ids_of("PHOENIX"), vec![2]);
         assert!(source_ids_of("Nonesuch").is_empty());
     }
