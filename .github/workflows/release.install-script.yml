@@ -11,8 +11,8 @@ name: release.install-script
 # configure-aws-credentials step fails. See the design doc / infra runbook.
 #
 # The feed-registry document under the feeds/ keys of the same bucket is published by
-# release.feed-registry.yml, on its own path trigger — it is a different artifact with a
-# different cadence, not another key to add here.
+# malbeclabs/infra's feed-registry aggregator — a different artifact with its own publisher,
+# not another key to add here.
 on:
   push:
     branches: [main]
