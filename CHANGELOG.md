@@ -60,55 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     row's subscription loss does. And a purge no longer runs while any receiver for that channel is
     still draining: it is handed to that entry and reruns once the receiver has stopped, so its
     final write cannot restore what was removed.
-    books gone from new clients' bootstrap. A running sibling now keeps the catalog and history,
-    and a book-building one keeps the book.
 - **The Hyperliquid public backstop emitted under a category no row carries.** `ws_input`'s
   `HL_CATEGORY` was still `perps` after the hosted feed registry renamed Hyperliquid's native
   universe to `hl-perps`, so with `--ws-input-coins` set the backstop's quotes and trades were keyed
   as a universe of their own — harmless while Hyperliquid arbitrates `Coordinated`, and a duplicate
-  tape the day it turns `Sticky`. The category is now read off the catalog entry the coin resolves to rather than a constant, since
-  the native perps and the `xyz:` builder DEX (`xyz-perps`) both arrive as Source ID 1 on the one
+  tape the day it turns `Sticky`. The category is now read off the catalog entry the coin resolves
+  to rather than a constant, since the native perps and the `xyz:` builder DEX (`xyz-perps`) both arrive as Source ID 1 on the one
   public socket: an `xyz:` coin in `--ws-input-coins` had its trades filed under the native universe,
   where history dropped them as unattributable or credited them to a market sharing the identity.
-- ⚠️ **The hosted feed-registry document was hand-curated, and had drifted five weeks and six rows
-  behind the document this repo tests.** It is now published from `src/ingest/registry.json` by
-  `.github/workflows/release.feed-registry.yml` on every change to that file on `main` — the same
-  `doublezero-install` bucket, CloudFront distribution and OIDC deploy role that publish the
-  `connect` one-liner, and only after `cargo test --lib ingest::registry` has run the real loader
-  over the document, since a document the fleet cannot use is not rejected by the fleet: each host
-  warns once and degrades to its own built-in copy, silently, one at a time as containers restart.
-
-  Drift here is not cosmetic, because a `Url` origin **wins** over the copy compiled into the image:
-  whatever the hosted document says is what a default container runs. Fetched on 2026-09-18 it was
-  last modified 2026-08-11 and served three rows where the built-in copy served nine — no
-  Hyperliquid, no Phoenix, no Kalshi elections — and carried no `publisher_offset` on any row, which
-  is the field that folds a mirrored publisher's `channel_id` back onto the league's. Without it
-  every mirrored Kalshi market appeared in the catalog twice, `/v1/products` reported a bare
-  `KALSHI:KXBTCPERP` as ambiguous, and `history::Key` split each tape into two series
-  (`processor::tests::tob_mirror_offset_collapses_catalog_identity` is the property). The three rows
-  it did carry had the right group, kind, ports and channel set — every value a subscriber binds on
-  matched — so nothing about the drift was visible from a receiver's liveness.
-
-  What the operator sees change, on the first container start after this publishes: six more rows,
-  `edge-kalshi-sports-mbp`'s `category` as `events` (the rename that merged in #152 and was inert
-  until now), and one catalog entry per Kalshi market instead of two. Each publish also leaves an
-  immutable `…/feeds/doublezero-edge-feeds-<sha>.json` beside `-latest`, to pin a host that must not
-  move under a republish, or to roll back to — written **before** `-latest` moves, so whatever
-  `-latest` points at always has a pin target that exists. The publisher runs in one queued,
-  non-cancelling lane (the image publisher's pattern, `queue: max` included) so two merges cannot
-  finish out of order and leave `-latest` on the older document, and it is gated to `main`, since
-  `workflow_dispatch` otherwise runs a branch's own copy of the workflow against the deploy role.
-
-  ⚠️ One rule tightens with the cadence, and it is wider than the `sources` block it was first
-  written for. **Any** document change an already-deployed binary rejects at parse or validation
-  degrades that host to its own built-in copy — a `version` bump (the loader's check is an equality
-  test, not a floor), a new `kind` or `arbitration` value (closed enums, so an unknown variant fails
-  the parse of the whole document), or a Source ID assignment it cannot resolve — so the release has
-  to be out and the fleet upgraded **before the document change merges**, because merging is the
-  republish and there is no later step at which to hold it back. The validation gate above does not
-  substitute for that ordering: it runs the loader from the commit being published, so a change
-  bumping `SUPPORTED_VERSION` and the document `version` together passes it and republishes a
-  document the whole running fleet rejects. `docs/self-hosting.md` states the rule.
 - **This repo no longer publishes the hosted feed registry.** #161 published `src/ingest/registry.json`
   to `feeds/doublezero-edge-feeds-latest.json` on every change to it on `main` — the same key
   `malbeclabs/infra`'s feed-registry aggregator republishes every 30 minutes from the venues' own
