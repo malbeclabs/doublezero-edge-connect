@@ -377,7 +377,7 @@ mod tests {
     fn sports_ports_are_the_base_plus_the_channel_id() {
         let row = feeds()
             .iter()
-            .find(|f| f.venue == "KALSHI" && f.category == "events")
+            .find(|f| f.code == "edge-kalshi-sports-mbp")
             .expect("no events row");
         assert_eq!(row.code, "edge-kalshi-sports-mbp");
         assert_eq!(row.group, Ipv4Addr::new(233, 84, 178, 20));
@@ -461,13 +461,15 @@ mod tests {
         // place.
         for f in feeds() {
             let expected = match (f.venue, f.category, f.kind) {
-                ("HYPERLIQUID", "perps", FeedKind::TopOfBook | FeedKind::MarketByOrder) => {
-                    "tiredsolid"
-                }
+                ("HYPERLIQUID", "hl-perps", FeedKind::TopOfBook) => "edge-hyper-hl-tob",
+                ("HYPERLIQUID", "hl-perps", FeedKind::MarketByOrder) => "edge-hyper-hl-mbo",
+                ("HYPERLIQUID", "xyz-perps", FeedKind::TopOfBook) => "edge-hyper-xyz-tob",
+                ("HYPERLIQUID", "xyz-perps", FeedKind::MarketByOrder) => "edge-hyper-xyz-mbo",
                 ("PHOENIX", "perps", FeedKind::TopOfBook) => "edge-phoenix-tob",
                 ("PHOENIX", "perps", FeedKind::MarketByPrice) => "edge-phoenix-mbp",
                 ("KALSHI", "perps", FeedKind::TopOfBook) => "edge-kalshi-perps-tob",
                 ("KALSHI", "perps", FeedKind::MarketByPrice) => "edge-kalshi-perps-mbp",
+                ("KALSHI", "events", FeedKind::TopOfBook) => "edge-kalshi-sports-tob",
                 ("KALSHI", "events", FeedKind::MarketByPrice) => "edge-kalshi-sports-mbp",
                 ("KALSHI", "elections", FeedKind::TopOfBook) => "edge-kalshi-elections-pol-tob",
                 ("KALSHI", "elections", FeedKind::MarketByPrice) => "edge-kalshi-elections-pol-mbp",
@@ -689,29 +691,54 @@ mod tests {
         }
     }
 
-    /// The Hyperliquid fleet mirrors one venue across eleven publishers - six DoubleZero hosts,
-    /// four partners and one unattributed. Pins the count so a dropped row is caught, and pins the
-    /// exact base-port set: the registry previously held only the six in-house hosts, which is the
-    /// bug this list fixes, so "some publishers present" is not a strong enough assertion.
+    /// Hyperliquid is two universes — the native perps (`hl-perps`) and the XYZ builder DEX
+    /// (`xyz-perps`) — each a top-of-book and a market-by-order row on groups of their own. Every
+    /// row is one port block shared by its publishers (told apart by source IP address), so each
+    /// expands to exactly one receiver. Like the Kalshi and Binance tests, this pins document →
+    /// expansion consistency only; the values are copied from the hosted document.
     #[test]
-    fn hyperliquid_lists_the_whole_publisher_fleet() {
-        let base_ports = |kind: FeedKind| -> Vec<u16> {
+    fn the_hyperliquid_rows_expand_consistently_with_the_document() {
+        for (category, kind, code, group, ports) in [
+            (
+                "hl-perps",
+                FeedKind::TopOfBook,
+                "edge-hyper-hl-tob",
+                27,
+                (20000, 20001, None),
+            ),
+            (
+                "hl-perps",
+                FeedKind::MarketByOrder,
+                "edge-hyper-hl-mbo",
+                28,
+                (20010, 20011, Some(20012)),
+            ),
+            (
+                "xyz-perps",
+                FeedKind::TopOfBook,
+                "edge-hyper-xyz-tob",
+                29,
+                (20100, 20101, None),
+            ),
+            (
+                "xyz-perps",
+                FeedKind::MarketByOrder,
+                "edge-hyper-xyz-mbo",
+                30,
+                (20110, 20111, Some(20112)),
+            ),
+        ] {
             let f = feeds()
                 .iter()
-                .find(|f| f.venue == "HYPERLIQUID" && f.kind == kind)
-                .unwrap();
-            let mut v: Vec<u16> = f.publishers.iter().map(|p| p.base_port()).collect();
-            v.sort_unstable();
-            v
-        };
-        assert_eq!(
-            base_ports(FeedKind::TopOfBook),
-            vec![9001, 9011, 9101, 9201, 9301, 9401, 9501, 9601, 9701, 9801, 9901]
-        );
-        assert_eq!(
-            base_ports(FeedKind::MarketByOrder),
-            vec![10001, 10011, 10101, 10201, 10301, 10401, 10501, 10601, 10701, 10801, 10901]
-        );
+                .find(|f| f.venue == "HYPERLIQUID" && f.category == category && f.kind == kind)
+                .unwrap_or_else(|| panic!("Hyperliquid {category} {kind:?} row"));
+            assert_eq!(f.code, code);
+            assert_eq!(f.group, Ipv4Addr::new(233, 84, 178, group));
+            assert_eq!(f.publishers.len(), 1, "{code}: one shared block");
+            let p = &f.publishers[0].ports;
+            assert_eq!((p.mktdata(), p.refdata(), p.snapshot()), ports, "{code}");
+            assert_eq!(f.emit_trades, kind == FeedKind::TopOfBook, "{code}");
+        }
     }
 
     /// Within a publisher's block the offsets follow the publisher implementation: `+1`/`+2` on every

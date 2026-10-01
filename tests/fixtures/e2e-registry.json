@@ -1,0 +1,185 @@
+{
+  "version": 1,
+  "notes": [
+    "The registry the end-to-end tests run the real binary against, pinned here so they do not move",
+    "when the production document does. The Hyperliquid rows keep a layout the production document",
+    "no longer has - several publishers on distinct port blocks of one group - because that is what",
+    "two_publisher_port_blocks_are_both_ingested exercises; the replayed fixtures name no port, so the",
+    "values only have to agree with tests/common/replay.rs."
+  ],
+  "sources": [
+    {
+      "id": 1,
+      "name": "HYPERLIQUID"
+    },
+    {
+      "id": 2,
+      "name": "PHOENIX"
+    }
+  ],
+  "feeds": [
+    {
+      "venue": "HYPERLIQUID",
+      "category": "hl-perps",
+      "code": "tiredsolid",
+      "kind": "TopOfBook",
+      "group": "233.84.178.15",
+      "emit_trades": true,
+      "arbitration": "Coordinated",
+      "publishers": {
+        "explicit": [
+          {
+            "mktdata": 9001,
+            "refdata": 9002
+          },
+          {
+            "mktdata": 9011,
+            "refdata": 9012
+          },
+          {
+            "mktdata": 9101,
+            "refdata": 9102
+          },
+          {
+            "mktdata": 9201,
+            "refdata": 9202
+          },
+          {
+            "mktdata": 9301,
+            "refdata": 9302
+          },
+          {
+            "mktdata": 9401,
+            "refdata": 9402
+          },
+          {
+            "mktdata": 9501,
+            "refdata": 9502
+          },
+          {
+            "mktdata": 9601,
+            "refdata": 9602
+          },
+          {
+            "mktdata": 9701,
+            "refdata": 9702,
+            "notes": "No traffic has ever been observed from this block. Its receiver reports dz_receiver_up 0, and that is the publisher, not your subscription."
+          },
+          {
+            "mktdata": 9801,
+            "refdata": 9802
+          },
+          {
+            "mktdata": 9901,
+            "refdata": 9902
+          }
+        ]
+      }
+    },
+    {
+      "venue": "HYPERLIQUID",
+      "category": "hl-perps",
+      "code": "tiredsolid",
+      "kind": "MarketByOrder",
+      "group": "233.84.178.15",
+      "emit_trades": false,
+      "arbitration": "Coordinated",
+      "publishers": {
+        "explicit": [
+          {
+            "mktdata": 10001,
+            "refdata": 10002,
+            "snapshot": 10003
+          },
+          {
+            "mktdata": 10011,
+            "refdata": 10012,
+            "snapshot": 10013
+          },
+          {
+            "mktdata": 10101,
+            "refdata": 10102,
+            "snapshot": 10103
+          },
+          {
+            "mktdata": 10201,
+            "refdata": 10202,
+            "snapshot": 10203
+          },
+          {
+            "mktdata": 10301,
+            "refdata": 10302,
+            "snapshot": 10303
+          },
+          {
+            "mktdata": 10401,
+            "refdata": 10402,
+            "snapshot": 10403
+          },
+          {
+            "mktdata": 10501,
+            "refdata": 10502,
+            "snapshot": 10503
+          },
+          {
+            "mktdata": 10601,
+            "refdata": 10602,
+            "snapshot": 10603
+          },
+          {
+            "mktdata": 10701,
+            "refdata": 10702,
+            "snapshot": 10703,
+            "notes": "No traffic has ever been observed from this block. Its receiver reports dz_receiver_up 0, and that is the publisher, not your subscription."
+          },
+          {
+            "mktdata": 10801,
+            "refdata": 10802,
+            "snapshot": 10803
+          },
+          {
+            "mktdata": 10901,
+            "refdata": 10902,
+            "snapshot": 10903,
+            "notes": "Only this block's refdata port has been observed on the wire; its mktdata and snapshot ports are inferred from the block layout, so silence here can be a wrong port rather than a quiet publisher."
+          }
+        ]
+      }
+    },
+    {
+      "venue": "PHOENIX",
+      "category": "perps",
+      "code": "edge-phoenix-tob",
+      "kind": "TopOfBook",
+      "group": "233.84.178.24",
+      "emit_trades": true,
+      "arbitration": "Coordinated",
+      "publishers": {
+        "explicit": [
+          {
+            "mktdata": 9201,
+            "refdata": 9202
+          }
+        ]
+      }
+    },
+    {
+      "venue": "PHOENIX",
+      "category": "perps",
+      "code": "edge-phoenix-mbp",
+      "kind": "MarketByPrice",
+      "group": "233.84.178.25",
+      "emit_trades": true,
+      "arbitration": "Coordinated",
+      "publishers": {
+        "explicit": [
+          {
+            "mktdata": 9211,
+            "refdata": 9212,
+            "snapshot": 9213
+          }
+        ]
+      }
+    }
+  ]
+}

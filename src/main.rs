@@ -1039,42 +1039,52 @@ mod tests {
     #[test]
     fn publisher_selection_narrows_by_base_port() {
         registry();
-        let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201, 9401]).unwrap();
-        let hl_tob = sel
+        let sel = filter_publishers(select_feeds(&[]).unwrap(), &[34010, 34012]).unwrap();
+        let events_mbp = sel
             .iter()
-            .find(|f| f.venue == "HYPERLIQUID" && f.kind == feeds::FeedKind::TopOfBook)
+            .find(|f| f.code == "edge-kalshi-sports-mbp")
             .unwrap();
-        let ports: Vec<u16> = hl_tob.publishers.iter().map(|p| p.base_port()).collect();
-        assert_eq!(ports, vec![9201, 9401]);
+        let ports: Vec<u16> = events_mbp
+            .publishers
+            .iter()
+            .map(|p| p.base_port())
+            .collect();
+        assert_eq!(ports, vec![34010, 34012]);
     }
 
     /// A feed left with no matching publisher drops out entirely rather than running with zero
-    /// publishers (9401 is a Hyperliquid-only block; Phoenix publishes on 9201/9211).
+    /// publishers (34010 is a Kalshi events market-by-price block and nothing else).
     #[test]
     fn feeds_without_a_matching_base_port_drop_out() {
         registry();
-        let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9401]).unwrap();
+        let sel = filter_publishers(select_feeds(&[]).unwrap(), &[34010]).unwrap();
         assert!(!sel.iter().any(|f| f.venue == "PHOENIX"));
-        assert!(sel.iter().any(|f| f.venue == "HYPERLIQUID"));
+        assert_eq!(
+            sel.iter().map(|f| f.code).collect::<Vec<_>>(),
+            vec!["edge-kalshi-sports-mbp"]
+        );
     }
 
-    /// Base ports are unique **within** a feed, not across feeds: 9201 is both a Hyperliquid TOB
-    /// block and Phoenix's top-of-book block, so selecting it keeps a publisher on each. Scoping
-    /// to one venue is `--feed`'s job.
+    /// Base ports are unique **within** a feed, not across feeds: both Binance rows publish on
+    /// 30001, each on its own group, so selecting it keeps a publisher on each. Scoping to one
+    /// venue is `--feed`'s job.
     #[test]
     fn base_ports_are_not_unique_across_feeds() {
         registry();
-        let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201]).unwrap();
-        let venues: std::collections::HashSet<&str> = sel.iter().map(|f| f.venue).collect();
-        assert!(venues.contains("HYPERLIQUID"));
-        assert!(venues.contains("PHOENIX"));
+        let sel = filter_publishers(select_feeds(&[]).unwrap(), &[30001]).unwrap();
+        let mut codes: Vec<&str> = sel.iter().map(|f| f.code).collect();
+        codes.sort_unstable();
+        assert_eq!(
+            codes,
+            vec!["edge-binance-spot-tob", "edge-binance-usdsm-tob"]
+        );
         assert!(sel
             .iter()
-            .all(|f| f.publishers.iter().all(|p| p.base_port() == 9201)));
+            .all(|f| f.publishers.iter().all(|p| p.base_port() == 30001)));
 
         let scoped =
-            filter_publishers(select_feeds(&["PHOENIX".to_string()]).unwrap(), &[9201]).unwrap();
-        assert!(scoped.iter().all(|f| f.venue == "PHOENIX"));
+            filter_publishers(select_feeds(&["BINANCE".to_string()]).unwrap(), &[30001]).unwrap();
+        assert!(scoped.iter().all(|f| f.venue == "BINANCE"));
     }
 
     #[test]
@@ -1093,7 +1103,7 @@ mod tests {
         registry();
         let sports = feeds::feeds()
             .iter()
-            .find(|f| f.category == "events")
+            .find(|f| f.code == "edge-kalshi-sports-mbp")
             .expect("the built-in registry has an events row");
         let chan10_port = sports
             .publishers
@@ -1130,7 +1140,7 @@ mod tests {
         registry();
         let sports = feeds::feeds()
             .iter()
-            .find(|f| f.category == "events")
+            .find(|f| f.code == "edge-kalshi-sports-mbp")
             .expect("the built-in registry has an events row");
         let chan10_port = sports
             .publishers

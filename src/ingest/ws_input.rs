@@ -58,7 +58,7 @@ fn hl_venue() -> &'static str {
 /// collapsing the two copies of one fill. What survives that is whatever the `trade_id` window
 /// cannot collapse on its own, i.e. a public copy stamped with a different id than the edge copy;
 /// those would reach the wire twice. `category_names_the_row_this_backstop_mirrors` pins the value.
-const HL_CATEGORY: &str = "perps";
+const HL_CATEGORY: &str = "hl-perps";
 
 /// Hyperliquid documents a cap of 1000 subscriptions per WebSocket connection. We fan out two
 /// subscriptions (`bbo` + `trades`) per coin over a single connection and log if the configured coin

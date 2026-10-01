@@ -195,7 +195,7 @@ Modules are grouped by role under `src/`:
   installed by `feeds::init` (called once from `main` before any receiver spawns); the backing
   `OnceLock` is deliberately **not** `pub`, so a consumer reading it directly is a compile error
   rather than a silently-missing row. Each `Feed` is one multicast group mapped to one
-  venue, with a group `code` (`tiredsolid`/`edge-phoenix-tob` — the identifier `doublezero status` reports,
+  venue, with a group `code` (`edge-hyper-hl-tob`/`edge-phoenix-tob` — the identifier `doublezero status` reports,
   matched by the reconciler), a `FeedKind` (which protocol) and **N `FeedPublisher` rows**, one per
   publisher mirroring the feed, each with its own `FeedPorts` block (`TwoPort` for TOB/Midpoint, or
   `ThreePort` adding a snapshot port for MBO). One receiver task runs per publisher. A publisher's
@@ -230,9 +230,11 @@ Modules are grouped by role under `src/`:
   blocks unbound and the bridge ingesting about a third of the group's datagrams. (The rule used to
   live in the document's own notes; it moved here when those notes were rewritten for the operators
   who read them — `registry.json` states what a subscriber needs, this states how we verify it.)
-  One row-level fact that lived there too: Hyperliquid's `9011`/`10011` block is on the wire and in
-  no inventory, and its depth half is the group's highest-volume publisher — its owner is still to
-  be established, so **do not drop the row** for being unattributed. A third **Kalshi** row
+  Hyperliquid is two universes on four groups — `hl-perps` (`edge-hyper-hl-tob`/`-mbo`, the native
+  perps) and `xyz-perps` (`edge-hyper-xyz-*`, the XYZ builder DEX) — each row one port block shared
+  by three publishers; it replaced the one `tiredsolid` group of eleven blocks. Neither row declares
+  a `source_id`: `sources/spec.md` says ID 1 is still stamped on the builder DEXes too until its
+  publishers filter, so declaring 7 on `xyz-perps` would be a claim the wire does not make yet. A third **Kalshi** row
   (`edge-kalshi-sports-mbp`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
   under the same Source ID — hence its own `category` (`events`: sport is one kind of event
   market and the row carries more than sport, while the group `code` stays the ledger's

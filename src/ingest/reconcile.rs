@@ -1521,7 +1521,7 @@ mod tests {
     fn the_filter_narrows_the_desired_receiver_set() {
         let sports = *crate::ingest::feeds::feeds()
             .iter()
-            .find(|f| f.category == "events")
+            .find(|f| f.code == "edge-kalshi-sports-mbp")
             .expect("the built-in registry has an events row");
         let filter = ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap();
 
@@ -1549,7 +1549,7 @@ mod tests {
     fn sports_row() -> Feed {
         *crate::ingest::feeds::feeds()
             .iter()
-            .find(|f| f.category == "events")
+            .find(|f| f.code == "edge-kalshi-sports-mbp")
             .expect("the built-in registry has an events row")
     }
 
