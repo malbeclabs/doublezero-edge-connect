@@ -17,23 +17,24 @@ input delivered a given update.
 | **Hyperliquid public WS** (`ingest::ws_input`) | **off** | on when `--ws-input-coins` is non-empty | `--ws-input-coins` (`WS_INPUT_COINS`, e.g. `BTC,ETH`) · `--ws-input-url` (`WS_INPUT_URL`, default `wss://api.hyperliquid.xyz/ws`) |
 | **Phoenix public WS** (`ingest::phoenix_input`) | **off** | on when `--phoenix-ws-input-markets` is non-empty | `--phoenix-ws-input-markets` (`PHOENIX_WS_INPUT_MARKETS`, bare tickers e.g. `SOL,BTC`) · `--phoenix-ws-input-url` (`PHOENIX_WS_INPUT_URL`, default `wss://perp-api.phoenix.trade/v1/ws`) |
 
-One receiver task runs per `(venue, protocol, publisher)`, so an eleven-publisher venue runs eleven
-receivers per protocol. Each is a full receiver — and for Market-by-Order a full independent book —
+One receiver task runs per `(venue, protocol, publisher)`, where a publisher is one port block, so a
+feed published on N blocks runs N receivers per protocol (publishers sharing one block share one
+receiver, told apart by source IP address). Each is a full receiver — and for Market-by-Order a full independent book —
 so `--publisher-port` (`DZ_PUBLISHER_PORTS`) is the release valve for capping ingest cost or
 excluding a misbehaving publisher. A publisher is named by its **base port** — the market-data port
 of its block — which is unique within a feed but not across feeds, so pair it with `--feed` to scope
 the narrowing to one venue.
 
 > **Size `--recv-buf` against the socket count, not one socket.** Every port of every publisher is
-> its own socket requesting `--recv-buf` (default 8 MiB): the eleven-publisher Hyperliquid fleet
-> binds 55 sockets (11 × 2 Top-of-Book + 11 × 3 Market-by-Order), 60 with Phoenix's two rows
-> (2 Top-of-Book + 3 Market-by-Price), 65 with Kalshi's two single-publisher perps rows
-> (2 Top-of-Book + 3 Market-by-Price), 158 with Kalshi's derived 31-channel events row
-> (`edge-kalshi-sports-mbp`, 31 × 3 Market-by-Price), 188 with Kalshi's two derived six-channel
-> elections rows (`edge-kalshi-elections-pol-tob` and `-mbp`, 6 × 2 + 6 × 3), and 192 with
-> Binance's two single-publisher Top-of-Book rows (`edge-binance-usdsm-tob` and
+> its own socket requesting `--recv-buf` (default 8 MiB): Hyperliquid's four rows bind 10 sockets
+> (`hl-perps` and `xyz-perps`, each one 2-port Top-of-Book and one 3-port Market-by-Order block),
+> 15 with Phoenix's two rows (2 Top-of-Book + 3 Market-by-Price), 20 with Kalshi's two
+> single-block perps rows (2 + 3), 175 with Kalshi's two derived 31-channel events rows
+> (`edge-kalshi-sports-tob` and `-mbp`, 31 × 2 + 31 × 3), 205 with Kalshi's two derived six-channel
+> elections rows (`edge-kalshi-elections-pol-tob` and `-mbp`, 6 × 2 + 6 × 3), and 209 with
+> Binance's two single-block Top-of-Book rows (`edge-binance-usdsm-tob` and
 > `edge-binance-spot-tob`, 2 × 2), so a fully-subscribed host's requested `SO_RCVBUF` total is
-> ~1.5 GiB where a single-publisher deployment requested ~40 MiB.
+> ~1.6 GiB where a single-publisher deployment requested ~40 MiB.
 > `net.core.rmem_max` clamps each socket individually and will not catch the aggregate — and the
 > value every installer sets (`268435456`) is a per-socket ceiling well above the 8 MiB default, so
 > it will not bound this either. Lower `DZ_RECV_BUF` or narrow `--publisher-port` if that exceeds the

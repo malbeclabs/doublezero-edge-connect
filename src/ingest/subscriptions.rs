@@ -818,11 +818,13 @@ mod tests {
     fn market_data_feeds_match_by_code() {
         let enabled: &[Feed] = feeds();
 
-        // Subscribed to Hyperliquid's group only -> both HL rows (TOB + MBO), not Phoenix.
-        let hl = subs(&["tiredsolid", "edge-solana-shreds"], &[]);
+        // Subscribed to Hyperliquid's native top-of-book group only -> that one row: its
+        // market-by-order sibling rides a group of its own now, and the XYZ rows are another
+        // universe. Not Phoenix.
+        let hl = subs(&["edge-hyper-hl-tob", "edge-solana-shreds"], &[]);
         let got = hl.market_data_feeds(enabled);
-        assert_eq!(got.len(), 2);
-        assert!(got.iter().all(|f| f.venue == "HYPERLIQUID"));
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].venue, got[0].category), ("HYPERLIQUID", "hl-perps"));
 
         // Subscribed to Phoenix's top-of-book group only -> that row, not the MBP sibling.
         let px = subs(&["edge-phoenix-tob"], &[]);

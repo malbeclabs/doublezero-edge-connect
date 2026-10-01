@@ -1235,7 +1235,7 @@ pub(crate) fn sports_channel_ids() -> Vec<u8> {
     let row = doc
         .feeds
         .iter()
-        .find(|f| f.category == "events")
+        .find(|f| f.code == "edge-kalshi-sports-mbp")
         .expect("built-in document has no events row");
     match &row.publishers {
         Publishers::Derived(d) => published_set_entries(row, &d.channels)

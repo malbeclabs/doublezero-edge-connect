@@ -51,98 +51,391 @@
     "one is not a bump."
   ],
   "sources": [
-    { "id": 1, "name": "HYPERLIQUID" },
-    { "id": 2, "name": "PHOENIX" },
-    { "id": 3, "name": "KALSHI" },
-    { "id": 4, "name": "SETAI_FINANCIALS" },
-    { "id": 5, "name": "SETAI_COMMODITIES" },
-    { "id": 6, "name": "BINANCE" },
-    { "id": 7, "name": "HYPERLIQUID" },
-    { "id": 8, "name": "BINANCE" }
+    {
+      "id": 1,
+      "name": "HYPERLIQUID"
+    },
+    {
+      "id": 2,
+      "name": "PHOENIX"
+    },
+    {
+      "id": 3,
+      "name": "KALSHI"
+    },
+    {
+      "id": 4,
+      "name": "SETAI_FINANCIALS"
+    },
+    {
+      "id": 5,
+      "name": "SETAI_COMMODITIES"
+    },
+    {
+      "id": 6,
+      "name": "BINANCE"
+    },
+    {
+      "id": 7,
+      "name": "HYPERLIQUID"
+    },
+    {
+      "id": 8,
+      "name": "BINANCE"
+    }
   ],
   "feeds": [
     {
-      "venue": "HYPERLIQUID",
+      "venue": "KALSHI",
       "category": "perps",
-      "code": "tiredsolid",
+      "code": "edge-kalshi-perps-tob",
       "kind": "TopOfBook",
-      "group": "233.84.178.15",
+      "group": "233.84.178.3",
       "emit_trades": true,
-      "arbitration": "Coordinated",
+      "arbitration": "Sticky",
+      "publisher_offset": 100,
       "notes": [
-        "Hyperliquid perpetuals, top of book and trades. Depth for the same venue is the market-by-order",
-        "row below, on this same group.",
+        "Kalshi perpetuals, top of book and trades. The venue's depth is edge-kalshi-perps-mbp, on a",
+        "separate group behind a separate subscription.",
         "",
-        "PORTS. One block per publisher, written out because the bases follow no arithmetic rule - a block",
-        "can sit anywhere (9011 is base+10, not base+N*100). Within a block, refdata is mktdata+1. Read a",
-        "block from its market-data port; never compute a market-data port from a position in this list.",
+        "TAPE. Both perps rows carry trades.",
         "",
-        "PUBLISHERS. Eleven, each on its own port block and each carrying the whole feed. No mirror offset",
-        "here: a publisher is identified by its block, not by a channel id.",
+        "Top-of-Book & Trades wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/spec.md",
         "",
-        "TAPE. This row carries the venue's trades; the depth row below is depth-only."
+        "PORTS. One block, read verbatim.",
+        "",
+        "PUBLISHERS. 2, on the same ports. The second stamps every channel id raised by 100, which publisher_offset records."
       ],
       "publishers": {
         "explicit": [
-          { "mktdata": 9001, "refdata": 9002 },
-          { "mktdata": 9011, "refdata": 9012 },
-          { "mktdata": 9101, "refdata": 9102 },
-          { "mktdata": 9201, "refdata": 9202 },
-          { "mktdata": 9301, "refdata": 9302 },
-          { "mktdata": 9401, "refdata": 9402 },
-          { "mktdata": 9501, "refdata": 9502 },
-          { "mktdata": 9601, "refdata": 9602 },
           {
-            "mktdata": 9701,
-            "refdata": 9702,
-            "notes": "No traffic has ever been observed from this block. Its receiver reports dz_receiver_up 0, and that is the publisher, not your subscription."
-          },
-          { "mktdata": 9801, "refdata": 9802 },
-          { "mktdata": 9901, "refdata": 9902 }
+            "mktdata": 31000,
+            "refdata": 41000
+          }
+        ]
+      }
+    },
+    {
+      "venue": "KALSHI",
+      "category": "perps",
+      "code": "edge-kalshi-perps-mbp",
+      "kind": "MarketByPrice",
+      "group": "233.84.178.4",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "publisher_offset": 100,
+      "notes": [
+        "Kalshi perpetuals, market-by-price depth and trades.",
+        "",
+        "TAPE. Both perps rows carry trades.",
+        "",
+        "Market-by-Price wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/market-by-price/spec.md",
+        "",
+        "PORTS. One block, read verbatim.",
+        "",
+        "PUBLISHERS. 2, on the same ports. The second stamps every channel id raised by 100, which publisher_offset records."
+      ],
+      "publishers": {
+        "explicit": [
+          {
+            "mktdata": 32000,
+            "refdata": 42000,
+            "snapshot": 52000
+          }
+        ]
+      }
+    },
+    {
+      "venue": "KALSHI",
+      "category": "events",
+      "code": "edge-kalshi-sports-tob",
+      "kind": "TopOfBook",
+      "group": "233.84.178.17",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "publisher_offset": 100,
+      "notes": [
+        "Kalshi event markets, top of book and trades, one channel per league or sport. The code",
+        "stays edge-kalshi-sports-tob because it is the ledger's; the category is events.",
+        "",
+        "CHANNELS. The same published set as edge-kalshi-sports-mbp, on the same channel ids.",
+        "Ids are permanent from first publication: 30-38 are reserved for promoting a competition",
+        "out of a tag channel and are not published, and 63 and 120 are retired and never reissued.",
+        "An id listed here that the publisher does not send binds a socket that stays silent, which",
+        "reads as a dead publisher.",
+        "",
+        "Top-of-Book & Trades wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/spec.md",
+        "",
+        "PORTS. base + channel id % 100 on every role, for each of the 31 channels.",
+        "",
+        "PUBLISHERS. 2, on the same ports. The second stamps every channel id raised by 100, which publisher_offset records."
+      ],
+      "publishers": {
+        "derived": {
+          "channels": [
+            {
+              "range": [
+                10,
+                29
+              ]
+            },
+            {
+              "range": [
+                39,
+                49
+              ]
+            }
+          ],
+          "ports": {
+            "mktdata": 33000,
+            "refdata": 43000
+          }
+        }
+      }
+    },
+    {
+      "venue": "KALSHI",
+      "category": "events",
+      "code": "edge-kalshi-sports-mbp",
+      "kind": "MarketByPrice",
+      "group": "233.84.178.20",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "publisher_offset": 100,
+      "notes": [
+        "Kalshi event markets, market-by-price depth and trades, one channel per league or sport.",
+        "Each channel has its own reset count, sequence series and snapshot cycle.",
+        "",
+        "CHANNELS. Ids are permanent from first publication: 30-38 are reserved for promoting a",
+        "competition out of a tag channel and are not published, and 63 and 120 are retired and never",
+        "reissued. An id listed here that the publisher does not send binds a socket that stays",
+        "silent, which reads as a dead publisher.",
+        "",
+        "Market-by-Price wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/market-by-price/spec.md",
+        "",
+        "PORTS. base + channel id % 100 on every role, for each of the 31 channels.",
+        "",
+        "PUBLISHERS. 2, on the same ports. The second stamps every channel id raised by 100, which publisher_offset records."
+      ],
+      "publishers": {
+        "derived": {
+          "channels": [
+            {
+              "range": [
+                10,
+                29
+              ]
+            },
+            {
+              "range": [
+                39,
+                49
+              ]
+            }
+          ],
+          "ports": {
+            "mktdata": 34000,
+            "refdata": 44000,
+            "snapshot": 54000
+          }
+        }
+      }
+    },
+    {
+      "venue": "KALSHI",
+      "category": "elections",
+      "code": "edge-kalshi-elections-pol-tob",
+      "kind": "TopOfBook",
+      "group": "233.84.178.21",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "publisher_offset": 100,
+      "notes": [
+        "Kalshi political event markets, top of book and trades, one channel per family.",
+        "",
+        "Top-of-Book & Trades wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/spec.md",
+        "",
+        "PORTS. base + channel id % 100 on every role, for each of the 6 channels.",
+        "",
+        "PUBLISHERS. 2, on the same ports. The second stamps every channel id raised by 100, which publisher_offset records."
+      ],
+      "publishers": {
+        "derived": {
+          "channels": [
+            {
+              "range": [
+                50,
+                55
+              ]
+            }
+          ],
+          "ports": {
+            "mktdata": 35000,
+            "refdata": 45000
+          }
+        }
+      }
+    },
+    {
+      "venue": "KALSHI",
+      "category": "elections",
+      "code": "edge-kalshi-elections-pol-mbp",
+      "kind": "MarketByPrice",
+      "group": "233.84.178.22",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "publisher_offset": 100,
+      "notes": [
+        "Kalshi political event markets, market-by-price depth and trades, one channel per family.",
+        "",
+        "STATUS. Not confirmed from a subscriber. The top-of-book sibling has been; this row's group,",
+        "ports and snapshot plane rest on what the publishing hosts are configured with. Check that",
+        "its receivers report liveness on all three port roles before trusting a book from it.",
+        "",
+        "Market-by-Price wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/market-by-price/spec.md",
+        "",
+        "PORTS. base + channel id % 100 on every role, for each of the 6 channels.",
+        "",
+        "PUBLISHERS. 2, on the same ports. The second stamps every channel id raised by 100, which publisher_offset records."
+      ],
+      "publishers": {
+        "derived": {
+          "channels": [
+            {
+              "range": [
+                50,
+                55
+              ]
+            }
+          ],
+          "ports": {
+            "mktdata": 36000,
+            "refdata": 46000,
+            "snapshot": 56000
+          }
+        }
+      }
+    },
+    {
+      "venue": "HYPERLIQUID",
+      "category": "hl-perps",
+      "code": "edge-hyper-hl-tob",
+      "kind": "TopOfBook",
+      "group": "233.84.178.27",
+      "emit_trades": true,
+      "arbitration": "Coordinated",
+      "notes": [
+        "Hyperliquid native perpetuals: best bid/ask and trades.",
+        "",
+        "TAPE. This row carries the universe's trades; edge-hyper-hl-mbo is depth only.",
+        "",
+        "Top-of-Book & Trades wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/spec.md",
+        "",
+        "PORTS. One block, read verbatim.",
+        "",
+        "PUBLISHERS. 3, sharing this one port block and distinguished only by source IP address."
+      ],
+      "publishers": {
+        "explicit": [
+          {
+            "mktdata": 20000,
+            "refdata": 20001
+          }
         ]
       }
     },
     {
       "venue": "HYPERLIQUID",
-      "category": "perps",
-      "code": "tiredsolid",
+      "category": "hl-perps",
+      "code": "edge-hyper-hl-mbo",
       "kind": "MarketByOrder",
-      "group": "233.84.178.15",
+      "group": "233.84.178.28",
       "emit_trades": false,
       "arbitration": "Coordinated",
       "notes": [
-        "Hyperliquid perpetuals, market-by-order depth, on the same group as the top-of-book row above.",
+        "Hyperliquid native perpetuals: the order-level book.",
         "",
-        "PORTS. One block per publisher, paired with that row's blocks: refdata is mktdata+1 and the",
-        "snapshot the book recovery depends on is mktdata+2.",
+        "TAPE. Depth only: edge-hyper-hl-tob owns this universe's trades.",
         "",
-        "PUBLISHERS. Eleven, the same set as the top-of-book row by construction - a publisher onboarded to",
-        "one and forgotten on the other appears as a venue whose depth is missing a mirror.",
+        "Market-by-Order wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/market-by-order/spec.md",
         "",
-        "TAPE. Depth only: top of book owns this venue's trades."
+        "PORTS. One block, read verbatim.",
+        "",
+        "PUBLISHERS. 3, sharing this one port block and distinguished only by source IP address."
       ],
       "publishers": {
         "explicit": [
-          { "mktdata": 10001, "refdata": 10002, "snapshot": 10003 },
-          { "mktdata": 10011, "refdata": 10012, "snapshot": 10013 },
-          { "mktdata": 10101, "refdata": 10102, "snapshot": 10103 },
-          { "mktdata": 10201, "refdata": 10202, "snapshot": 10203 },
-          { "mktdata": 10301, "refdata": 10302, "snapshot": 10303 },
-          { "mktdata": 10401, "refdata": 10402, "snapshot": 10403 },
-          { "mktdata": 10501, "refdata": 10502, "snapshot": 10503 },
-          { "mktdata": 10601, "refdata": 10602, "snapshot": 10603 },
           {
-            "mktdata": 10701,
-            "refdata": 10702,
-            "snapshot": 10703,
-            "notes": "No traffic has ever been observed from this block. Its receiver reports dz_receiver_up 0, and that is the publisher, not your subscription."
-          },
-          { "mktdata": 10801, "refdata": 10802, "snapshot": 10803 },
+            "mktdata": 20010,
+            "refdata": 20011,
+            "snapshot": 20012
+          }
+        ]
+      }
+    },
+    {
+      "venue": "HYPERLIQUID",
+      "category": "xyz-perps",
+      "code": "edge-hyper-xyz-tob",
+      "kind": "TopOfBook",
+      "group": "233.84.178.29",
+      "emit_trades": true,
+      "arbitration": "Coordinated",
+      "notes": [
+        "Hyperliquid xyz builder-DEX perpetuals (xyz:-prefixed symbols): best bid/ask and trades.",
+        "",
+        "TAPE. This row carries the universe's trades; edge-hyper-xyz-mbo is depth only.",
+        "",
+        "Top-of-Book & Trades wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/spec.md",
+        "",
+        "PORTS. One block, read verbatim.",
+        "",
+        "PUBLISHERS. 3, sharing this one port block and distinguished only by source IP address."
+      ],
+      "publishers": {
+        "explicit": [
           {
-            "mktdata": 10901,
-            "refdata": 10902,
-            "snapshot": 10903,
-            "notes": "Only this block's refdata port has been observed on the wire; its mktdata and snapshot ports are inferred from the block layout, so silence here can be a wrong port rather than a quiet publisher."
+            "mktdata": 20100,
+            "refdata": 20101
+          }
+        ]
+      }
+    },
+    {
+      "venue": "HYPERLIQUID",
+      "category": "xyz-perps",
+      "code": "edge-hyper-xyz-mbo",
+      "kind": "MarketByOrder",
+      "group": "233.84.178.30",
+      "emit_trades": false,
+      "arbitration": "Coordinated",
+      "notes": [
+        "Hyperliquid xyz builder-DEX perpetuals (xyz:-prefixed symbols): the order-level book.",
+        "",
+        "TAPE. Depth only: edge-hyper-xyz-tob owns this universe's trades.",
+        "",
+        "Market-by-Order wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/market-by-order/spec.md",
+        "",
+        "PORTS. One block, read verbatim.",
+        "",
+        "PUBLISHERS. 3, sharing this one port block and distinguished only by source IP address."
+      ],
+      "publishers": {
+        "explicit": [
+          {
+            "mktdata": 20110,
+            "refdata": 20111,
+            "snapshot": 20112
           }
         ]
       }
@@ -163,12 +456,17 @@
         "refdata channel: the instrument catalog is keyed on the refdata channel, so a divergence lists",
         "every Phoenix product twice and makes the bare PHOENIX:SYMBOL product ids ambiguous.",
         "",
-        "PUBLISHERS. One, and no mirror offset.",
+        "PUBLISHERS. Three, all on these ports and channel 1 with no mirror offset, told apart by source IP address.",
         "",
         "TAPE. Both Phoenix rows claim it; the market-by-price row states how the two resolve."
       ],
       "publishers": {
-        "explicit": [{ "mktdata": 9201, "refdata": 9202 }]
+        "explicit": [
+          {
+            "mktdata": 9201,
+            "refdata": 9202
+          }
+        ]
       }
     },
     {
@@ -186,7 +484,7 @@
         "CHANNELS. One, id 1, on all three roles - the channel the top-of-book row carries, for the reason",
         "stated there.",
         "",
-        "PUBLISHERS. One, and no mirror offset.",
+        "PUBLISHERS. Three, all on these ports and channel 1 with no mirror offset, told apart by source IP address.",
         "",
         "TAPE. Both rows claim it: this row's mktdata role carries Trade byte-identical to the top-of-book",
         "row's. The reconciler ranks TopOfBook above MarketByPrice when both run, and the overlap at a",
@@ -197,188 +495,13 @@
         "consumer's own fill count is the only tripwire."
       ],
       "publishers": {
-        "explicit": [{ "mktdata": 9211, "refdata": 9212, "snapshot": 9213 }]
-      }
-    },
-    {
-      "venue": "KALSHI",
-      "category": "perps",
-      "code": "edge-kalshi-perps-tob",
-      "kind": "TopOfBook",
-      "group": "233.84.178.3",
-      "emit_trades": true,
-      "arbitration": "Sticky",
-      "publisher_offset": 100,
-      "notes": [
-        "Kalshi perpetuals, top of book and trades. The venue's depth is the market-by-price row below, on",
-        "a separate group behind a separate subscription - a host may hold either code without the other.",
-        "",
-        "PORTS. One block, read verbatim. The market-by-price sibling's block is spaced differently; see",
-        "that row.",
-        "",
-        "PUBLISHERS. Two, sharing this one port block and distinguished only by source IP address. The",
-        "second mirrors the whole published set, stamping every wire channel_id raised by 100, which is",
-        "what `publisher_offset` records: ingest canonicalises the mirror's channel id back to the base",
-        "publisher's for catalog and history identity only, never for the per-publisher book and sequence",
-        "state, which stays keyed on the raw wire channel id.",
-        "",
-        "TAPE. Both rows claim it and which one prints is decided at runtime, so a host subscribed only to",
-        "edge-kalshi-perps-mbp must still serve `trade`.",
-        "",
-        "STATUS. Both groups are live on testnet and mainnet. A permanently-zero dz_receiver_up here is a",
-        "wrong value in this row, not a quiet feed."
-      ],
-      "publishers": {
-        "explicit": [{ "mktdata": 31000, "refdata": 41000 }]
-      }
-    },
-    {
-      "venue": "KALSHI",
-      "category": "perps",
-      "code": "edge-kalshi-perps-mbp",
-      "kind": "MarketByPrice",
-      "group": "233.84.178.4",
-      "emit_trades": true,
-      "arbitration": "Sticky",
-      "publisher_offset": 100,
-      "notes": [
-        "Kalshi perpetuals, market-by-price depth, on its own group behind its own subscription.",
-        "",
-        "PORTS. One block, spaced +10000/+20000 rather than the +1/+2 the Hyperliquid blocks use. Read it",
-        "verbatim.",
-        "",
-        "PUBLISHERS. Mirrored exactly like the top-of-book sibling: a second publisher on the same block,",
-        "every channel_id raised by 100. See edge-kalshi-perps-tob.",
-        "",
-        "TAPE. Both rows claim it; see the top-of-book sibling."
-      ],
-      "publishers": {
-        "explicit": [{ "mktdata": 32000, "refdata": 42000, "snapshot": 52000 }]
-      }
-    },
-    {
-      "venue": "KALSHI",
-      "category": "events",
-      "code": "edge-kalshi-sports-mbp",
-      "kind": "MarketByPrice",
-      "group": "233.84.178.20",
-      "emit_trades": true,
-      "arbitration": "Sticky",
-      "publisher_offset": 100,
-      "notes": [
-        "Kalshi event markets, market-by-price depth. A universe disjoint from the perps rows under the",
-        "same Source ID, which is what `category` expresses: the two never contest each other's tape or",
-        "book.",
-        "",
-        "NAMING. The `category` is `events` - sport is one kind of event market and the universe carries",
-        "more than sport - while the group `code` stays edge-kalshi-sports-mbp: that name is the ledger's",
-        "and a subscriber matches `doublezero status` on it, so it is not ours to rename here.",
-        "",
-        "CHANNELS. One channel is one league or sport, each an independent state machine with its own reset",
-        "count, sequence series, manifest seq and snapshot cycle - so one channel is one publisher and one",
-        "receiver task, with its own processor state and books. Ids are permanent from first publication:",
-        "promoting a competition out of a tag channel takes a free id rather than renumbering. 30-38 are",
-        "reserved for exactly those promotions and are not published; 63 and 120 are retired and never",
-        "reissued. An id listed here that the publisher does not send binds a socket that stays silent,",
-        "which reads as a dead publisher.",
-        "",
-        "PORTS. base + channel_id on all three roles - the rule the publisher's own configuration asserts.",
-        "A subscriber that computes it any other way joins the right group and hears silence.",
-        "",
-        "PUBLISHERS. Two, and no failover. Both carry the whole published set on the same ports, the second",
-        "with every channel id raised by 100 - so the port names the league and a subscriber binds one",
-        "socket per league to hear both, while channel_id names the league AND the publisher, keeping the",
-        "two sequenced separately. `publisher_offset` canonicalises the mirror's id back to the league's",
-        "for catalog, history and book identity only.",
-        "",
-        "STATUS. The top-of-book sibling for this universe is not published yet, which is why this document",
-        "carries no row for it."
-      ],
-      "publishers": {
-        "derived": {
-          "channels": [{ "range": [10, 29] }, { "range": [39, 48] }, { "id": 49 }],
-          "ports": { "mktdata": 34000, "refdata": 44000, "snapshot": 54000 }
-        }
-      }
-    },
-    {
-      "venue": "KALSHI",
-      "category": "elections",
-      "code": "edge-kalshi-elections-pol-tob",
-      "kind": "TopOfBook",
-      "group": "233.84.178.21",
-      "emit_trades": true,
-      "arbitration": "Sticky",
-      "publisher_offset": 100,
-      "notes": [
-        "Kalshi political event markets, top of book and trades. Its own pair of groups, separate from",
-        "perps and events and behind their own subscriptions; the market-by-price sibling is below.",
-        "",
-        "CHANNELS. Six, 50 through 55, one per family - us, house, intl, primaries, offices, other.",
-        "",
-        "PORTS. base + channel_id, the rule the events row uses. Two roles only: this row has no snapshot",
-        "plane and the market-by-price sibling does. A snapshot port here would bind a socket nothing ever",
-        "sends to, and an idle socket reads as a publisher gone quiet rather than as a misconfiguration.",
-        "",
-        "PUBLISHERS. Two, the second offset by +100 the way the events feeds are: the port names the",
-        "family, so a subscriber binds one socket per family and hears both publishers on it, while",
-        "channel_id names the family AND the publisher. `publisher_offset` canonicalises the mirror's id",
-        "back for catalog and book identity only.",
-        "",
-        "STATUS. Confirmed from a subscriber on 2026-09-04, at two DoubleZero sites holding a subscribe",
-        "grant on this group. All six families carry traffic on both port roles at base + channel_id, and",
-        "both publishers are there: channels 50-55 alongside the mirror's 150-155. Every datagram came from",
-        "a declared publisher address and from the group the bind joined - no undeclared address, no",
-        "foreign group, nothing on an undeclared port role, at either site.",
-        "",
-        "The market-by-price sibling below has NOT been confirmed the same way; read its own STATUS before",
-        "relying on it."
-      ],
-      "publishers": {
-        "derived": {
-          "channels": [{ "range": [50, 55] }],
-          "ports": { "mktdata": 35000, "refdata": 45000 }
-        }
-      }
-    },
-    {
-      "venue": "KALSHI",
-      "category": "elections",
-      "code": "edge-kalshi-elections-pol-mbp",
-      "kind": "MarketByPrice",
-      "group": "233.84.178.22",
-      "emit_trades": true,
-      "arbitration": "Sticky",
-      "publisher_offset": 100,
-      "notes": [
-        "Kalshi political event markets, market-by-price depth. Sibling of edge-kalshi-elections-pol-tob:",
-        "the same six channels, the same two publishers and the same +100 mirror, on its own group and its",
-        "own port bases.",
-        "",
-        "CHANNELS. Six, 50 through 55, and they must agree with the sibling's - the instrument catalog is",
-        "keyed on the refdata channel, so a divergence splits it in two. They are the same ids here by",
-        "construction, for the reason the Phoenix pair states.",
-        "",
-        "PORTS. base + channel_id on all three roles. Unlike the top-of-book sibling, this row does carry a",
-        "snapshot plane.",
-        "",
-        "PUBLISHERS. Two, mirrored by +100 exactly as in the sibling.",
-        "",
-        "TAPE. Both rows claim it. The reconciler ranks TopOfBook above MarketByPrice when both run, the",
-        "same resolution the Phoenix pair relies on.",
-        "",
-        "STATUS. Not confirmed from a subscriber. The top-of-book sibling now is, but nothing subscribes to",
-        "this group from a site that could report on it, so this row's own group, ports and snapshot plane",
-        "still rest on the ledger and on what the publishing hosts are configured with. Treat the first",
-        "converge as the confirmation: check that the startup line names KALSHI/elections among `ingesting",
-        "feeds`, and that this row's receivers report liveness up on all three port roles, before trusting",
-        "an instrument count or a book that comes out of it."
-      ],
-      "publishers": {
-        "derived": {
-          "channels": [{ "range": [50, 55] }],
-          "ports": { "mktdata": 36000, "refdata": 46000, "snapshot": 56000 }
-        }
+        "explicit": [
+          {
+            "mktdata": 9211,
+            "refdata": 9212,
+            "snapshot": 9213
+          }
+        ]
       }
     },
     {
@@ -407,7 +530,12 @@
         "in this row, not a quiet feed."
       ],
       "publishers": {
-        "explicit": [{ "mktdata": 30001, "refdata": 30002 }]
+        "explicit": [
+          {
+            "mktdata": 30001,
+            "refdata": 30002
+          }
+        ]
       }
     },
     {
@@ -435,7 +563,12 @@
         "in this row, not a quiet feed."
       ],
       "publishers": {
-        "explicit": [{ "mktdata": 30001, "refdata": 30002 }]
+        "explicit": [
+          {
+            "mktdata": 30001,
+            "refdata": 30002
+          }
+        ]
       }
     }
   ]
