@@ -68,4 +68,5 @@ Two PRs.
 
 - #110 re-keys the MBO processor's own book map (not `BookKey`); it overlaps in `processor.rs`, so
   whichever lands second rebases.
-- #161 publishes `src/ingest/registry.json`; unaffected.
+- #161 published `src/ingest/registry.json` to the hosted feed registry; unaffected. (That publisher
+  was removed again in #183: `malbeclabs/infra`'s aggregator owns the hosted document.)
