@@ -433,6 +433,10 @@ pub struct Metrics {
     pub unregistered_sources: IntCounter,
     /// Messages labelled `UNREGISTERED` because the distinct-unregistered-ID cap was reached.
     pub unregistered_source_labels_capped: IntCounter,
+    /// Messages from a feed row that declares a `source_id` but stamp a different one, by the row's
+    /// `venue` and `category`. Expect zero: anything else is a wrong declaration or a publisher
+    /// stamping the wrong ID, and that row's health and status are reported under the wrong engine.
+    pub source_id_mismatch: IntCounterVec,
 
     // --- Query API history writer (`ingest::reconcile::feed_history`) ---
     /// Trades dropped rather than stored because the catalog carries no `instrument` for the exact
@@ -1210,6 +1214,12 @@ impl Metrics {
                 &registry,
                 "dz_unregistered_source_ids_total",
                 "Distinct Source IDs seen with no registry row",
+            ),
+            source_id_mismatch: counter_vec(
+                &registry,
+                "dz_source_id_mismatch_total",
+                "Messages whose wire Source ID differs from the source_id their feed row declares",
+                &["venue", "category"],
             ),
             unregistered_source_labels_capped: counter(
                 &registry,

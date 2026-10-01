@@ -4164,6 +4164,7 @@ mod tests {
             role,
             publisher: TEST_PUB,
             mirror_offset: None,
+            declared_source_id: None,
         }
     }
 

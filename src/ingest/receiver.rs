@@ -16,7 +16,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
     os::fd::AsRawFd,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -136,6 +136,10 @@ pub struct DatagramCtx<'a> {
     /// wire channel id for consumer-facing identity without reaching back into the registry.
     /// `None` for every row with no declared mirror.
     pub mirror_offset: Option<u8>,
+    /// This row's declared [`Feed::source_id`], if any. Checked against every emitted message's
+    /// wire Source ID, because the declaration is a claim about a machine outside this process and
+    /// nothing else would notice it being wrong (see [`note_source_id_mismatch`]).
+    pub declared_source_id: Option<u16>,
 }
 
 impl DatagramCtx<'_> {
@@ -166,7 +170,13 @@ impl DatagramCtx<'_> {
     /// attempted to emit, a Source-ID fact, independent of whether the arbiter's dedup floor
     /// later broadcasts that particular copy.
     pub fn emit(&self, msg: FeedMessage) {
-        record_revealed(self.venue, msg.source_id());
+        let wire_id = msg.source_id();
+        if let Some(declared) = self.declared_source_id {
+            if wire_id != declared {
+                note_source_id_mismatch(self.venue, self.category, declared, wire_id);
+            }
+        }
+        record_revealed(self.venue, wire_id);
         lock(self.arbiter).emit(msg, Transport::Edge(self.publisher), self.category);
     }
 }
@@ -260,6 +270,41 @@ pub(crate) fn revealed_ids_for(venue: &str) -> BTreeSet<u16> {
         .unwrap_or_default()
 }
 
+/// Cap on distinct `(venue, category, wire Source ID)` mismatches warned about. The wire ID is
+/// unauthenticated, so a forged flood must not grow the warn-once set without bound; past the cap
+/// the counter still counts.
+const MAX_SOURCE_ID_MISMATCH_WARNINGS: usize = 64;
+
+/// `(row venue, row category, wire Source ID)` of one warned-about mismatch.
+type MismatchKey = (&'static str, &'static str, u16);
+
+/// A row declared `declared` and its traffic stamped `wire`. The declared ID is as much a claim
+/// about a publisher as a port is, and it fails just as silently: the row never emits a wire
+/// `status` (its ID is never revealed), `/v1/status` reports it under the declared ID, and its
+/// products carry the wire ID and read another engine's health. Counted on every such message
+/// (`dz_source_id_mismatch_total{venue,category}`) and warned about once per wire ID.
+fn note_source_id_mismatch(venue: &'static str, category: &'static str, declared: u16, wire: u16) {
+    metrics()
+        .source_id_mismatch
+        .with_label_values(&[venue, category])
+        .inc();
+    static WARNED: OnceLock<Mutex<HashSet<MismatchKey>>> = OnceLock::new();
+    let mut warned = WARNED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if warned.len() < MAX_SOURCE_ID_MISMATCH_WARNINGS && warned.insert((venue, category, wire)) {
+        warn!(
+            venue,
+            category,
+            declared,
+            wire,
+            "feed row declares one Source ID but its traffic stamps another; its health and \
+             status are reported under the declared ID"
+        );
+    }
+}
+
 /// Which `(name, source_id)` pairs a status for row `venue` speaks for: every revealed ID, except
 /// one whose name is another row's own venue (that row reports itself).
 ///
@@ -269,6 +314,13 @@ pub(crate) fn revealed_ids_for(venue: &str) -> BTreeSet<u16> {
 /// converse holds too: a row that declares none skips every ID some row declares (`claimed`), since
 /// that row reports it — otherwise an undeclared sibling's edge (a document that declares the ID on
 /// one row of a name but not another) would declare that engine down, or mask its outage.
+///
+/// `claimed` deliberately counts a declaration on **any** row of the document, running or not. So
+/// when the declaring row is not running (unsubscribed, filtered out) and an undeclared row carries
+/// that ID's traffic, the ID gets no wire `status` at all. That is intended, and is the same
+/// registry-first rule `FeedHealth::source_up` follows: an ID's health belongs to the row that
+/// declares it, and borrowing a sibling's would report an engine nobody is ingesting. Do not narrow
+/// it to running rows.
 fn status_targets(
     venue: &str,
     declared: Option<u16>,
@@ -883,6 +935,7 @@ async fn drive<P: DatagramProcessor>(
                 role,
                 publisher,
                 mirror_offset,
+                declared_source_id: source_id,
             };
             processor.on_datagram(&channels[idx].buf[..n], &ctx);
         }
@@ -1239,6 +1292,66 @@ mod tests {
         assert_eq!(targets, vec![("ROW", 1)]);
     }
 
+    /// A row's declared Source ID is checked against what its traffic stamps: a mismatch is counted
+    /// (and warned about once), a match is not, and a row declaring none is never checked.
+    #[test]
+    fn a_declared_source_id_the_wire_contradicts_is_counted() {
+        use std::collections::HashMap;
+
+        use crate::model::{InstrumentSnapshot, NormalizedQuote};
+
+        let venue: &'static str = "SourceIdMismatchRow";
+        let (arbiter, _rx) = test_arbiter();
+        let instruments: InstrumentSnapshot =
+            std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let ctx = |declared| DatagramCtx {
+            venue,
+            category: "spot",
+            arbiter: &arbiter,
+            instruments: &instruments,
+            kernel_rx_ts_ns: 0,
+            recv_ts_ns: 0,
+            role: PortRole::Mktdata,
+            publisher: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            mirror_offset: None,
+            declared_source_id: declared,
+        };
+        let quote = |source_id, ts| {
+            FeedMessage::Quote(NormalizedQuote {
+                venue: "PHOENIX".into(),
+                source_name: "PHOENIX".into(),
+                source_id,
+                symbol: "X".into(),
+                bid: 1.0,
+                ask: 1.0,
+                bid_size: 1.0,
+                ask_size: 1.0,
+                bid_n: 0,
+                ask_n: 0,
+                source_ts_ns: ts,
+                recv_ts_ns: ts,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            })
+        };
+        let count = || {
+            metrics()
+                .source_id_mismatch
+                .with_label_values(&[venue, "spot"])
+                .get()
+        };
+        ctx(Some(8)).emit(quote(8, 1));
+        ctx(None).emit(quote(2, 2));
+        assert_eq!(
+            count(),
+            0,
+            "a match, and an undeclared row, are never counted"
+        );
+        ctx(Some(8)).emit(quote(2, 3));
+        ctx(Some(8)).emit(quote(2, 4));
+        assert_eq!(count(), 2, "every contradicting message counts");
+    }
+
     /// `record_revealed` is idempotent per `(venue, source_id)` pair and distinguishes rows.
     #[test]
     fn record_revealed_is_idempotent_and_scoped_per_row() {
@@ -1315,6 +1428,7 @@ mod tests {
             role: PortRole::Mktdata,
             publisher: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             mirror_offset: None,
+            declared_source_id: None,
         };
         let quote = NormalizedQuote {
             venue: wire_venue.into(),

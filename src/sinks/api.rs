@@ -1854,6 +1854,7 @@ mod tests {
             role,
             publisher,
             mirror_offset: None,
+            declared_source_id: None,
         };
         let mut proc = MbpProcessor::new(Arc::new(std::sync::atomic::AtomicBool::new(false)));
 

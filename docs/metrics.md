@@ -97,6 +97,7 @@ protocol — TOB, Midpoint, MBO, MBP all go through this), not by the arbiter's 
 |--------|------|--------|---------|
 | `dz_source_id_changed_total` | counter | `venue` | A `(publisher, instrument)` already revealed under one wire Source ID named a different one on a later message — a publisher defect, not a decode issue. Labelled by the **new** (post-change) venue, which is also re-announced a fresh `instrument` under so the new venue's precision-before-price guarantee still holds. Should stay flat at zero; a nonzero rate means a publisher is relabeling an instrument's venue partway through. |
 | `dz_unregistered_source_ids_total` | counter | — | Distinct Source IDs seen with no registry row. |
+| `dz_source_id_mismatch_total` | counter | `venue`, `category` | Messages from a feed row that declares a `source_id` but stamp a different one. Expect zero. A declared ID is a claim about a publisher, like a port, and fails as silently: the row emits no wire `status`, `/v1/status` reports it under the declared ID, and its products read another engine's health. Also logged once per wire ID at `warn`. |
 | `dz_unregistered_source_id_labels_capped_total` | counter | — | Messages labelled `UNREGISTERED` because the distinct-unregistered-ID cap was reached. |
 
 ## Market-by-Price processor (per venue)

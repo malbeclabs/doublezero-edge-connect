@@ -349,7 +349,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a product's `status` reads its own engine — offline while that engine's declaring row is not
   running, never borrowed from an undeclared row sharing the name. Rows sharing a
   `(venue, category)` must declare the same `source_id` (`SourceIdDisagreement`): that pair is one
-  universe to tape ownership, so two engines there would let one row mute the other's trades. A row that declares none behaves
+  universe to tape ownership, so two engines there would let one row mute the other's trades.
+  A row whose traffic stamps a Source ID other than the one it declares is counted on
+  `dz_source_id_mismatch_total{venue,category}` and warned about once per wire ID, since nothing
+  else would notice: its health and status would silently be filed under the wrong engine. A row that declares none behaves
   exactly as before, except that it no longer emits `status` for an ID another row declares.
   Metric labels: `category` on `dz_datagrams_received_total`, `dz_datagram_bytes_total`,
   `dz_socket_errors_total`, `dz_idle_rejoin_total`, `dz_receiver_up` and `dz_seq_events_total`;
