@@ -745,6 +745,15 @@ fn build(text: &str, origin: &str) -> Result<Loaded, RegistryError> {
         rows.push(feed_from(row, sources)?);
     }
     check_cross_row_invariants(&rows)?;
+    let table = sources.unwrap_or_else(sources::assignments);
+    for (venue, category) in undeclared_shared_rows(&rows, table) {
+        info!(
+            venue,
+            category,
+            "feed registry row declares no source_id although several Source IDs share its \
+             venue name; its engines' health and status are reported together under the name"
+        );
+    }
 
     Ok(Loaded {
         rows: Box::leak(rows.into_boxed_slice()),
@@ -752,6 +761,29 @@ fn build(text: &str, origin: &str) -> Result<Loaded, RegistryError> {
         origin: origin.to_string(),
         version: doc.version,
     })
+}
+
+/// The `(venue, category)` of every row that declares no `source_id` although the resolving table
+/// gives its venue name several Source IDs — the rows whose engines `FeedHealth` cannot tell apart,
+/// so one engine streaming masks another's outage under the shared name.
+///
+/// Reported, not refused (#187): the hosted Hyperliquid rows are such rows today, and declaring 7 on
+/// `xyz-perps` would contradict a wire that still stamps 1 on the builder DEX too. Refusing them is
+/// the follow-up once the publishers stamp one id per engine and their fragments declare it — and
+/// infra's validator has to refuse them first.
+fn undeclared_shared_rows(
+    rows: &[Feed],
+    table: &[SourceAssignment],
+) -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&'static str, &'static str)> = rows
+        .iter()
+        .filter(|f| f.source_id.is_none())
+        .filter(|f| table.iter().filter(|a| a.name == f.venue).count() > 1)
+        .map(|f| (f.venue, f.category))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Names `sources::source_label` synthesizes for an unassigned Source ID, so a block may not claim
@@ -2137,6 +2169,37 @@ mod tests {
                 "ports":{"mktdata":35000,"refdata":45000}}}}"#;
         build(&doc_with(&format!("{SPORTS_ROW},{derived_tob}")), "test")
             .expect("two derived rows share a category");
+    }
+
+    /// A row is reported when its venue name has several Source IDs and it declares none — the
+    /// hosted Hyperliquid rows' state — and not when it declares one, or when its name has a
+    /// single id. Reported per `(venue, category)`, once.
+    #[test]
+    fn undeclared_rows_of_a_shared_name_are_reported() {
+        let block = r#"{"id":1,"name":"HYPERLIQUID"},{"id":7,"name":"HYPERLIQUID"},
+            {"id":6,"name":"BINANCE"},{"id":8,"name":"BINANCE"},{"id":3,"name":"KALSHI"}"#;
+        let hl = |category: &str, code: &str, group: &str| {
+            format!(
+                r#"{{"venue":"HYPERLIQUID","category":"{category}","code":"{code}",
+                "kind":"TopOfBook","group":"{group}","emit_trades":true,
+                "arbitration":"Coordinated",
+                "publishers":{{"explicit":[{{"mktdata":20000,"refdata":20001}}]}}}}"#
+            )
+        };
+        let rows = [
+            hl("hl-perps", "a", "233.84.178.27"),
+            hl("xyz-perps", "b", "233.84.178.29"),
+            two_engine_rows(r#","source_id":6"#, r#","source_id":8"#),
+            PERPS_ROW.to_string(),
+        ]
+        .join(",");
+        let loaded = build(&doc_with_sources(block, &rows), "test").expect("loads");
+        let table = loaded.sources.expect("block installed");
+        assert_eq!(
+            undeclared_shared_rows(loaded.rows, table),
+            vec![("HYPERLIQUID", "hl-perps"), ("HYPERLIQUID", "xyz-perps")],
+            "BINANCE declares its ids and KALSHI has one: neither is reported"
+        );
     }
 
     /// Optional: a row declaring none loads exactly as before, at the name-level status key.

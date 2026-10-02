@@ -4285,12 +4285,14 @@ mod tests {
     /// venue's precision-before-price guarantee breaks for whichever id shows up second: no
     /// `Instrument` for it anywhere (not the wire, not `InstrumentSnapshot`, not the WS replay map).
     ///
-    /// `#[serial]` because the exact-count assertion reads a process-global Prometheus child
-    /// (`dz_source_id_changed_total{venue="PHOENIX"}`) that every other 1 -> 2 change in this binary
-    /// also increments — see `metrics::metrics`'s test-isolation note. A relative baseline is not
-    /// enough on its own when a sibling can increment between the read and the assert.
+    /// The change is to an **unassigned** Source ID no other test uses, so the exact-count assertion
+    /// reads a Prometheus child (`dz_source_id_changed_total{venue="SOURCE_<id>"}`) that nothing else
+    /// in this binary increments. The registry is process-global (see `metrics::metrics`'s
+    /// test-isolation note), and a change to `PHOENIX` raced every other processor test that reveals
+    /// a PHOENIX instrument (#136): `#[serial]` cannot fix that, since it orders only the tests marked
+    /// with it. An unassigned id still exercises the whole path, because the wire id is authoritative
+    /// and gets a synthesized label rather than being dropped.
     #[test]
-    #[serial_test::serial]
     fn tob_source_id_change_reannounces_and_is_counted() {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = TobProcessor::new(tape(false));
@@ -4318,12 +4320,15 @@ mod tests {
         }
         assert_eq!(seen, vec![(1, "HYPERLIQUID".to_string())], "first reveal");
 
+        // Unique to this test; its label is synthesized, so it names no registry row.
+        const CHANGED_ID: u16 = 61_336;
+        let label = crate::ingest::sources::source_label(CHANGED_ID);
         let before = metrics()
             .source_id_changed
-            .with_label_values(&["PHOENIX"])
+            .with_label_values(&[label])
             .get();
         proc.on_datagram(
-            &tob_datagram(2, &[enc_tob_quote(41, 2, 2_000)]),
+            &tob_datagram(2, &[enc_tob_quote(41, CHANGED_ID, 2_000)]),
             &ctx(PortRole::Mktdata),
         );
         let mut seen = Vec::new();
@@ -4334,13 +4339,13 @@ mod tests {
         }
         assert_eq!(
             seen,
-            vec![(2, "PHOENIX".to_string())],
+            vec![(CHANGED_ID, label.to_string())],
             "a changed id is re-announced under the new venue"
         );
         assert_eq!(
             metrics()
                 .source_id_changed
-                .with_label_values(&["PHOENIX"])
+                .with_label_values(&[label])
                 .get(),
             before + 1,
             "the change is counted, labelled by the NEW venue"
