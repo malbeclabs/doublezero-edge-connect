@@ -892,8 +892,13 @@ impl Reconciler {
         // about to remove, and nothing will purge it again (this channel is not diffed as
         // "departing" a second time). Compiles out in release builds; active in every test and
         // debug run, which is where a reordering regression would otherwise pass silently.
+        //
+        // The one exception is a **deferred** purge rerun under a draining sibling's key whose
+        // subscription has since come back: that key is running again, and is necessarily still
+        // admitted (nothing unadmitted is ever spawned), so the sibling check below counts it
+        // and keeps everything it supplies. Running is harmless exactly when admitted.
         debug_assert!(
-            !self.active.contains_key(key),
+            !self.active.contains_key(key) || self.last_filter_admitted.contains(key),
             "forget_departing_channel ran before its receiver was aborted (N1 regression): \
              venue={} category={} channel={channel}",
             feed.venue,
@@ -932,7 +937,11 @@ impl Reconciler {
         let siblings: Vec<FeedKind> = self
             .last_filter_admitted
             .iter()
-            .filter(|k| k.0 == feed.venue && k.1 == feed.category && *k != key)
+            // No `*k != key`: on the normal path the departing key is not admitted anyway
+            // (`last_filter_admitted` is set before any purge runs), and on the deferred path
+            // `key` is the *draining sibling's*, which the filter may well still admit — it must
+            // then count as its own sibling, or its state is purged by another row's narrowing.
+            .filter(|k| k.0 == feed.venue && k.1 == feed.category)
             .filter(|k| Self::channel_in(&self.cfg.enabled, k) == Some(channel))
             .map(|k| k.2)
             .collect();
@@ -2315,6 +2324,74 @@ mod tests {
         assert!(
             !r.cfg.instruments.lock().unwrap().contains_key(&catalog_key),
             "and runs once that receiver is reaped"
+        );
+    }
+
+    /// A deferred purge reruns under the **draining** entry's key, which is the sibling's. That
+    /// sibling, still admitted by the filter, must count as its own sibling there, or narrowing
+    /// another row purges the state of one that merely lost its subscription. Here market-by-price
+    /// on channel 50 is draining after a subscription loss (still admitted), and the filter narrows
+    /// only top-of-book off 50: top-of-book's purge is handed to market-by-price's entry, and when
+    /// that is reaped nothing may be dropped. The aborted top-of-book task is allowed to finish
+    /// (`yield_now`), so the two entries drain on different ticks — the timing that reaches the
+    /// deferred path. The harness runs with subscription gating off, so market-by-price is
+    /// respawned meanwhile: the variant where its subscription comes back before the drain
+    /// bound, and the deferred purge reruns beside its live receiver.
+    #[tokio::test]
+    async fn a_deferred_purge_spares_a_draining_sibling_the_filter_still_admits() {
+        let rows: Vec<Feed> = crate::ingest::feeds::feeds()
+            .iter()
+            .filter(|f| f.category == "elections")
+            .copied()
+            .collect();
+        let both = "edge-kalshi-elections-pol-tob=50,51;edge-kalshi-elections-pol-mbp=50,51";
+        let mut r = test_reconciler_with_filter(rows, ChannelFilter::parse(both).unwrap());
+        let mbp50 = ("KALSHI", "elections", FeedKind::MarketByPrice, 36050u16);
+        let catalog_key: (crate::model::SourceKey, Arc<str>, u8, u32) = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            "elections".into(),
+            50,
+            1,
+        );
+        r.tick().await;
+        r.cfg.instruments.lock().unwrap().insert(
+            catalog_key.clone(),
+            crate::model::NormalizedInstrument {
+                tick_size: 0,
+                venue: "KALSHI".into(),
+                source_name: "KALSHI".into(),
+                source_id: 3,
+                symbol: "UNSUBSCRIBED".into(),
+                channel: 50,
+                instrument_id: 1,
+                category: "elections".into(),
+                price_exponent: -4,
+                qty_exponent: -2,
+            },
+        );
+
+        // Market-by-price on channel 50 loses its subscription: aborted, draining, no purge of
+        // its own, and still admitted by the filter. Its task never finishes on its own here.
+        let (h, _) = r.active.remove(&mbp50).unwrap();
+        h.abort();
+        r.draining.push(Draining {
+            key: mbp50,
+            handle: tokio::spawn(std::future::pending()),
+            ticks_waited: 0,
+            purge: false,
+        });
+
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse(
+            "edge-kalshi-elections-pol-tob=51;edge-kalshi-elections-pol-mbp=50,51",
+        )
+        .unwrap();
+        for _ in 0..=MAX_DRAIN_TICKS + 1 {
+            r.tick().await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            r.cfg.instruments.lock().unwrap().contains_key(&catalog_key),
+            "market-by-price is still admitted on channel 50: its state stays"
         );
     }
 

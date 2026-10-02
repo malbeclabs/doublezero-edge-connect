@@ -49,8 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     channels its filter admitted, or only the ones still alive, so each market-by-price receiver of
     the rest decoded its prints and dropped them. Ownership is now elected per `(venue, category,
     channel)` for a derived row (`reconcile::Universe`), and the arbiter's `Sticky` tape gate is
-    keyed per channel to match, so a channel served from another host is not muted by a leader
-    streaming a different one. Shared-block rows keep category-level ownership, and the registry
+    keyed at the same grain, so a channel served from another host is not muted by a leader
+    streaming a different one. Shared-block rows keep category-level ownership and a
+    category-level gate (their channel ids name mirrors, which must share a leader), and the registry
     refuses a category whose tape-claiming rows mix the two shapes (`MixedChannelShape`).
   - **The channel-filter purge.** Narrowing one row off a channel erased that channel's catalog,
     book and history while the sibling row's receiver for it kept running — history lost, and idle
@@ -60,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     row's subscription loss does. And a purge no longer runs while any receiver for that channel is
     still draining: it is handed to that entry and reruns once the receiver has stopped, so its
     final write cannot restore what was removed.
+    A deferred purge reruns under the draining sibling's key, and that sibling, if still admitted,
+    counts as its own sibling — so narrowing one row never purges a sibling that only lost its
+    subscription, including when that subscription returns before the drain completes.
 - **The Hyperliquid public backstop emitted under a category no row carries.** `ws_input`'s
   `HL_CATEGORY` was still `perps` after the hosted feed registry renamed Hyperliquid's native
   universe to `hl-perps`, so with `--ws-input-coins` set the backstop's quotes and trades were keyed

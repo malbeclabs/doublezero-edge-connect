@@ -482,11 +482,12 @@ Modules are grouped by role under `src/`:
   `dz_tape_path_transfers_total`. ⚠️ Two residual limits, both inherited from the unauthenticated
   wire: on a venue with no `book` traffic the authority tracks nobody, so a forged publisher printing first
   holds the tape until it goes quiet for a window — the same primitive `StickyAuthority::admit`'s
-  no-dark-start already exposes for `book` — and the gate spans a whole category's **channel**
-  (`tape_leader` is keyed `(source, category, channel)`, matching the reconciler's per-channel
-  ownership, so a channel served from another host is never muted by a leader streaming a different
-  one), so paths that *sharded* one channel's prints rather than mirroring them would lose the
-  non-serving path's fills. The two `books` lookups inside it read the authority at
+  no-dark-start already exposes for `book` — and the gate runs at the **reconciler's grain**:
+  `tape_leader` is keyed `(source, category, Option<channel>)`, `Some` only for a derived row's
+  receiver (`DatagramCtx::per_channel` → `Arbiter::emit_scoped`), so a channel served from another
+  host is never muted by a leader streaming a different one, while a shared-block row — whose
+  `channel_id` names mirrors — keeps one leader per category. Paths that *sharded* one gated
+  scope's prints rather than mirroring them would still lose the non-serving path's fills. The two `books` lookups inside it read the authority at
   the same `(venue, category)` grain, so the deferral can only ever name a path elected on *this*
   universe. `no_id_owner` is skipped entirely
   for `Sticky` venues: it is the `Coordinated` guard, and it cannot see a gate-approved handover.
