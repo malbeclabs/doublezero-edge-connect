@@ -506,15 +506,16 @@ Modules are grouped by role under `src/`:
   non-leader's collapses (the content-inclusive depth oracle would otherwise flag the pair as
   duplicates). No wedge: a real later event has `source_ts > 0` and re-advances the floor. The depth
   floor assumes `source_ts` monotonicity only **within** a session: the MBO processor clears it on
-  `EndOfSession` (whole venue) / `InstrumentReset` (that symbol) via `reset_depth_floor_for_*` — the
+  `EndOfSession` (that channel's latched symbols) / `InstrumentReset` (that symbol) via `reset_depth_floor_for_*` — the
   session-reset escape hatch (#66, counted in `dz_depth_floor_resets_total{venue,reason}`) — so a
   venue that restarts its clock below the latched high-water doesn't wedge depth forever.
-  `EndOfSession` also drops the **receiving publisher's** books to `Recovering`
-  (`book.rs::on_end_of_session` — sequences, buffered deltas and event clock discarded). ⚠️ That
-  reset is per-publisher while the floor it clears is venue-wide: one processor per receiver task
-  means a mirror that loses its own `EndOfSession` datagram keeps a `Synced` book and can re-latch
-  the cleared floor at the old high-water, wedging the venue's depth until it resets on its own.
-  Closing that needs a per-venue session era shared across the tasks (not built).
+  `EndOfSession` also drops that channel's books to `Recovering` for **every publisher the
+  processor holds** (`book.rs::on_end_of_session` — sequences, buffered deltas and event clock
+  discarded), matching channels canonically; sibling channels are untouched, as in `MbpProcessor`.
+  ⚠️ That reset reaches only one receiver task's books while the floor it clears is shared: a
+  mirror on another task that loses its own `EndOfSession` datagram keeps a `Synced` book and can
+  re-latch the cleared floor at the old high-water, wedging that symbol's depth until it resets on
+  its own. Closing that needs a per-channel session era shared across the tasks (not built).
   `on_instrument_reset` likewise drops
   `last_event_ts`, scopes its clear by the symbol the depth was emitted under (the processor's
   `emitted_symbol` memo — immune to an id→symbol remap), and falls back to a venue-wide clear when
@@ -761,10 +762,22 @@ Modules are grouped by role under `src/`:
   a shared port block one publisher's restart would otherwise clear every publisher's definitions and
   blank the venue. Reads take the **non-inserting** `PerPublisher::def`; only the refdata handlers use
   the inserting `get`, so a forged-publisher market-data flood cannot evict a real publisher's definitions.
-  `MboProcessor` reconstructs an **independent book per `(publisher, instrument)`** (keyed on the
-  datagram source IP address): two publishers mirror one feed but their instance-scoped per-instrument delta
-  sequences collide, so the books can't be merged. `SnapshotOrder` carries only a `snapshot_id` (no
-  instrument id) and routes **only to the originating publisher's** building book. `emit_depth` stamps
+  `MboProcessor` reconstructs an **independent book per `BookKey` = `(publisher, channel_id,
+  instrument_id)`** — the same three axes `MbpProcessor`'s `PriceBookKey` carries, and every map
+  keyed off `books` (`last_top`, `emitted_symbol`, `revealed`, `synced_reported`,
+  `reveal_rebaselined_ns`) moves with it or an eviction strands, or silently un-reveals, a sibling.
+  *Publisher* (the source IP address): two publishers mirror one feed but their instance-scoped
+  per-instrument delta sequences collide, so the books can't be merged. *Channel* (the **raw** wire
+  id from the datagram header, never canonicalized and never a message body): the edge-feed-spec
+  scopes `instrument_id` to its channel, so two channels reusing an id would otherwise share one book
+  and cross-apply deltas — silent corruption no sequence check catches. ⚠️ `RefDataState` is **not**
+  channel-scoped, so one publisher sending two channels does not work yet: each channel's `Reset
+  Count` and manifest seq clear the other's definitions, `book_for`'s definition gate refuses the
+  deltas and snapshots, and neither book syncs. Moot while publishers stay on channel 0; a
+  multi-channel MBO feed needs refdata keyed by channel first.
+  `SnapshotOrder` carries only a `snapshot_id` (no instrument id) and routes **only to the originating
+  channel instance's** building book — publisher alone stopped guaranteeing a single builder the
+  moment a second channel existed. `emit_depth` stamps
   `source_ts_ns = book.last_event_ts()` (a per-*event* time) while coalescing per *datagram*, so two
   datagrams in one tick can emit two depths with the same `source_ts`; this is **benign** under the
   content-inclusive depth floor (same tick + same leader + new content → both admitted, distinct
@@ -779,8 +792,8 @@ Modules are grouped by role under `src/`:
   within a rotation), a **cross-instrument** buffer budget (`MAX_BUFFERED_DELTAS_ACROSS_BOOKS`, 2^20;
   overflow drops the largest instrument's buffer and marks it `Gap` rather than taking the channel
   down — `pricebook`'s per-book cap is a quarter of it, so the budget only binds with several heavy
-  books), `EndOfSession` scoped to the emitting `(publisher, channel)` (the order-keyed handler's
-  venue-wide clear would tear down a live peer path's published book), and a channel reset on any
+  books), `EndOfSession` scoped to the emitting `(publisher, channel)` (the order-keyed handler's reset of every
+  publisher's books would tear down a live peer path's published book), and a channel reset on any
   **change** of the datagram header's `Reset Count` (`!=`, never `>`, so the `255 -> 0` wrap counts) —
   read from the **market-data role only** and only for a publisher whose reference data we already
   hold: the three ports carry one era on three sockets, so a memo shared across them would re-reset
