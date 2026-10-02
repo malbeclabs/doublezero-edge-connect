@@ -41,6 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- **`:latest` was months older than `:mainnet-beta`, though documented as the same image.** The
+  mainnet-beta build added `:latest` only on a `vX.Y.Z` tag, and none had been cut since June, so a
+  container pinned to `:latest` predated #169 and rejected the hosted feed registry (which repeats a
+  name) for its June built-in copy (#186). It now moves with `:mainnet-beta` on every build: `main`
+  pushes and the dispatch and poll rebuilds included.
+- **The Hyperliquid sink could drop the frame that says why it disconnected a client.** Ending a
+  connection (inbound rate limit, or a client lagging twice) sent the error and a `Close` and dropped
+  the socket at once; with any of the peer's bytes still unread, TCP resets the connection, and the
+  peer discards the frames it had not yet read — the error included. It now waits, up to 2 s, for the
+  peer's `Close` before dropping (`finish_close`). This was also the intermittent failure of the
+  two rate-limit tests (#188): 0 of 12 full runs fail now, against about 1 in 3 before.
 - **Two derived rows of one category lost trades and state under an uneven channel filter.** A
   top-of-book and a market-by-price row over the same channels (the Kalshi elections pair today,
   and the events pair once the hosted rows land) share a universe, and two things were keyed on
@@ -338,6 +349,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A market-by-price `InstrumentReset` discarded its own recovery snapshot group.** A publisher withholding and then re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin` follows its own reset by ~0.1 ms on a different port — resets ride mktdata, snapshot groups the snapshot port, on independent sequence series — so which is processed first is a coin flip. When the begin won, both the book's assembly and the processor's level route were torn out, the market waited a full snapshot rotation to heal, and the group's levels were counted on `dz_mbp_snapshot_levels_dropped_total{reason="reset"}`. A group anchored at or after the reset's `New Anchor Seq` is now kept — the same test a `SnapshotBegin` is already judged by — and only one that predates the reset is dropped and tombstoned. Observed on a live Phoenix feed at roughly two flaps per hour per market; expect that `reason="reset"` series to fall substantially.
 
 ### Changed
+- **A feed-registry row that shares its venue name with other Source IDs but declares no `source_id`
+  is reported at load** (`info`, once per `(venue, category)`): its engines' health and status are
+  reported together under the name. The hosted Hyperliquid rows are such rows today. Refusing them is
+  the follow-up in #187, once the publishers stamp one id per engine.
 - **The compiled-in feed registry is brought into line with the hosted document.** It had fallen
   behind what `malbeclabs/infra`'s aggregator publishes, and a host whose fetch fails runs it:
   Hyperliquid was one `tiredsolid` group of eleven port blocks where the ledger now carries two

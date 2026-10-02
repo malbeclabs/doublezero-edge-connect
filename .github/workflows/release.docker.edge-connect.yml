@@ -2,8 +2,8 @@ name: release.docker.edge-connect
 
 # Builds and publishes the three doublezero-edge-connect variants to GHCR.
 # See docs/superpowers/specs/2026-06-12-edge-connect-image-variants-design.md.
-#   push to main      -> moving tags (:testnet, :mainnet-beta, devnet :latest) + :sha-
-#   tag vX.Y.Z        -> pinned :<env>-X.Y.Z (+ :latest for mainnet-beta, devnet :X.Y.Z)
+#   push to main      -> moving tags (:testnet, :mainnet-beta = :latest, devnet :latest) + :sha-
+#   tag vX.Y.Z        -> the same, plus pinned :<env>-X.Y.Z (devnet :X.Y.Z)
 #   workflow_dispatch -> moving tags (manual)
 #   pull_request      -> build-only smoke test (mainnet-beta, no push)
 on:

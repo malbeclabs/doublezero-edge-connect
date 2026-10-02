@@ -1236,7 +1236,7 @@ async fn serve_client(
                     // `unsubscribe`/`subscribe` loop is an output amplifier — the `added` guard below
                     // only suppresses an identical *repeat*.
                     if !inbound_allowed(&mut win_start, &mut win_count) {
-                        return end_rate_limited(&mut write).await;
+                        return end_rate_limited(&mut write, &mut read).await;
                     }
                     match parse_control(&txt) {
                         Ok(Control::Ping) => write.send(WsMessage::Text(
@@ -1317,7 +1317,7 @@ async fn serve_client(
                 Some(Ok(WsMessage::Ping(p))) => {
                     last_seen = Instant::now();
                     if !inbound_allowed(&mut win_start, &mut win_count) {
-                        return end_rate_limited(&mut write).await;
+                        return end_rate_limited(&mut write, &mut read).await;
                     }
                     write.send(WsMessage::Pong(p)).await?;
                 }
@@ -1349,7 +1349,7 @@ async fn serve_client(
                     // client's fault, and a `trades`/`l2Book` client is unaffected by it.
                     Prepared::Resync if subs.iter().any(|s| matches!(s, Sub::L4Book { .. })) => {
                         if !rebootstrap(&mut write, &books, &subs, &pinned, &mut last_rebootstrap).await? {
-                            return end_lagging(&mut write).await;
+                            return end_lagging(&mut write, &mut read).await;
                         }
                     }
                     Prepared::Resync => {}
@@ -1358,7 +1358,7 @@ async fn serve_client(
                     warn!("hl sink client lagged, dropped {n}");
                     dropped("client_lagged");
                     if !rebootstrap(&mut write, &books, &subs, &pinned, &mut last_rebootstrap).await? {
-                        return end_lagging(&mut write).await;
+                        return end_lagging(&mut write, &mut read).await;
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -1386,31 +1386,62 @@ fn inbound_allowed(win_start: &mut Instant, win_count: &mut u32) -> bool {
     *win_count <= MAX_INBOUND_PER_MIN
 }
 
-/// End a connection that crossed the inbound cap. The `Close` is not decoration: dropping the socket
-/// straight after the error frame races whatever the peer has not drained, so a real client is
-/// disconnected with the one frame that says why still in flight.
-async fn end_rate_limited<S>(write: &mut S) -> Result<()>
+/// How long a connection being ended waits for the peer's `Close` before it is dropped anyway. A
+/// bound, not a courtesy: a peer that never answers must not hold a client slot open.
+const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Finish the WebSocket closing handshake after this side has sent its `Close`: read, and discard,
+/// whatever the peer still sends until its own `Close` (or the end of the stream) arrives, bounded by
+/// [`CLOSE_HANDSHAKE_TIMEOUT`].
+///
+/// Dropping the socket straight after the `Close` is what loses the frames before it. A TCP socket
+/// closed with inbound bytes still unread is **reset** rather than shut down, and a peer that
+/// receives the reset discards everything it had not yet read — the error frame that says why it was
+/// disconnected included. Reading the peer's reply consumes those bytes and lets the connection end
+/// with a FIN behind the frames it carries.
+async fn finish_close<R, E>(read: &mut R)
+where
+    R: StreamExt<Item = std::result::Result<WsMessage, E>> + Unpin,
+{
+    let _ = tokio::time::timeout(CLOSE_HANDSHAKE_TIMEOUT, async {
+        while let Some(Ok(msg)) = read.next().await {
+            if matches!(msg, WsMessage::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
+/// End a connection that crossed the inbound cap. The `Close`, and waiting for the peer's, are not
+/// decoration: without them a real client is disconnected with the one frame that says why still in
+/// flight — see [`finish_close`].
+async fn end_rate_limited<S, R, E>(write: &mut S, read: &mut R) -> Result<()>
 where
     S: SinkExt<WsMessage> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
+    R: StreamExt<Item = std::result::Result<WsMessage, E>> + Unpin,
 {
     write
         .send(error_frame("inbound rate limit exceeded"))
         .await?;
     write.send(WsMessage::Close(None)).await?;
+    finish_close(read).await;
     Ok(())
 }
 
 /// End a connection that keeps falling behind. See [`rebootstrap`].
-async fn end_lagging<S>(write: &mut S) -> Result<()>
+async fn end_lagging<S, R, E>(write: &mut S, read: &mut R) -> Result<()>
 where
     S: SinkExt<WsMessage> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
+    R: StreamExt<Item = std::result::Result<WsMessage, E>> + Unpin,
 {
     write
         .send(error_frame("lagging: reconnect for a fresh book"))
         .await?;
     write.send(WsMessage::Close(None)).await?;
+    finish_close(read).await;
     Ok(())
 }
 
