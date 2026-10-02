@@ -526,8 +526,9 @@
         "SOURCE. Source ID 6. The spot row below is Source ID 8 under the same name, BINANCE, and both list",
         "symbols such as BTCUSDT: tell them apart by `source_id`, never by `venue` and `symbol` alone.",
         "",
-        "STATUS. Not yet confirmed from a subscriber. A permanently-zero dz_receiver_up here is a wrong value",
-        "in this row, not a quiet feed."
+        "STATUS. Confirmed from a subscriber on 2026-10-02, at a Chicago DoubleZero site: the group, both",
+        "ports and the Source ID carry this engine's traffic. A permanently-zero dz_receiver_up here is a",
+        "wrong value in this row, or a publisher whose multicast TTL does not reach you, not a quiet feed."
       ],
       "publishers": {
         "explicit": [
@@ -559,8 +560,9 @@
         "",
         "SOURCE. Source ID 8; see the USD-margined row above for the shared name.",
         "",
-        "STATUS. Not yet confirmed from a subscriber. A permanently-zero dz_receiver_up here is a wrong value",
-        "in this row, not a quiet feed."
+        "STATUS. Confirmed from a subscriber on 2026-10-02, at a Chicago DoubleZero site: the group, both",
+        "ports and the Source ID carry this engine's traffic. A permanently-zero dz_receiver_up here is a",
+        "wrong value in this row, or a publisher whose multicast TTL does not reach you, not a quiet feed."
       ],
       "publishers": {
         "explicit": [

@@ -349,6 +349,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A market-by-price `InstrumentReset` discarded its own recovery snapshot group.** A publisher withholding and then re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin` follows its own reset by ~0.1 ms on a different port — resets ride mktdata, snapshot groups the snapshot port, on independent sequence series — so which is processed first is a coin flip. When the begin won, both the book's assembly and the processor's level route were torn out, the market waited a full snapshot rotation to heal, and the group's levels were counted on `dz_mbp_snapshot_levels_dropped_total{reason="reset"}`. A group anchored at or after the reset's `New Anchor Seq` is now kept — the same test a `SnapshotBegin` is already judged by — and only one that predates the reset is dropped and tombstoned. Observed on a live Phoenix feed at roughly two flaps per hour per market; expect that `reason="reset"` series to fall substantially.
 
 ### Changed
+- **The Binance rows are confirmed from a subscriber.** A capture on 2026-10-02 at a Chicago
+  DoubleZero site matched both rows' group, ports, Source ID (6, 8) and channel (0, 1), and the bridge
+  served 566 and 1,372 products with live quotes on both engines; the rows' `notes` drop "not yet
+  confirmed". It also found the publishers' multicast TTL of 8 dying inside the fabric before
+  Chicago — fixed at the publisher (malbeclabs/binance#123) — so the notes now name a short TTL as a
+  cause of a row that binds and stays silent at one site.
 - **A feed-registry row that shares its venue name with other Source IDs but declares no `source_id`
   is reported at load** (`info`, once per `(venue, category)`): its engines' health and status are
   reported together under the name. The hosted Hyperliquid rows are such rows today. Refusing them is
