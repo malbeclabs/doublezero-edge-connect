@@ -61,9 +61,20 @@ use crate::{
 /// kind, one per universe.
 pub type FeedKey = (&'static str, &'static str, FeedKind, u16);
 
-/// The set of rows that mirror one another: a [`FeedKey`]'s `(venue, category)` prefix. One tape
-/// owner is elected per universe, never per venue — see [`tape_owners`].
-pub type Universe = (&'static str, &'static str);
+/// The set of receivers that mirror one another's tape: a [`FeedKey`]'s `(venue, category)` prefix
+/// plus, for a row that derives a port per channel, that receiver's channel. One tape owner is
+/// elected per universe, never per venue — see [`tape_owners_by_channel`].
+///
+/// The channel is part of it because a derived row's receivers do **not** mirror each other: each
+/// carries one league's prints and nothing else. Two derived rows in one category (a top-of-book
+/// and a market-by-price row over the same channels) pair up per channel, so ownership is elected
+/// per channel too; elected per category, the top-of-book row would own every channel's tape while
+/// running only some of them, and the market-by-price receivers of the rest would decode their
+/// prints and drop them. A row on one shared port block reports `None` and keeps universe-level
+/// ownership, since every one of its publishers carries the whole tape. The registry refuses a
+/// category that mixes the two shapes (`RegistryError::MixedChannelShape`), so a `None` and a
+/// `Some` never describe the same prints.
+pub type Universe = (&'static str, &'static str, Option<u8>);
 
 /// Whether a receiver currently owns its venue's `trade` tape. Read once per print by the
 /// processors; the reconciler flips it in place so ownership can move **without respawning** the
@@ -115,8 +126,9 @@ pub fn tape_rank_is_some(kind: FeedKind) -> bool {
 /// peer that is actually streaming. `Unregistered` therefore ranks below `Up` — an incumbent keeps
 /// the tape until the newcomer really registers — but above `Down`, so a cold start where nothing
 /// has bound yet still falls back to rank instead of leaving the venue with no owner.
-pub fn tape_owners(
+pub fn tape_owners_by_channel(
     active: impl IntoIterator<Item = FeedKey>,
+    channel_of: impl Fn(&FeedKey) -> Option<u8>,
     liveness: impl Fn(&FeedKey) -> TapeLiveness,
 ) -> HashMap<Universe, FeedKey> {
     /// What the rows of one universe are ranked on, lowest wins. Named so the ordering is stated
@@ -128,7 +140,7 @@ pub fn tape_owners(
             continue;
         };
         let order = (liveness(&key), rank, key.3);
-        let universe = (key.0, key.1);
+        let universe = (key.0, key.1, channel_of(&key));
         match best.get(&universe) {
             Some(&(cur, _)) if cur <= order => {}
             _ => {
@@ -145,8 +157,26 @@ pub fn tape_owners(
 /// base port, so **every** publisher of the owning row emits — collapsing mirrored copies is the
 /// arbiter's job. The kind comparison alone is not enough once a venue can hold two rows of one
 /// kind: it would hand a sports book row the tape because the perps book row owns one.
+pub fn owns_on(owners: &HashMap<Universe, FeedKey>, key: &FeedKey, channel: Option<u8>) -> bool {
+    owners
+        .get(&(key.0, key.1, channel))
+        .is_some_and(|o| o.2 == key.2)
+}
+
+/// [`tape_owners_by_channel`] over rows that all share one port block — the universe-level case
+/// the ranking tests are about.
+#[cfg(test)]
+pub fn tape_owners(
+    active: impl IntoIterator<Item = FeedKey>,
+    liveness: impl Fn(&FeedKey) -> TapeLiveness,
+) -> HashMap<Universe, FeedKey> {
+    tape_owners_by_channel(active, |_| None, liveness)
+}
+
+/// [`owns_on`] for a receiver of a row on one shared port block.
+#[cfg(test)]
 pub fn owns(owners: &HashMap<Universe, FeedKey>, key: &FeedKey) -> bool {
-    owners.get(&(key.0, key.1)).is_some_and(|o| o.2 == key.2)
+    owns_on(owners, key, None)
 }
 
 /// Every receiver key a feed contributes — one per publisher the [`ChannelFilter`] admits.
@@ -711,7 +741,11 @@ impl Reconciler {
         // off before its replacement is switched on, for the same reason as the abort above — and
         // each spawn then starts with the flag it will hold, so activating a feed is not also
         // counted as a tape *change*.
-        let owners = tape_owners(desired.iter().copied(), |k| self.health.liveness(k));
+        let owners = tape_owners_by_channel(
+            desired.iter().copied(),
+            |k| self.channel_of(k),
+            |k| self.health.liveness(k),
+        );
         self.publish_tape_owners(&owners);
         for key in to_spawn {
             let (feed, publisher) = self
@@ -734,7 +768,8 @@ impl Reconciler {
                 mktdata = publisher.ports.mktdata(),
                 "activating market-data receiver (subscribed)"
             );
-            let tape: TapeOwner = Arc::new(AtomicBool::new(owns(&owners, &key)));
+            let tape: TapeOwner =
+                Arc::new(AtomicBool::new(owns_on(&owners, &key, publisher.channel)));
             let h = tokio::spawn(receiver::run_feed(
                 feed,
                 publisher,
@@ -838,7 +873,7 @@ impl Reconciler {
     /// registry's only `derived` rows are `MarketByPrice`; no `MarketByOrder` row is ever
     /// channel-derived today, so `MboProcessor`'s writer of `DepthSnapshot` never runs behind a
     /// narrowable publisher.
-    fn forget_departing_channel(&self, key: &FeedKey) {
+    fn forget_departing_channel(&mut self, key: &FeedKey) {
         let Some((feed, publisher)) = self.cfg.enabled.iter().find_map(|f| {
             f.publishers
                 .iter()
@@ -857,34 +892,94 @@ impl Reconciler {
         // about to remove, and nothing will purge it again (this channel is not diffed as
         // "departing" a second time). Compiles out in release builds; active in every test and
         // debug run, which is where a reordering regression would otherwise pass silently.
+        //
+        // The one exception is a **deferred** purge rerun under a draining sibling's key whose
+        // subscription has since come back: that key is running again, and is necessarily still
+        // admitted (nothing unadmitted is ever spawned), so the sibling check below counts it
+        // and keeps everything it supplies. Running is harmless exactly when admitted.
         debug_assert!(
-            !self.active.contains_key(key),
+            !self.active.contains_key(key) || self.last_filter_admitted.contains(key),
             "forget_departing_channel ran before its receiver was aborted (N1 regression): \
              venue={} category={} channel={channel}",
             feed.venue,
             feed.category,
         );
 
+        // A receiver for this `(venue, category, channel)` still draining — a sibling aborted by a
+        // subscription loss, or this very key aborted earlier for one — can still land a final
+        // write after a purge run now, restoring what was just removed with nothing left to remove
+        // it again. Hand the purge to that entry instead: `drain_departed` reruns it once the
+        // receiver has confirmably stopped, against the admitted set in force then.
+        let mut deferred = false;
+        for entry in self.draining.iter_mut() {
+            if entry.key.0 == feed.venue
+                && entry.key.1 == feed.category
+                && Self::channel_in(&self.cfg.enabled, &entry.key) == Some(channel)
+            {
+                entry.purge = true;
+                deferred = true;
+            }
+        }
+        if deferred {
+            return;
+        }
+
+        // What a **sibling** row still admits on this channel is not this row's to drop. The purge
+        // is keyed `(venue, category, channel)`, which two derived rows of one category share (a
+        // top-of-book and a market-by-price row over the same leagues), and the channel filter
+        // narrows each row independently. Judged on the filter's admitted set, not on which
+        // receivers happen to be running, because the purge is the *filter's* decision: a sibling
+        // that is merely unsubscribed keeps its state exactly as a lone row's subscription loss
+        // does (so it resyncs on return), and is purged the day the filter narrows it too. Every
+        // kind carries reference data and the sibling's prints feed the history, so either kind
+        // keeps the catalog and history; only a book-building kind keeps the book, since a
+        // top-of-book sibling would leave it stale forever.
+        let siblings: Vec<FeedKind> = self
+            .last_filter_admitted
+            .iter()
+            // No `*k != key`: on the normal path the departing key is not admitted anyway
+            // (`last_filter_admitted` is set before any purge runs), and on the deferred path
+            // `key` is the *draining sibling's*, which the filter may well still admit — it must
+            // then count as its own sibling, or its state is purged by another row's narrowing.
+            .filter(|k| k.0 == feed.venue && k.1 == feed.category)
+            .filter(|k| Self::channel_in(&self.cfg.enabled, k) == Some(channel))
+            .map(|k| k.2)
+            .collect();
+        let keep_catalog_and_history = !siblings.is_empty();
+        let keep_books = siblings
+            .iter()
+            .any(|k| matches!(k, FeedKind::MarketByPrice | FeedKind::MarketByOrder));
+
         // The catalog: a bare HashMap<(venue, category, channel, instrument_id), _>, keyed on this
         // departing row's own universe — see the doc above.
         let category = category_arc(feed.category);
-        crate::model::lock(&self.cfg.instruments)
-            .retain(|k, _| !(k.0.name() == feed.venue && k.1 == category && k.2 == channel));
+        if !keep_catalog_and_history {
+            crate::model::lock(&self.cfg.instruments)
+                .retain(|k, _| !(k.0.name() == feed.venue && k.1 == category && k.2 == channel));
+        }
 
         // The book: routed through the arbiter, never hand-deleted from the replay map directly, so
         // the accumulator, the replay entry and `StickyAuthority::last_admitted` drop together —
         // see `Arbiter::forget_channel_books`'s doc for why a direct replay-map delete is unsafe.
-        let books_dropped = crate::ingest::arbiter::lock(&self.cfg.arbiter).forget_channel_books(
-            feed.venue,
-            feed.category,
-            channel,
-        );
+        let books_dropped = if keep_books {
+            0
+        } else {
+            crate::ingest::arbiter::lock(&self.cfg.arbiter).forget_channel_books(
+                feed.venue,
+                feed.category,
+                channel,
+            )
+        };
 
-        let history_dropped = crate::model::lock(&self.cfg.history).forget_channel(
-            &sources::source_ids_of(feed.venue),
-            &category,
-            channel,
-        );
+        let history_dropped = if keep_catalog_and_history {
+            0
+        } else {
+            crate::model::lock(&self.cfg.history).forget_channel(
+                &sources::source_ids_of(feed.venue),
+                &category,
+                channel,
+            )
+        };
 
         if history_dropped > 0 || books_dropped > 0 {
             info!(
@@ -903,9 +998,26 @@ impl Reconciler {
     ///
     /// `Relaxed` throughout: the flag is advisory per-message policy, not a synchronization point,
     /// and the worst case at a subscription boundary is one duplicated or one dropped print.
+    /// The channel `key`'s publisher was derived for, or `None` for a publisher on a shared port
+    /// block (and for a key no enabled row has, which cannot be running).
+    fn channel_of(&self, key: &FeedKey) -> Option<u8> {
+        Self::channel_in(&self.cfg.enabled, key)
+    }
+
+    /// [`Self::channel_of`] over an explicit row set, so a caller holding a mutable borrow of
+    /// another field can still ask.
+    fn channel_in(enabled: &[Feed], key: &FeedKey) -> Option<u8> {
+        enabled.iter().find_map(|f| {
+            f.publishers
+                .iter()
+                .find(|p| (f.venue, f.category, f.kind, p.base_port()) == *key)
+                .and_then(|p| p.channel)
+        })
+    }
+
     fn publish_tape_owners(&self, owners: &HashMap<Universe, FeedKey>) {
         for (key, (_, tape)) in &self.active {
-            let want = owns(owners, key);
+            let want = owns_on(owners, key, self.channel_of(key));
             if tape.swap(want, Ordering::Relaxed) != want {
                 metrics()
                     .tape_owner_changes
@@ -1261,7 +1373,7 @@ mod tests {
     #[test]
     fn top_of_book_owns_the_tape_when_both_feeds_run() {
         let owners = tape_owners([("V", C, TOB, 7576), ("V", C, MBP, 31000)], all_live);
-        assert_eq!(owners.get(&("V", C)), Some(&("V", C, TOB, 7576)));
+        assert_eq!(owners.get(&("V", C, None)), Some(&("V", C, TOB, 7576)));
         assert!(owns(&owners, &("V", C, TOB, 7576)));
         assert!(!owns(&owners, &("V", C, MBP, 31000)));
     }
@@ -1272,6 +1384,30 @@ mod tests {
     fn market_by_price_owns_the_tape_alone() {
         let owners = tape_owners([("V", C, MBP, 31000)], all_live);
         assert!(owns(&owners, &("V", C, MBP, 31000)));
+    }
+
+    /// Two derived rows of one category pair up **per channel**. With top-of-book running channel
+    /// 10 only and market-by-price running 10 and 11, top-of-book owns channel 10 and
+    /// market-by-price owns channel 11 — elected per category, top-of-book would own every
+    /// channel and channel 11's prints would be decoded and dropped.
+    #[test]
+    fn derived_rows_elect_a_tape_owner_per_channel() {
+        let (tob10, mbp10, mbp11) = (
+            ("V", C, TOB, 33010),
+            ("V", C, MBP, 34010),
+            ("V", C, MBP, 34011),
+        );
+        let channel = |k: &FeedKey| Some((k.3 % 100) as u8);
+        let owners = tape_owners_by_channel([tob10, mbp10, mbp11], channel, all_live);
+        assert!(owns_on(&owners, &tob10, Some(10)));
+        assert!(
+            !owns_on(&owners, &mbp10, Some(10)),
+            "channel 10's tape is top-of-book's"
+        );
+        assert!(
+            owns_on(&owners, &mbp11, Some(11)),
+            "no top-of-book runs channel 11"
+        );
     }
 
     #[test]
@@ -1776,7 +1912,7 @@ mod tests {
             mirror_offset: None,
             source_id: None,
         };
-        let r = test_reconciler(vec![feed_a, feed_b]);
+        let mut r = test_reconciler(vec![feed_a, feed_b]);
         let key_a = (
             "HYPERLIQUID",
             "testcategory",
@@ -1884,7 +2020,7 @@ mod tests {
             mirror_offset: None,
             source_id: None,
         };
-        let r = test_reconciler(vec![feed_perps, feed_sports]);
+        let mut r = test_reconciler(vec![feed_perps, feed_sports]);
         let key_perps = ("KALSHI", "perps", FeedKind::MarketByPrice, 33030u16);
 
         r.cfg.instruments.lock().unwrap().insert(
@@ -2016,6 +2152,246 @@ mod tests {
             404,
             "a departed channel's product must vanish from the query surface, not read as \
              alive-but-quiet"
+        );
+    }
+
+    /// A row narrowed off a channel its **sibling** still admits leaves the sibling's state alone.
+    /// The Kalshi elections pair (a top-of-book and a market-by-price row over channels 50-55, one
+    /// category) shares the `(venue, category, channel)` the purge is keyed on, and the channel
+    /// filter narrows each row on its own.
+    ///
+    /// Narrowing top-of-book off channel 50 while market-by-price keeps it purges nothing: the
+    /// catalog, the book and the history are all still fed. Narrowing market-by-price off it while
+    /// top-of-book runs it drops only the book, which top-of-book cannot rebuild; the catalog and
+    /// history stay.
+    #[tokio::test]
+    async fn a_channel_a_sibling_row_still_admits_is_not_purged() {
+        let rows: Vec<Feed> = crate::ingest::feeds::feeds()
+            .iter()
+            .filter(|f| f.category == "elections")
+            .copied()
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "fixture: the elections top-of-book and market-by-price rows"
+        );
+        let both = "edge-kalshi-elections-pol-tob=50,51;edge-kalshi-elections-pol-mbp=50,51";
+        let mut r = test_reconciler_with_filter(rows, ChannelFilter::parse(both).unwrap());
+        let id = || crate::model::SourceKey::new(3, "KALSHI".into());
+        let catalog_key: (crate::model::SourceKey, Arc<str>, u8, u32) =
+            (id(), "elections".into(), 50, 1);
+        let book_key: crate::ingest::authority::MarketKey = (id(), Arc::from("elections"), 50, 1);
+        let hist_key = history::Key {
+            source_id: 3,
+            category: "elections".into(),
+            channel: 50,
+            instrument_id: 1,
+        };
+
+        r.tick().await;
+        r.cfg.instruments.lock().unwrap().insert(
+            catalog_key.clone(),
+            crate::model::NormalizedInstrument {
+                tick_size: 0,
+                venue: "KALSHI".into(),
+                source_name: "KALSHI".into(),
+                source_id: 3,
+                symbol: "SIBLING".into(),
+                channel: 50,
+                instrument_id: 1,
+                category: "elections".into(),
+                price_exponent: -4,
+                qty_exponent: -2,
+            },
+        );
+        seed_book(&r, "KALSHI", 3, "SIBLING", "elections", 50, 1);
+        r.cfg.history.lock().unwrap().ingest(
+            hist_key.clone(),
+            history::Print {
+                ts_ns: 1_000 * 1_000_000_000,
+                price: 1.0,
+                size: 1.0,
+            },
+        );
+        let state = |r: &Reconciler| {
+            (
+                r.cfg.instruments.lock().unwrap().contains_key(&catalog_key),
+                crate::model::lock(&r.cfg.books).contains_key(&book_key),
+                !r.cfg
+                    .history
+                    .lock()
+                    .unwrap()
+                    .candles(&hist_key, 60, 10, 1_100)
+                    .is_empty(),
+            )
+        };
+        assert_eq!(state(&r), (true, true, true), "fixture: all three seeded");
+
+        async fn narrow(r: &mut Reconciler, spec: &str) {
+            *r.cfg.filter.lock().unwrap() = ChannelFilter::parse(spec).unwrap();
+            for _ in 0..=MAX_DRAIN_TICKS {
+                r.tick().await;
+            }
+        }
+        narrow(
+            &mut r,
+            "edge-kalshi-elections-pol-tob=51;edge-kalshi-elections-pol-mbp=50,51",
+        )
+        .await;
+        assert_eq!(
+            state(&r),
+            (true, true, true),
+            "market-by-price still runs channel 50: nothing is purged"
+        );
+
+        narrow(
+            &mut r,
+            "edge-kalshi-elections-pol-tob=50,51;edge-kalshi-elections-pol-mbp=51",
+        )
+        .await;
+        assert_eq!(
+            state(&r),
+            (true, false, true),
+            "only top-of-book runs channel 50: the book goes, the catalog and history stay"
+        );
+    }
+
+    /// A purge must not run while a receiver for its channel is still draining, or that receiver's
+    /// final write lands after it and restores what was removed, with nothing left to remove it
+    /// again. Here market-by-price on channel 50 was aborted by a subscription loss (draining, no
+    /// purge of its own) and top-of-book had already exited when the filter drops channel 50 from
+    /// both: the purge is handed to the draining entry and runs only once it is reaped.
+    #[tokio::test]
+    async fn a_purge_waits_for_a_draining_sibling_on_its_channel() {
+        let rows: Vec<Feed> = crate::ingest::feeds::feeds()
+            .iter()
+            .filter(|f| f.category == "elections")
+            .copied()
+            .collect();
+        let both = "edge-kalshi-elections-pol-tob=50,51;edge-kalshi-elections-pol-mbp=50,51";
+        let mut r = test_reconciler_with_filter(rows, ChannelFilter::parse(both).unwrap());
+        let tob50 = ("KALSHI", "elections", FeedKind::TopOfBook, 35050u16);
+        let mbp50 = ("KALSHI", "elections", FeedKind::MarketByPrice, 36050u16);
+        let catalog_key: (crate::model::SourceKey, Arc<str>, u8, u32) = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            "elections".into(),
+            50,
+            1,
+        );
+        r.tick().await;
+        assert!(r.active.contains_key(&tob50) && r.active.contains_key(&mbp50));
+        r.cfg.instruments.lock().unwrap().insert(
+            catalog_key.clone(),
+            crate::model::NormalizedInstrument {
+                tick_size: 0,
+                venue: "KALSHI".into(),
+                source_name: "KALSHI".into(),
+                source_id: 3,
+                symbol: "DRAINING".into(),
+                channel: 50,
+                instrument_id: 1,
+                category: "elections".into(),
+                price_exponent: -4,
+                qty_exponent: -2,
+            },
+        );
+
+        // Top-of-book has exited on its own; market-by-price was aborted for a subscription loss and
+        // is still draining (its task is never polled here, so it stays unfinished until the bound).
+        let (tob, _) = r.active.remove(&tob50).unwrap();
+        tob.abort();
+        let (mbp, _) = r.active.remove(&mbp50).unwrap();
+        r.draining.push(Draining {
+            key: mbp50,
+            handle: mbp,
+            ticks_waited: 0,
+            purge: false,
+        });
+
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse(
+            "edge-kalshi-elections-pol-tob=51;edge-kalshi-elections-pol-mbp=51",
+        )
+        .unwrap();
+        r.tick().await;
+        assert!(
+            r.cfg.instruments.lock().unwrap().contains_key(&catalog_key),
+            "the purge waits while market-by-price on channel 50 is still draining"
+        );
+        for _ in 0..MAX_DRAIN_TICKS {
+            r.tick().await;
+        }
+        assert!(
+            !r.cfg.instruments.lock().unwrap().contains_key(&catalog_key),
+            "and runs once that receiver is reaped"
+        );
+    }
+
+    /// A deferred purge reruns under the **draining** entry's key, which is the sibling's. That
+    /// sibling, still admitted by the filter, must count as its own sibling there, or narrowing
+    /// another row purges the state of one that merely lost its subscription. Here market-by-price
+    /// on channel 50 is draining after a subscription loss (still admitted), and the filter narrows
+    /// only top-of-book off 50: top-of-book's purge is handed to market-by-price's entry, and when
+    /// that is reaped nothing may be dropped. The aborted top-of-book task is allowed to finish
+    /// (`yield_now`), so the two entries drain on different ticks — the timing that reaches the
+    /// deferred path. The harness runs with subscription gating off, so market-by-price is
+    /// respawned meanwhile: the variant where its subscription comes back before the drain
+    /// bound, and the deferred purge reruns beside its live receiver.
+    #[tokio::test]
+    async fn a_deferred_purge_spares_a_draining_sibling_the_filter_still_admits() {
+        let rows: Vec<Feed> = crate::ingest::feeds::feeds()
+            .iter()
+            .filter(|f| f.category == "elections")
+            .copied()
+            .collect();
+        let both = "edge-kalshi-elections-pol-tob=50,51;edge-kalshi-elections-pol-mbp=50,51";
+        let mut r = test_reconciler_with_filter(rows, ChannelFilter::parse(both).unwrap());
+        let mbp50 = ("KALSHI", "elections", FeedKind::MarketByPrice, 36050u16);
+        let catalog_key: (crate::model::SourceKey, Arc<str>, u8, u32) = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            "elections".into(),
+            50,
+            1,
+        );
+        r.tick().await;
+        r.cfg.instruments.lock().unwrap().insert(
+            catalog_key.clone(),
+            crate::model::NormalizedInstrument {
+                tick_size: 0,
+                venue: "KALSHI".into(),
+                source_name: "KALSHI".into(),
+                source_id: 3,
+                symbol: "UNSUBSCRIBED".into(),
+                channel: 50,
+                instrument_id: 1,
+                category: "elections".into(),
+                price_exponent: -4,
+                qty_exponent: -2,
+            },
+        );
+
+        // Market-by-price on channel 50 loses its subscription: aborted, draining, no purge of
+        // its own, and still admitted by the filter. Its task never finishes on its own here.
+        let (h, _) = r.active.remove(&mbp50).unwrap();
+        h.abort();
+        r.draining.push(Draining {
+            key: mbp50,
+            handle: tokio::spawn(std::future::pending()),
+            ticks_waited: 0,
+            purge: false,
+        });
+
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse(
+            "edge-kalshi-elections-pol-tob=51;edge-kalshi-elections-pol-mbp=50,51",
+        )
+        .unwrap();
+        for _ in 0..=MAX_DRAIN_TICKS + 1 {
+            r.tick().await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            r.cfg.instruments.lock().unwrap().contains_key(&catalog_key),
+            "market-by-price is still admitted on channel 50: its state stays"
         );
     }
 

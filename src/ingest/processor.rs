@@ -4165,6 +4165,7 @@ mod tests {
             publisher: TEST_PUB,
             mirror_offset: None,
             declared_source_id: None,
+            per_channel: false,
         }
     }
 

@@ -140,6 +140,10 @@ pub struct DatagramCtx<'a> {
     /// wire Source ID, because the declaration is a claim about a machine outside this process and
     /// nothing else would notice it being wrong (see [`note_source_id_mismatch`]).
     pub declared_source_id: Option<u16>,
+    /// Whether this receiver's row derives a port per channel ([`FeedPublisher::channel`] is
+    /// `Some`). Its prints are then tape-gated per channel, the grain the reconciler elects this
+    /// receiver's tape ownership at (`reconcile::Universe`); see `Arbiter::emit_scoped`.
+    pub per_channel: bool,
 }
 
 impl DatagramCtx<'_> {
@@ -177,7 +181,12 @@ impl DatagramCtx<'_> {
             }
         }
         record_revealed(self.venue, wire_id);
-        lock(self.arbiter).emit(msg, Transport::Edge(self.publisher), self.category);
+        lock(self.arbiter).emit_scoped(
+            msg,
+            Transport::Edge(self.publisher),
+            self.category,
+            self.per_channel,
+        );
     }
 }
 
@@ -796,6 +805,7 @@ async fn drive<P: DatagramProcessor>(
     kind: FeedKind,
     publisher_port: u16,
     source_id: Option<u16>,
+    per_channel: bool,
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     health: SharedFeedHealth,
@@ -936,6 +946,7 @@ async fn drive<P: DatagramProcessor>(
                 publisher,
                 mirror_offset,
                 declared_source_id: source_id,
+                per_channel,
             };
             processor.on_datagram(&channels[idx].buf[..n], &ctx);
         }
@@ -983,6 +994,7 @@ pub async fn run_feed(
                 feed.kind,
                 publisher.base_port(),
                 feed.source_id,
+                publisher.channel.is_some(),
                 arbiter,
                 instruments,
                 health,
@@ -1003,6 +1015,7 @@ pub async fn run_feed(
                 feed.kind,
                 publisher.base_port(),
                 feed.source_id,
+                publisher.channel.is_some(),
                 arbiter,
                 instruments,
                 health,
@@ -1039,6 +1052,7 @@ pub async fn run_feed(
                 feed.kind,
                 publisher.base_port(),
                 feed.source_id,
+                publisher.channel.is_some(),
                 arbiter,
                 instruments,
                 health,
@@ -1075,6 +1089,7 @@ pub async fn run_feed(
                 feed.kind,
                 publisher.base_port(),
                 feed.source_id,
+                publisher.channel.is_some(),
                 arbiter,
                 instruments,
                 health,
@@ -1315,6 +1330,7 @@ mod tests {
             publisher: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             mirror_offset: None,
             declared_source_id: declared,
+            per_channel: false,
         };
         let quote = |source_id, ts| {
             FeedMessage::Quote(NormalizedQuote {
@@ -1429,6 +1445,7 @@ mod tests {
             publisher: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             mirror_offset: None,
             declared_source_id: None,
+            per_channel: false,
         };
         let quote = NormalizedQuote {
             venue: wire_venue.into(),

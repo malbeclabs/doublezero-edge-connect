@@ -379,9 +379,15 @@ Modules are grouped by role under `src/`:
   than off a `Desired` that was never applied. The desired receiver set is the subscribed rows' publishers **narrowed by the
   channel filter** (`ingest::channel_filter`) — an input to the set, not a second authority. Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
   finished handles so a died feed respawns. Fail-open / `--subscription-gating-disable` route through
-  one `static_desired()`. Also the **trade-tape row owner**: `tape_owners` ranks the running receivers
-  per `(venue, category)` — one owner per *universe*, since rows sharing a Source ID can carry
-  instrument sets that mirror nothing and a venue-wide rank mutes the loser's tape outright —
+  one `static_desired()`. Also the **trade-tape row owner**: `tape_owners_by_channel` ranks the running
+  receivers per `Universe` = `(venue, category, channel)` — one owner per *universe*, since rows
+  sharing a Source ID can carry instrument sets that mirror nothing and a venue-wide rank mutes the
+  loser's tape outright. The channel is the publisher's derived one, `None` for a shared port block:
+  a derived row's receivers carry one league each and pair with a sibling row's **per channel**, so
+  ranked per category a top-of-book row running some channels would mute every market-by-price
+  receiver, including those of channels it does not run (`derived_rows_elect_a_tape_owner_per_channel`);
+  a shared-block row's publishers each carry the whole tape and keep category-level ownership, and
+  the registry refuses a category mixing the two shapes (`MixedChannelShape`) —
   (`TopOfBook` over `MarketByPrice`, base port breaking ties; MBO/Midpoint never rank) and
   `apply_feeds` publishes the result onto a `TapeOwner` (`Arc<AtomicBool>`) each processor reads per
   print, so ownership moves **without a respawn** — a respawn would drop a healthy publisher's books
@@ -401,7 +407,14 @@ Modules are grouped by role under `src/`:
   that departing row's own `(venue, category, channel)` slice from all three: the catalog
   (`InstrumentSnapshot`, a `retain`), the book (routed through `Arbiter::forget_channel_books`, never
   a direct replay-map delete, so the accumulator/replay/`StickyAuthority` triple drops together), and
-  `history::Store::forget_channel`. Category-precise throughout so a departing channel can never
+  `history::Store::forget_channel` — **except what a sibling row the filter still admits on that
+  channel supplies**: two derived rows of one category share that key and the filter narrows each
+  alone, so any admitted sibling keeps the catalog and history, and a book-building one keeps the
+  book too (`a_channel_a_sibling_row_still_admits_is_not_purged`). Admission, not "running": the
+  purge is the filter's decision, and an unsubscribed sibling keeps its state just as a lone row's
+  subscription loss does. A purge also never runs while any receiver on that channel is still
+  draining — it sets that entry's `purge` and reruns when the receiver is reaped, so a final write
+  cannot restore what it removed (`a_purge_waits_for_a_draining_sibling_on_its_channel`). Category-precise throughout so a departing channel can never
   over-drop a live peer universe sharing the same numeric id — see `ingest/feeds.rs`'s
   mid-migration warning on `channel_id`.
 - **`ingest/receiver.rs`** — the ingest hot path. All socket plumbing is **protocol-agnostic and shared**:
@@ -469,9 +482,12 @@ Modules are grouped by role under `src/`:
   `dz_tape_path_transfers_total`. ⚠️ Two residual limits, both inherited from the unauthenticated
   wire: on a venue with no `book` traffic the authority tracks nobody, so a forged publisher printing first
   holds the tape until it goes quiet for a window — the same primitive `StickyAuthority::admit`'s
-  no-dark-start already exposes for `book` — and the gate spans a whole **category**, so rows sharing one
-  that *sharded* prints rather than mirroring them would lose the non-serving path's fills (giving them
-  distinct categories is the registry's job). The two `books` lookups inside it read the authority at
+  no-dark-start already exposes for `book` — and the gate runs at the **reconciler's grain**:
+  `tape_leader` is keyed `(source, category, Option<channel>)`, `Some` only for a derived row's
+  receiver (`DatagramCtx::per_channel` → `Arbiter::emit_scoped`), so a channel served from another
+  host is never muted by a leader streaming a different one, while a shared-block row — whose
+  `channel_id` names mirrors — keeps one leader per category. Paths that *sharded* one gated
+  scope's prints rather than mirroring them would still lose the non-serving path's fills. The two `books` lookups inside it read the authority at
   the same `(venue, category)` grain, so the deferral can only ever name a path elected on *this*
   universe. `no_id_owner` is skipped entirely
   for `Sticky` venues: it is the `Coordinated` guard, and it cannot see a gate-approved handover.
