@@ -1399,11 +1399,14 @@ const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 /// receives the reset discards everything it had not yet read — the error frame that says why it was
 /// disconnected included. Reading the peer's reply consumes those bytes and lets the connection end
 /// with a FIN behind the frames it carries.
-async fn finish_close<R, E>(read: &mut R)
+///
+/// `deadline` is [`CLOSE_HANDSHAKE_TIMEOUT`] in production; a parameter so a test can prove the bound
+/// holds against a peer that never answers without waiting it out.
+async fn finish_close<R, E>(read: &mut R, deadline: Duration)
 where
     R: StreamExt<Item = std::result::Result<WsMessage, E>> + Unpin,
 {
-    let _ = tokio::time::timeout(CLOSE_HANDSHAKE_TIMEOUT, async {
+    let _ = tokio::time::timeout(deadline, async {
         while let Some(Ok(msg)) = read.next().await {
             if matches!(msg, WsMessage::Close(_)) {
                 break;
@@ -1426,7 +1429,7 @@ where
         .send(error_frame("inbound rate limit exceeded"))
         .await?;
     write.send(WsMessage::Close(None)).await?;
-    finish_close(read).await;
+    finish_close(read, CLOSE_HANDSHAKE_TIMEOUT).await;
     Ok(())
 }
 
@@ -1441,7 +1444,7 @@ where
         .send(error_frame("lagging: reconnect for a fresh book"))
         .await?;
     write.send(WsMessage::Close(None)).await?;
-    finish_close(read).await;
+    finish_close(read, CLOSE_HANDSHAKE_TIMEOUT).await;
     Ok(())
 }
 
@@ -2449,6 +2452,40 @@ mod tests {
         assert_eq!(v["channel"], "trades");
         assert_eq!(v["data"][0]["tid"], 7u64);
         srv.abort();
+    }
+
+    /// The bound is what stops a peer that never answers our `Close` from holding one of
+    /// `MAX_CLIENTS` slots: against a stream that never yields, `finish_close` gives up at its
+    /// deadline instead of waiting forever.
+    #[tokio::test]
+    async fn finish_close_gives_up_on_a_peer_that_never_answers() {
+        let mut silent = futures_util::stream::pending::<Result<WsMessage, std::io::Error>>();
+        let deadline = Duration::from_millis(50);
+        let started = Instant::now();
+        timeout(Duration::from_secs(5), finish_close(&mut silent, deadline))
+            .await
+            .expect("finish_close must return at its deadline, not hang");
+        assert!(
+            started.elapsed() >= deadline,
+            "it waits out the deadline first"
+        );
+    }
+
+    /// The common path ends well before the deadline: the peer's `Close` is the end of the
+    /// handshake, and frames ahead of it are read and discarded rather than ending the wait.
+    #[tokio::test]
+    async fn finish_close_returns_on_the_peers_close() {
+        let mut peer = futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(WsMessage::Text("late frame".into())),
+            Ok(WsMessage::Close(None)),
+        ])
+        .chain(futures_util::stream::pending());
+        let started = Instant::now();
+        finish_close(&mut peer, Duration::from_secs(30)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "returned on the Close, not at the deadline"
+        );
     }
 
     /// Flood the connection past the inbound cap with `flood`, then report whether the rate-limit
