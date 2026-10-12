@@ -174,6 +174,9 @@ pub struct Metrics {
     /// handover `rebaselined` the consumer (`yes`/`no`). A sustained re-baselining rate means the
     /// thresholds are too loose.
     pub path_transfers: IntCounterVec,
+    /// Health overrides held against an early revert, by how the hold ended
+    /// (`natural`/`deadline`/`incomplete`).
+    pub book_revert_holds: IntCounterVec,
     /// Trade-tape ownership moving from one of a venue's **feed rows** to another (the reconciler's
     /// decision, on a subscription change). Each move is a window in which a print may double or
     /// drop, so a sustained rate means subscriptions are flapping.
@@ -696,6 +699,13 @@ impl Metrics {
                 "Authority transfers by reason (initial/health/health_revert/silence/margin) and \
                  whether the handover re-baselined the consumer (rebaselined=yes/no).",
                 &["venue", "reason", "rebaselined"],
+            ),
+            book_revert_holds: counter_vec(
+                &registry,
+                "dz_book_revert_holds_total",
+                "Health overrides whose revert to the leader was held, by how the hold ended \
+                 (natural/deadline/incomplete).",
+                &["venue", "release"],
             ),
             path_markets_held: gauge_vec(
                 &registry,
@@ -1313,6 +1323,9 @@ mod tests {
         m.path_transfers
             .with_label_values(&["KALSHI", "silence", "yes"])
             .inc();
+        m.book_revert_holds
+            .with_label_values(&["KALSHI", "natural"])
+            .inc();
         m.path_markets_held
             .with_label_values(&["KALSHI", "path0"])
             .set(1);
@@ -1430,6 +1443,7 @@ mod tests {
             "dz_depth_ticks_won_total",
             "dz_path_lead_ns",
             "dz_path_authority_transfers_total",
+            "dz_book_revert_holds_total",
             "dz_path_markets_held",
             "dz_tape_owner_changes_total",
             "dz_tape_path_transfers_total",
