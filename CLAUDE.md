@@ -661,10 +661,10 @@ Modules are grouped by role under `src/`:
   ⚠️ **The override is stored, not computed** (`RevertHold`): the first healthy alternate to serve a
   market holds it until the leader has been healthy for `REVERT_HOLD_NS` (15 s) **and** has sent that
   market a `clear`-led batch since it went unhealthy (the install precedes the health report, so
-  "since healthy" would never match), or `REVERT_DEADLINE_NS` (60 s) passes. Recomputed per admission,
+  "since healthy" would never match), or has been healthy for `REVERT_DEADLINE_NS` (60 s) without one. Recomputed per admission,
   two alternates traded a market on every message, each trade a re-baseline. A hold is discarded when
-  an election moves the leader, the holder goes unhealthy or silent, or the replay entry is incomplete
-  (a quiet holder would never republish it); `dz_book_revert_holds_total{release}` counts the endings.
+  an election moves the leader, the holder goes unhealthy or silent, or the leader sends a batch while the replay entry is incomplete
+  (a quiet holder would never republish it; the holder's own batch may be that republish); `dz_book_revert_holds_total{release}` counts the endings.
   Tunables are the `--arb-*` flags (see docs/metrics.md).
   **Anything but "the path that last reached the wire for this market" re-baselines the consumer**: a
   serving-path change (margin, silence, or that health override), a market's first admission, a market

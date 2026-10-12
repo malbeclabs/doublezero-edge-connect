@@ -50,9 +50,10 @@
 //!
 //! Health is an **override** on the universe's leader, and it is **stored** ([`RevertHold`]): a
 //! market whose leader is unhealthy is pinned to one healthy path, and goes back only after the
-//! leader has been healthy for [`REVERT_HOLD_NS`] and has re-baselined that market itself, or at
-//! [`REVERT_DEADLINE_NS`]. Computed per admission instead, it followed whichever alternate spoke
-//! last, and every handover in either direction costs the consumer a whole book.
+//! leader has been healthy for [`REVERT_HOLD_NS`] and has re-baselined that market itself, or once
+//! it has been healthy for [`REVERT_DEADLINE_NS`]. Computed per admission instead, it followed
+//! whichever alternate spoke last, and every handover in either direction costs the consumer a
+//! whole book.
 //!
 //! # Bounding
 //!
@@ -120,8 +121,8 @@ const MAX_WINDOW_SAMPLES: usize = 4096;
 /// fix: sized above the p99 (7.07 s) and max (13.09 s) unhealth episodes measured on one bridge.
 pub(crate) const REVERT_HOLD_NS: u64 = 15_000_000_000;
 
-/// Unconditional revert once the leader is healthy, so a market whose leader never re-baselines it
-/// is not held on the override for good.
+/// Continuous leader health after which a held market reverts without the leader's re-baseline, so
+/// a market it never re-baselines is not held on the override for good.
 pub(crate) const REVERT_DEADLINE_NS: u64 = 60_000_000_000;
 
 /// Tunables for [`StickyAuthority`], all CLI-settable (`--arb-*`).
@@ -195,7 +196,6 @@ struct RevertHold {
     holder: Transport,
     /// The scope leader the hold was taken from; an election moving it discards the hold.
     leader: Transport,
-    began_ns: u64,
     /// First admission seen with the leader healthy since it last went unhealthy. Stamped lazily,
     /// because health reports carry no time.
     leader_healthy_since_ns: Option<u64>,
@@ -506,7 +506,6 @@ impl StickyAuthority {
             None => Some(RevertHold {
                 holder: publisher,
                 leader,
-                began_ns: now,
                 leader_healthy_since_ns: None,
             }),
             Some(mut h) => {
@@ -520,7 +519,7 @@ impl StickyAuthority {
                             .is_some_and(|m| m.reinstalled.contains(&leader));
                         if reinstalled && now.saturating_sub(since) >= REVERT_HOLD_NS {
                             Some("natural")
-                        } else if now.saturating_sub(h.began_ns) >= REVERT_DEADLINE_NS {
+                        } else if now.saturating_sub(since) >= REVERT_DEADLINE_NS {
                             Some("deadline")
                         } else {
                             None
@@ -537,19 +536,14 @@ impl StickyAuthority {
         }
     }
 
-    /// The healthy non-leader path most recently live anywhere in the scope, other than `exclude`.
-    fn alternate(
-        &self,
-        key: &MarketKey,
-        leader: Transport,
-        exclude: Option<Transport>,
-    ) -> Option<Transport> {
+    /// The healthy non-leader path most recently live anywhere in the scope.
+    fn alternate(&self, key: &MarketKey, leader: Transport) -> Option<Transport> {
         let scope = scope_of(key);
         self.scopes
             .get(&scope)?
             .paths
             .iter()
-            .filter(|(a, _)| **a != leader && Some(**a) != exclude && self.healthy(key, **a))
+            .filter(|(a, _)| **a != leader && self.healthy(key, **a))
             // The ordinal breaks a `last_seen_ns` tie: without it two tying paths are ordered by
             // `HashMap` iteration and two calls on one state could pick differently.
             .max_by_key(|&(&a, path)| (path.last_seen_ns, self.path_label(&scope, a)))
@@ -568,7 +562,7 @@ impl StickyAuthority {
         if self.healthy(key, leader) {
             return Some(leader);
         }
-        Some(self.alternate(key, leader, None).unwrap_or(leader))
+        Some(self.alternate(key, leader).unwrap_or(leader))
     }
 
     /// The path actually serving one market — its scope's leader, or a healthy path overriding it.
@@ -1100,13 +1094,15 @@ mod tests {
         assert_eq!(a.take_hold_release(), Some("natural"));
     }
 
-    /// A leader that never re-baselines the market takes it back at the deadline.
+    /// The deadline runs from the leader's recovery, however long the episode before it lasted.
     #[test]
     fn a_quiet_market_reverts_on_the_deadline() {
         let mut a = on_hold();
+        keep_live(&mut a, &[path(1), path(2)], 2 * SEC, 90 * SEC);
         a.set_health(&key(), path(1), true);
-        let deadline = SEC + REVERT_DEADLINE_NS;
-        keep_live(&mut a, &[path(1), path(2)], 2 * SEC, deadline);
+        assert_eq!(a.admit(key(), path(1), 90 * SEC), Admit::Dropped, "held");
+        let deadline = 90 * SEC + REVERT_DEADLINE_NS;
+        keep_live(&mut a, &[path(1), path(2)], 91 * SEC, deadline);
         assert_eq!(a.admit(key(), path(1), deadline - 1), Admit::Dropped);
         assert!(a.admit(key(), path(1), deadline).emitted());
         assert_eq!(a.take_hold_release(), Some("deadline"));

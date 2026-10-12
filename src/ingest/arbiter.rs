@@ -3447,16 +3447,20 @@ impl Arbiter {
                 {
                     self.books.note_rebaseline_point(&key, publisher);
                 }
+                let leader_before = self.books.scope_leader(&scope);
                 // A hold waiting on a leader that is healthy again must not outlive an incomplete
                 // replay entry: a quiet holder never closes an event, so it never republishes one.
-                if self.books.holding_revert(&key) && self.replay_incomplete(&key) {
+                // Only the leader's batch can take the market back; the holder's may be the republish.
+                if leader_before == Some(publisher)
+                    && self.books.holding_revert(&key)
+                    && self.replay_incomplete(&key)
+                {
                     self.books.drop_hold(&key);
                     count_revert_hold(&b.venue, "incomplete");
                 }
                 let prev = self.books.last_admitted(&key);
                 let overridden_from = self.books.overridden_from(&key);
                 let healthy_here = self.books.healthy(&key, publisher);
-                let leader_before = self.books.scope_leader(&scope);
                 let decision = self.books.admit(key.clone(), publisher, b.recv_ts_ns);
                 if let Some(release) = self.books.take_hold_release() {
                     count_revert_hold(&b.venue, release);
@@ -6073,9 +6077,9 @@ mod tests {
         let (mut a, mut rx, _) = on_hold(venue);
         synced(&mut a, venue, BOOK_INSTRUMENT, path(2), 2 * SEC);
         a.set_book_health(&key, path(1), true);
-        let out = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 3, 61);
+        let out = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 3, 63);
         assert_eq!(rebaselines(&out), 1, "only the holder's own clear");
-        let out = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 61, 62);
+        let out = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 63, 64);
         assert_eq!(rebaselines(&out), 1, "reverted at the deadline");
         assert_eq!(revert_holds(venue, "deadline"), deadline + 1);
     }
@@ -6097,6 +6101,25 @@ mod tests {
         assert!(model::lock(&replay).get(&key).unwrap().baselined());
     }
 
+    /// ...but the holder's own owed republish repairs the entry without handing the market over.
+    #[test]
+    fn a_holders_owed_republish_keeps_the_market() {
+        let venue = "BookHoldHolderRepair";
+        let key = mkey(venue, BOOK_INSTRUMENT);
+        let (mut a, mut rx, replay) = on_hold(venue);
+        overflow(&mut a, venue, path(2), SEC + 1);
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(1), 2 * SEC);
+        a.set_book_health(&key, path(1), true);
+        let _ = drain_books(&mut rx);
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(2), 3 * SEC);
+        assert_eq!(
+            rebaselines(&drain_books(&mut rx)),
+            1,
+            "the republish was published"
+        );
+        assert!(model::lock(&replay).get(&key).unwrap().baselined());
+    }
+
     /// A deadline release onto a leader whose own copy is incomplete degrades to a bare `clear`,
     /// and the leader then owes the republish.
     #[test]
@@ -6105,9 +6128,9 @@ mod tests {
         let key = mkey(venue, BOOK_INSTRUMENT);
         let (mut a, mut rx, _) = on_hold(venue);
         a.set_book_health(&key, path(1), true);
-        let _ = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 2, 60);
-        overflow(&mut a, venue, path(1), 60 * SEC);
-        let out = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 61, 62);
+        let _ = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 2, 61);
+        overflow(&mut a, venue, path(1), 61 * SEC);
+        let out = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 62, 63);
         assert_eq!(out[0].changes, vec![clear_both()], "a bare clear");
         assert!(a.book_rebaselines_owed(path(1), std::slice::from_ref(&key))[0]);
     }
