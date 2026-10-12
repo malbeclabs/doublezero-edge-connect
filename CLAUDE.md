@@ -819,7 +819,7 @@ Modules are grouped by role under `src/`:
   computed (#163): an `InstrumentReset` purges `revealed` in the same message that reports unhealth,
   so the install that readmits the instrument has no venue to file under, and marking that report
   done would leave the path unhealthy at the gate with a `Ready` book — the market then sits on a
-  stale peer while a live path is on the wire. The memo also stores the `SourceKey` it filed under: a
+  stale peer while a live path is on the wire. The memo also stores the Source ID it filed under: a
   report under a different one after a filed `false` first withdraws that unhealth, since an
   `InstrumentReset` purges `revealed` and nothing would ever report on the old market again. `send_book`'s own `Ready` gate is unchanged, so a path mid-rotation keeps the market
   and publishes nothing until the install's re-baseline. ⚠️ **At every event close it asks the arbiter

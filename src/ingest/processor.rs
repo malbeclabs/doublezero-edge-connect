@@ -2257,7 +2257,7 @@ pub struct MbpProcessor {
     /// the authority on transitions only and an unhealthy entry left under a Source ID the book no
     /// longer carries can be withdrawn. Evicted in lockstep with `books`, so its keys are always a
     /// subset of `books`' keys.
-    health_reported: HashMap<PriceBookKey, (SourceKey, bool)>,
+    health_reported: HashMap<PriceBookKey, (u16, bool)>,
     /// Reused buffer for the levels a `BookClear` removed, so the clear path never allocates.
     cleared: Vec<(u8, i64)>,
     /// The wire Source ID revealed for a book key — absent until the FIRST message that carries one
@@ -2637,7 +2637,7 @@ impl MbpProcessor {
     }
 
     fn report_health(&mut self, ctx: &DatagramCtx, key: &PriceBookKey, healthy: bool) {
-        // `self.wire_venue(key)` — not `ctx.venue` — to match the `MarketKey` the arbiter itself
+        // The revealed wire Source ID — not `ctx.venue` — to match the `MarketKey` the arbiter itself
         // builds off the emitted `book`'s own venue field on admission (`b.venue.clone()`): a
         // health report keyed by the feed row's static venue would target a `MarketKey` no book
         // was ever admitted under, once this feed's instruments carry distinct wire Source IDs.
@@ -2652,20 +2652,20 @@ impl MbpProcessor {
         // book is `Ready` — the market then sits on a stale peer with a live path on the wire.
         // Unfiled, it is retried on the next datagram that touches the book, which is the one the
         // reveal rides in on.
-        let Some(venue) = self.wire_venue(key) else {
+        let Some(id) = self.revealed.get(key).copied() else {
             return;
         };
-        let filed = self.health_reported.insert(*key, (venue.clone(), healthy));
-        if filed.as_ref() == Some(&(venue.clone(), healthy)) {
+        if self.health_reported.get(key) == Some(&(id, healthy)) {
             return;
         }
+        let filed = self.health_reported.insert(*key, (id, healthy));
         // `ctx.category` for the same reason: the arbiter keys the market on the emitting row's
         // instrument universe, so a report filed without it targets nothing the gate ever admitted.
         // `ctx.canonical_channel`, not the raw `key.1`, so a mirror path's health report lands on
         // the SAME `MarketKey` `send_book` admits its `book` under — see `DatagramCtx::canonical_channel`.
-        let market = |venue| -> MarketKey {
+        let market = |id| -> MarketKey {
             (
-                venue,
+                SourceKey::from_id(id),
                 category_arc(ctx.category),
                 ctx.canonical_channel(key.1),
                 key.2,
@@ -2674,10 +2674,10 @@ impl MbpProcessor {
         let mut arbiter = lock(ctx.arbiter);
         // Unhealth filed under a Source ID the book has since moved off would otherwise stand for
         // the life of the process: nothing reports on that market again.
-        if let Some((old, false)) = filed.filter(|(old, _)| *old != venue) {
+        if let Some((old, false)) = filed.filter(|(old, _)| *old != id) {
             arbiter.set_book_health(&market(old), Transport::Edge(key.0), true);
         }
-        arbiter.set_book_health(&market(venue), Transport::Edge(key.0), healthy);
+        arbiter.set_book_health(&market(id), Transport::Edge(key.0), healthy);
     }
 
     /// §4.9: discard everything a `Reset Count` change invalidated for one `(publisher, channel)` —
