@@ -67,6 +67,8 @@ fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
             role: port_role(*role),
             publisher: *ip,
             mirror_offset: None,
+            declared_source_id: None,
+            per_channel: false,
         };
         p.on_datagram(datagram, &ctx);
     }
@@ -137,6 +139,8 @@ fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
             },
             publisher: *ip,
             mirror_offset: None,
+            declared_source_id: None,
+            per_channel: false,
         };
         p.on_datagram(datagram, &ctx);
     }

@@ -69,7 +69,15 @@ a `:sha-<commit>` tag for precise pinning.
 The image sets `DZ_FEED_REGISTRY_URL` to the hosted document
 (`https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json`); building/running from
 source instead gets the `clap` default, which is empty — no network call unless you pass
-`--feed-registry-url`/`DZ_FEED_REGISTRY_URL` yourself. Override with a different URL, or with
+`--feed-registry-url`/`DZ_FEED_REGISTRY_URL` yourself.
+
+The hosted document is assembled by `malbeclabs/infra`'s `scripts/feed-registry` from each
+venue's published fragment (listed in its `feeds/manifest.toml`) and republished every 30 minutes,
+with an immutable timestamped copy alongside under `…/feeds/` to pin or roll back to. It is
+validated before it is published, because a document the fleet cannot use is not rejected by the
+fleet: each host warns once and degrades to its own built-in copy, silently, one at a time as
+containers restart. This repo's `src/ingest/registry.json` is that built-in copy, not the source of
+the hosted one. Override with a different URL, or with
 `--feed-registry <path>`/`DZ_FEED_REGISTRY <path>` (a bind-mounted file, in Docker) — note the
 bridge tries the URL first when it's non-empty, so pass an empty `--feed-registry-url ""` alongside
 the file if you've also set a URL. A URL that can't be reached or fails validation falls back to
@@ -83,7 +91,12 @@ generated from `edge-feed-spec/sources/spec.md`, which stays the authority for i
 "sources": [
   { "id": 1, "name": "HYPERLIQUID" },
   { "id": 2, "name": "PHOENIX" },
-  { "id": 3, "name": "KALSHI" }
+  { "id": 3, "name": "KALSHI" },
+  { "id": 4, "name": "SETAI_FINANCIALS" },
+  { "id": 5, "name": "SETAI_COMMODITIES" },
+  { "id": 6, "name": "BINANCE" },
+  { "id": 7, "name": "HYPERLIQUID" },
+  { "id": 8, "name": "BINANCE" }
 ]
 ```
 
@@ -95,10 +108,39 @@ assign is not an error — the wire value is authoritative and gets a distinct s
 `SOURCE_<id>` label. Assigning a venue is therefore a republish of this document rather than a new
 release.
 
-⚠️ **With one ordering constraint.** A binary that predates the block has no `sources` field, so it
-warns about `$.sources` and ignores it — and then validates the rows against its own compiled-in
-table, where the new venue does not resolve. Under a URL origin that rejection degrades the **whole**
-document to the built-in copy, so that host loses every other feed-row change in the same republish,
-not just the new source. Until the fleet is upgraded, a `sources` block may only name sources every
-deployed binary already resolves; assigning a genuinely new venue is a release *and* a republish, in
-that order.
+Where several ids share a name, a feed row may say which one it carries with an optional
+**`source_id`** — Binance's USD-margined row declares `"source_id": 6` and its spot row `8`. It
+never relabels data — the wire value stays authoritative — it only keeps each engine's health, `status`,
+`/v1/status` entry and `dz_feed_up` series apart, so one live engine cannot mask the other's
+outage. It must be an id this document's `sources` block (or, with no block, the compiled-in table)
+assigns to that row's own `venue`; anything else refuses the document. A row without it reports at
+the name level, as every row did before the field existed, and a binary that predates it ignores it.
+
+⚠️ **With one ordering constraint** — and it is not specific to `sources`. A binary that predates
+the block has no `sources` field, so it warns about `$.sources` and ignores it — and then validates
+the rows against its own compiled-in table, where the new venue does not resolve. Under a URL origin
+that rejection degrades the **whole** document to the built-in copy, so that host loses every other
+feed-row change in the same republish, not just the new source.
+
+### Ordering: any change an older deployed binary rejects
+
+A new `sources` assignment is one instance of a wider class, and the class is what the rule is
+about: **a document change that an already-deployed binary rejects at parse or validation degrades
+that host to its built-in copy, whatever the field.** The others the schema allows today:
+
+- a **`version` bump** — the loader's check is an equality test, not a floor, so a binary that
+  understands `1` rejects `2` outright rather than reading what it recognizes;
+- a new **`kind`** or **`arbitration`** value — both are closed enums, so an unknown variant fails
+  the parse of the *whole document*, not of the row that carries it.
+
+So until the fleet is upgraded, a document may only use values every deployed binary already
+accepts; introducing one is a release *and* a republish, in that order.
+
+Since the aggregator republishes on its own schedule, "in that order" means the release has to be out
+and the fleet upgraded **before the change reaches a fragment or the manifest** — that is the
+republish, and there is no later step at which to hold it back.
+
+⚠️ **The aggregator's validation does not cover this class**, and cannot: it checks the document
+against the rules it knows today, not against every binary already deployed. A document that passes
+can still be one the *running* fleet rejects; the ordering above is what makes it load in the builds
+already out there.

@@ -9,6 +9,10 @@ name: release.install-script
 # PREREQUISITE: the deploy role's OIDC trust policy must be extended to also trust
 # this repo (repo:malbeclabs/doublezero-edge-connect:*); until then the
 # configure-aws-credentials step fails. See the design doc / infra runbook.
+#
+# The feed-registry document under the feeds/ keys of the same bucket is published by
+# malbeclabs/infra's feed-registry aggregator — a different artifact with its own publisher,
+# not another key to add here.
 on:
   push:
     branches: [main]

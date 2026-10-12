@@ -7,12 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- A market whose elected book path gapped no longer ping-pongs between the other paths. The health override now holds the market on the first healthy alternate and returns it to the leader only after 15 s of continuous leader health and the leader's own re-baseline of that market, or after 60 s. One lost leader datagram on a three-path venue cost a consumer up to 15 re-baselines in 6 s; it now costs one each way. New counter `dz_book_revert_holds_total{venue,release}`.
-
-### Added
-- Registry rows may declare `shared_batch_id` (default false, one value per venue and category), set on `edge-phoenix-mbp`. In a declared scope, a book failover between paths at the same committed slot holding identical levels goes out as an ordinary delta rather than a re-baseline; a mismatch counts `dz_book_path_divergence_total{venue}` and re-baselines as before.
-
 ### Notes
 - **Open glossary item, deliberately recorded here rather than as an issue: `venue` names a matching
   engine, not a venue.** The glossary is explicit that a Source ID identifies one matching engine and
@@ -47,6 +41,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- A market whose elected book path gapped no longer ping-pongs between the other paths. The health override now holds the market on the first healthy alternate and returns it to the leader only after 15 s of continuous leader health and the leader's own re-baseline of that market, or after 60 s of that health alone. One lost leader datagram on a three-path venue cost a consumer up to 15 re-baselines in 6 s; it now costs one each way. New counter `dz_book_revert_holds_total{venue,release}`.
+- **`:latest` was months older than `:mainnet-beta`, though documented as the same image.** The
+  mainnet-beta build added `:latest` only on a `vX.Y.Z` tag, and none had been cut since June, so a
+  container pinned to `:latest` predated #169 and rejected the hosted feed registry (which repeats a
+  name) for its June built-in copy (#186). It now moves with `:mainnet-beta` on every build: `main`
+  pushes and the dispatch and poll rebuilds included.
+- **The Hyperliquid sink could drop the frame that says why it disconnected a client.** Ending a
+  connection (inbound rate limit, or a client lagging twice) sent the error and a `Close` and dropped
+  the socket at once; with any of the peer's bytes still unread, TCP resets the connection, and the
+  peer discards the frames it had not yet read — the error included. It now waits, up to 2 s, for the
+  peer's `Close` before dropping (`finish_close`). This was also the intermittent failure of the
+  two rate-limit tests (#188): 0 of 12 full runs fail now, against about 1 in 3 before.
+- **Two derived rows of one category lost trades and state under an uneven channel filter.** A
+  top-of-book and a market-by-price row over the same channels (the Kalshi elections pair today,
+  and the events pair once the hosted rows land) share a universe, and two things were keyed on
+  `(venue, category)` that are really per channel:
+  - **Tape ownership.** The top-of-book row owned every channel's tape while running only the
+    channels its filter admitted, or only the ones still alive, so each market-by-price receiver of
+    the rest decoded its prints and dropped them. Ownership is now elected per `(venue, category,
+    channel)` for a derived row (`reconcile::Universe`), and the arbiter's `Sticky` tape gate is
+    keyed at the same grain, so a channel served from another host is not muted by a leader
+    streaming a different one. Shared-block rows keep category-level ownership and a
+    category-level gate (their channel ids name mirrors, which must share a leader), and the registry
+    refuses a category whose tape-claiming rows mix the two shapes (`MixedChannelShape`).
+  - **The channel-filter purge.** Narrowing one row off a channel erased that channel's catalog,
+    book and history while the sibling row's receiver for it kept running — history lost, and idle
+    books gone from new clients' bootstrap. A sibling the filter still admits on that channel now
+    keeps the catalog and history, and a book-building one keeps the book — judged on admission
+    rather than on which receivers run, so an unsubscribed sibling keeps its state exactly as a lone
+    row's subscription loss does. And a purge no longer runs while any receiver for that channel is
+    still draining: it is handed to that entry and reruns once the receiver has stopped, so its
+    final write cannot restore what was removed.
+    A deferred purge reruns under the draining sibling's key, and that sibling, if still admitted,
+    counts as its own sibling — so narrowing one row never purges a sibling that only lost its
+    subscription, including when that subscription returns before the drain completes.
+- **The Hyperliquid public backstop emitted under a category no row carries.** `ws_input`'s
+  `HL_CATEGORY` was still `perps` after the hosted feed registry renamed Hyperliquid's native
+  universe to `hl-perps`, so with `--ws-input-coins` set the backstop's quotes and trades were keyed
+  as a universe of their own — harmless while Hyperliquid arbitrates `Coordinated`, and a duplicate
+  tape the day it turns `Sticky`. The category is now read off the catalog entry the coin resolves
+  to rather than a constant, since the native perps and the `xyz:` builder DEX (`xyz-perps`) both arrive as Source ID 1 on the one
+  public socket: an `xyz:` coin in `--ws-input-coins` had its trades filed under the native universe,
+  where history dropped them as unattributable or credited them to a market sharing the identity.
+- **This repo no longer publishes the hosted feed registry.** #161 published `src/ingest/registry.json`
+  to `feeds/doublezero-edge-feeds-latest.json` on every change to it on `main` — the same key
+  `malbeclabs/infra`'s feed-registry aggregator republishes every 30 minutes from the venues' own
+  fragments. The two overwrote each other, and the copy here was the older one (`tiredsolid` where the
+  ledger now carries `edge-hyper-hl-*`, no `xyz-perps`): merging the Binance rows replaced the live
+  document with it at 20:35 UTC on 2026-10-01, until the aggregator was run by hand at 20:39.
+  `release.feed-registry.yml` is removed (and #161's own entry with it, never released) and the docs
+  name the aggregator as the only publisher; `registry.json` stays the copy compiled into the image
+  as a fallback.
 - `MidpointProcessor` held one `SeqTracker` for every publisher, where `TobProcessor` and
   `MbpProcessor` key theirs per publisher. Datagram sequence is scoped to `(source_ip, group, port)`,
   so under a shared port block two mirrored publishers' independent sequence spaces interleaved onto
@@ -304,6 +350,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A market-by-price `InstrumentReset` discarded its own recovery snapshot group.** A publisher withholding and then re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin` follows its own reset by ~0.1 ms on a different port — resets ride mktdata, snapshot groups the snapshot port, on independent sequence series — so which is processed first is a coin flip. When the begin won, both the book's assembly and the processor's level route were torn out, the market waited a full snapshot rotation to heal, and the group's levels were counted on `dz_mbp_snapshot_levels_dropped_total{reason="reset"}`. A group anchored at or after the reset's `New Anchor Seq` is now kept — the same test a `SnapshotBegin` is already judged by — and only one that predates the reset is dropped and tombstoned. Observed on a live Phoenix feed at roughly two flaps per hour per market; expect that `reason="reset"` series to fall substantially.
 
 ### Changed
+- **A feed-registry row that shares its venue name with other Source IDs but declares no `source_id`
+  is reported at load** (`info`, once per `(venue, category)`): its engines' health and status are
+  reported together under the name. The hosted Hyperliquid rows are such rows today. Refusing them is
+  the follow-up in #187, once the publishers stamp one id per engine.
+- **The compiled-in feed registry is brought into line with the hosted document.** It had fallen
+  behind what `malbeclabs/infra`'s aggregator publishes, and a host whose fetch fails runs it:
+  Hyperliquid was one `tiredsolid` group of eleven port blocks where the ledger now carries two
+  universes on four groups (`edge-hyper-hl-tob`/`-mbo` as `hl-perps`, `edge-hyper-xyz-tob`/`-mbo`
+  as `xyz-perps`, one shared block of three publishers each), and Kalshi's `events` universe had no
+  top-of-book row (`edge-kalshi-sports-tob`). The non-Binance rows are now copied from the hosted
+  document verbatim, notes included; the Binance rows and the full `sources` table stay, since they
+  reach the hosted document separately. The end-to-end tests now run the binary against their own
+  `tests/fixtures/e2e-registry.json`, so they no longer move when the production document does.
+- **Health, `status` and metrics are kept per Source ID where several IDs share one name.** Two
+  engines under one registry name — Binance's USD-margined perps (ID 6) and spot (ID 8), both
+  `BINANCE` — collapsed everywhere the bridge keyed on the name: one live engine masked the other's
+  outage in `status`, `dz_feed_up` and `/v1/status`, and the two receivers (same venue, kind and
+  base port) overwrote each other's per-receiver series. A feed-registry row may now declare its
+  `source_id` (optional; validated against the resolving `sources` table under the row's own
+  `venue`, so a mismatch refuses the document). A row that declares one aggregates its health under
+  `(venue, source_id)`, emits the wire `status` for that ID alone, and gets its own `/v1/status`
+  entry carrying `source_id`, which `doublezero-edge status`/`diagnose` render as `VENUE (source N)`;
+  a product's `status` reads its own engine — offline while that engine's declaring row is not
+  running, never borrowed from an undeclared row sharing the name. Rows sharing a
+  `(venue, category)` must declare the same `source_id` (`SourceIdDisagreement`): that pair is one
+  universe to tape ownership, so two engines there would let one row mute the other's trades.
+  A row whose traffic stamps a Source ID other than the one it declares is counted on
+  `dz_source_id_mismatch_total{venue,category}` and warned about once per wire ID, since nothing
+  else would notice: its health and status would silently be filed under the wrong engine. A row that declares none behaves
+  exactly as before, except that it no longer emits `status` for an ID another row declares.
+  Metric labels: `category` on `dz_datagrams_received_total`, `dz_datagram_bytes_total`,
+  `dz_socket_errors_total`, `dz_idle_rejoin_total`, `dz_receiver_up` and `dz_seq_events_total`;
+  `source_id` on `dz_emit_total`, `dz_feed_up` and `dz_feed_stale_ms` (see `docs/metrics.md`).
+  Declaring `source_id` is not yet required for a shared name: the hosted document's rows are
+  copied from publisher fragments that do not carry it yet (malbeclabs/infra#2841,
+  malbeclabs/infra#2846), and requiring it is the follow-up once they do.
 - A `sources` block may give several Source IDs one name. Each ID keeps its own state and
   `status`; product ids use the shared name. A `status` carries its feed's health, so IDs on one
   feed go down together. Consumers must key on `source_id`, not the name (see PROTOCOL.md).
@@ -420,6 +502,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- Registry rows may declare `shared_batch_id` (default false, one value per venue and category), set on `edge-phoenix-mbp`. In a declared scope, a book failover between paths at the same committed slot holding identical levels goes out as an ordinary delta rather than a re-baseline; a mismatch counts `dz_book_path_divergence_total{venue}` and re-baselines as before.
+- **Binance feeds: USD-margined perpetuals and spot, Top-of-Book.** Two rows in the compiled-in
+  feed registry, `edge-binance-usdsm-tob` (group `233.84.178.23`, Source ID 6) and
+  `edge-binance-spot-tob` (`233.84.178.31`, Source ID 8), both `BINANCE`, both on ports
+  `30001`/`30002`, both `Sticky` and claiming the tape; each declares its `source_id`, so the two
+  engines keep separate health, `status` and `/v1/status` entries — under the built-in document only:
+  the hosted document's rows do not declare it yet, and report both engines under one name-level
+  `BINANCE` key. A consumer follows one engine with the `source_id` subscription filter (#175).
+  Source IDs 6 and 8 join both the
+  document's `sources` block and the compiled-in fallback table, which a failed `Url` fetch degrades
+  to. Both now carry every ID `edge-feed-spec/sources/spec.md` assigns, adding the three they were
+  missing: 4 (`SETAI_FINANCIALS`), 5 (`SETAI_COMMODITIES`) and 7 (`HYPERLIQUID`, the XYZ builder
+  DEX). Without them a document with no `sources` block refused a valid row declaring one, and ID
+  7's traffic was labelled `SOURCE_7` instead of `HYPERLIQUID`. A host activates a row only while subscribed to its code, so nothing changes on a host
+  subscribed to neither. Quotes only until the publisher sends `Trade`. The ports come from the
+  publisher's deployment inventory and the rows say they are unconfirmed until a capture checks them.
+- **`source_id` subscription filter dimension.** Several Source IDs may share one name — Binance's
+  USD-margined perpetuals (6) and spot (8) are both `BINANCE` and both list `BTCUSDT` — and a
+  `{"venue":"BINANCE","symbol":"BTCUSDT"}` subscriber receives both engines interleaved. A
+  subscription may now carry `"source_id": N` to follow one engine. It runs through the same single
+  `SubFilter::matches` on the live and replay paths, applies to every kind including `status`
+  (which carries its own `source_id`), and is additive: no protocol version change. PROTOCOL.md
+  documents it, with Binance as the worked example. A `book`/`order_book` frame is matched on its
+  replay key's id, the one its bootstrap is matched on, so an ID past the unregistered-source cap
+  (collapsed to `0` there) can never receive incremental batches for a book it was not bootstrapped
+  with. `status` is stamped per ID; its liveness is per engine only where the feed registry
+  declares each engine's Source ID on its row, and per name otherwise.
 - A market withheld from the WebSocket bootstrap is now visible. `/v1/products` rows carry
   `book_complete` (`false`: no new subscriber gets this market's book), and
   `dz_book_bootstrap_lost_total` / `dz_book_bootstrap_withheld` are labelled by `venue`, `category`,

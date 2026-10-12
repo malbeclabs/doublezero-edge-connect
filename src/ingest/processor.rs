@@ -76,7 +76,7 @@ impl WarnRateLimit {
     }
 }
 
-/// Pre-resolved `dz_seq_events_total{venue, kind}` children (one per [`SeqCheck`] outcome) for a
+/// Pre-resolved `dz_seq_events_total{venue, category, kind}` children (one per [`SeqCheck`] outcome) for a
 /// single feed, so the per-datagram hot path increments a cached counter instead of doing a label-map
 /// lookup. The processor doesn't know its venue until the first datagram (`ctx.venue`, fixed for the
 /// feed's lifetime), so the children are bound lazily on first use.
@@ -96,15 +96,13 @@ impl SeqEvents {
         }
     }
 
-    fn record(&mut self, venue: &str, check: &SeqCheck) {
+    /// `category` rides along because two rows can share a venue (two engines under one Source ID
+    /// name), and their sequence classifications must not merge into one series.
+    fn record(&mut self, venue: &str, category: &str, check: &SeqCheck) {
         let children = self.children.get_or_insert_with(|| {
             let m = metrics();
-            [
-                m.seq_events.with_label_values(&[venue, "first"]),
-                m.seq_events.with_label_values(&[venue, "ok"]),
-                m.seq_events.with_label_values(&[venue, "reset"]),
-                m.seq_events.with_label_values(&[venue, "stale"]),
-            ]
+            let child = |k| m.seq_events.with_label_values(&[venue, category, k]);
+            [child("first"), child("ok"), child("reset"), child("stale")]
         });
         children[Self::index(check)].inc();
     }
@@ -484,7 +482,7 @@ impl DatagramProcessor for TobProcessor {
                 header.reset_count,
                 header.sequence,
             );
-            self.seq_events.record(ctx.venue, &check);
+            self.seq_events.record(ctx.venue, ctx.category, &check);
             match check {
                 SeqCheck::Stale => {
                     debug!(
@@ -830,7 +828,7 @@ impl DatagramProcessor for MidpointProcessor {
                 header.reset_count,
                 header.sequence,
             );
-            self.seq_events.record(ctx.venue, &check);
+            self.seq_events.record(ctx.venue, ctx.category, &check);
             !matches!(check, SeqCheck::Stale)
         } else {
             true
@@ -2964,7 +2962,7 @@ impl DatagramProcessor for MbpProcessor {
             let check = self
                 .seq
                 .check(ctx.publisher, channel, header.reset_count, header.sequence);
-            self.seq_events.record(ctx.venue, &check);
+            self.seq_events.record(ctx.venue, ctx.category, &check);
             let fresh = !matches!(check, SeqCheck::Stale);
             if !fresh {
                 debug!(
@@ -4166,6 +4164,8 @@ mod tests {
             role,
             publisher: TEST_PUB,
             mirror_offset: None,
+            declared_source_id: None,
+            per_channel: false,
         }
     }
 
@@ -4285,12 +4285,14 @@ mod tests {
     /// venue's precision-before-price guarantee breaks for whichever id shows up second: no
     /// `Instrument` for it anywhere (not the wire, not `InstrumentSnapshot`, not the WS replay map).
     ///
-    /// `#[serial]` because the exact-count assertion reads a process-global Prometheus child
-    /// (`dz_source_id_changed_total{venue="PHOENIX"}`) that every other 1 -> 2 change in this binary
-    /// also increments — see `metrics::metrics`'s test-isolation note. A relative baseline is not
-    /// enough on its own when a sibling can increment between the read and the assert.
+    /// The change is to an **unassigned** Source ID no other test uses, so the exact-count assertion
+    /// reads a Prometheus child (`dz_source_id_changed_total{venue="SOURCE_<id>"}`) that nothing else
+    /// in this binary increments. The registry is process-global (see `metrics::metrics`'s
+    /// test-isolation note), and a change to `PHOENIX` raced every other processor test that reveals
+    /// a PHOENIX instrument (#136): `#[serial]` cannot fix that, since it orders only the tests marked
+    /// with it. An unassigned id still exercises the whole path, because the wire id is authoritative
+    /// and gets a synthesized label rather than being dropped.
     #[test]
-    #[serial_test::serial]
     fn tob_source_id_change_reannounces_and_is_counted() {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = TobProcessor::new(tape(false));
@@ -4318,12 +4320,15 @@ mod tests {
         }
         assert_eq!(seen, vec![(1, "HYPERLIQUID".to_string())], "first reveal");
 
+        // Unique to this test; its label is synthesized, so it names no registry row.
+        const CHANGED_ID: u16 = 61_336;
+        let label = crate::ingest::sources::source_label(CHANGED_ID);
         let before = metrics()
             .source_id_changed
-            .with_label_values(&["PHOENIX"])
+            .with_label_values(&[label])
             .get();
         proc.on_datagram(
-            &tob_datagram(2, &[enc_tob_quote(41, 2, 2_000)]),
+            &tob_datagram(2, &[enc_tob_quote(41, CHANGED_ID, 2_000)]),
             &ctx(PortRole::Mktdata),
         );
         let mut seen = Vec::new();
@@ -4334,13 +4339,13 @@ mod tests {
         }
         assert_eq!(
             seen,
-            vec![(2, "PHOENIX".to_string())],
+            vec![(CHANGED_ID, label.to_string())],
             "a changed id is re-announced under the new venue"
         );
         assert_eq!(
             metrics()
                 .source_id_changed
-                .with_label_values(&["PHOENIX"])
+                .with_label_values(&[label])
                 .get(),
             before + 1,
             "the change is counted, labelled by the NEW venue"
@@ -7998,7 +8003,9 @@ mod tests {
     fn mbp_an_era_change_forgets_the_sequence_anchor() {
         let venue = "MbpSeqPurge";
         let (arbiter, _rx, instruments) = mbp_harness();
-        let stale = metrics().seq_events.with_label_values(&[venue, "stale"]);
+        let stale = metrics()
+            .seq_events
+            .with_label_values(&[venue, "testcategory", "stale"]);
         let before = stale.get();
         let ctx = |role| mbp_ctx(venue, &arbiter, &instruments, role);
         let mut proc = MbpProcessor::new(tape(false));
@@ -8331,7 +8338,9 @@ mod tests {
     fn mbp_a_reordered_datagram_cannot_move_the_slot_or_close_an_event() {
         let venue = "MbpStaleDatagram";
         let (arbiter, mut rx, instruments) = mbp_harness();
-        let stale = metrics().seq_events.with_label_values(&[venue, "stale"]);
+        let stale = metrics()
+            .seq_events
+            .with_label_values(&[venue, "testcategory", "stale"]);
         let before = stale.get();
         let ctx = |role| mbp_ctx(venue, &arbiter, &instruments, role);
         let boundary = |batch_id: u32, batch_time: u64| {

@@ -144,8 +144,11 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Base ${{ steps.cfg.outputs.base }} -> $digest"
 
-      # Tag list: always moving + sha-<short>. On a release (version set) add the
-      # pinned tag, and :latest for the variant that owns it. devnet uses a bare
+      # Tag list: always moving + sha-<short>, plus :latest for the variant that
+      # owns it — on every build, not only a release, because :latest is
+      # documented as the same image as :mainnet-beta. Moved only on a release, it
+      # sat on a June build that rejects the hosted feed registry (#186). On a
+      # release (version set) add the pinned tag too. devnet uses a bare
       # :<version> (its moving tag is already :latest).
       - name: Compute tags
         id: tags
@@ -156,6 +159,9 @@ jobs:
           sha='${{ steps.sha.outputs.sha }}'
           short="${sha:0:12}"
           tags="${image}:${moving}"$'\n'"${image}:sha-${short}"
+          if [ '${{ steps.cfg.outputs.latest }}' = 'true' ]; then
+            tags="${tags}"$'\n'"${image}:latest"
+          fi
           ver='${{ inputs.version }}'
           if [ -n "$ver" ]; then
             safe="$(printf '%s' "$ver" | tr '~:' '--')"
@@ -163,9 +169,6 @@ jobs:
               tags="${tags}"$'\n'"${image}:${safe}"
             else
               tags="${tags}"$'\n'"${image}:${moving}-${safe}"
-              if [ '${{ steps.cfg.outputs.latest }}' = 'true' ]; then
-                tags="${tags}"$'\n'"${image}:latest"
-              fi
             fi
           fi
           {
