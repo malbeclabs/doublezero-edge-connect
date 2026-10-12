@@ -179,6 +179,21 @@ pub struct StatusResponse {
 pub struct VenueStatus {
     pub venue: String,
     pub status: String,
+    /// Present when the entry is one engine of a name several Source IDs share (the bridge lists
+    /// one entry per engine then); absent for a name-level entry and from an older bridge.
+    #[serde(default)]
+    pub source_id: Option<u16>,
+}
+
+impl VenueStatus {
+    /// The `VENUE` cell: the name, plus the Source ID when the entry carries one, so two engines
+    /// sharing a name do not render as two identical rows.
+    pub fn label(&self) -> String {
+        match self.source_id {
+            Some(id) => format!("{} (source {id})", self.venue),
+            None => self.venue.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

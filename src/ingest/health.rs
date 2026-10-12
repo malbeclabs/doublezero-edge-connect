@@ -3,7 +3,13 @@
 //! One venue is served by N receivers - one per publisher per protocol (see `ingest::feeds`). The
 //! wire `status` message and `dz_feed_up` are **venue**-level, so neither may flip just because a
 //! single publisher wedged: a venue is down only when EVERY registered quote-bearing receiver for
-//! it is down. Per-publisher detail lives in `dz_receiver_up{venue,kind,publisher}` instead.
+//! it is down. Per-publisher detail lives in `dz_receiver_up{venue,category,kind,publisher}`
+//! instead.
+//!
+//! "Venue" here is a [`StatusKey`], not the bare registry name: several Source IDs may share one
+//! name (two matching engines of one exchange), and PROTOCOL.md promises each its own `status`. A
+//! row that declares its `source_id` aggregates under that ID alone, so one live engine cannot mask
+//! the other's outage; a row that declares none keeps the name-level `(venue, None)` key.
 //!
 //! Two rules make the aggregate honest:
 //!
@@ -21,7 +27,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::ingest::feeds::FeedKind;
+use crate::ingest::feeds::{Feed, FeedKind};
 
 /// Identity of one receiver: `(venue, category, kind, base port)`. **The same tuple** as
 /// `reconcile::FeedKey`, which is what lets the reconciler pass its own keys to [`FeedHealth::liveness`]
@@ -29,6 +35,12 @@ use crate::ingest::feeds::FeedKind;
 /// carry disjoint instrument universes, and two rows of the same kind under one venue would otherwise
 /// share a liveness entry and report each other's health.
 pub type ReceiverKey = (&'static str, &'static str, FeedKind, u16);
+
+/// What the venue-level aggregate is keyed on: the row's `venue` plus its declared Source ID
+/// (`Feed::source_id`), or `None` for a row that declares none. Deliberately **not** part of
+/// [`ReceiverKey`], which has to stay the reconciler's `FeedKey`; each receiver states its status
+/// key once, at [`FeedHealth::register`].
+pub type StatusKey = (&'static str, Option<u16>);
 
 /// A receiver's liveness for the purpose of tape ownership, **ordered best first**: the derived
 /// `Ord` is what `reconcile::tape_owners` sorts on ahead of feed-kind rank, so the variant order
@@ -74,36 +86,47 @@ struct State {
     /// Registered receivers -> whether each is currently up. A receiver absent from this map is
     /// not running and does not count toward its venue's aggregate.
     up: HashMap<ReceiverKey, bool>,
-    /// Venues that have had a quote-bearing receiver registered at some point in this process's
-    /// life. **Sticky on purpose**: carriers leave `up` when their task stops (abort, exit, bind
-    /// error), and without this a venue whose every quote receiver had exited would fall back to
-    /// its depth-only receivers and publish `status: ok` with zero quotes flowing - the masking
-    /// this module's contract forbids. Never removed, so bounded by the venue count.
-    carrier_venues: HashSet<&'static str>,
+    /// Each receiver's [`StatusKey`], recorded at [`FeedHealth::register`]. Never removed: a
+    /// receiver's row does not change under it, and the map is bounded by the registry.
+    status_of: HashMap<ReceiverKey, StatusKey>,
+    /// Status keys that have had a quote-bearing receiver registered at some point in this
+    /// process's life. **Sticky on purpose**: carriers leave `up` when their task stops (abort,
+    /// exit, bind error), and without this a venue whose every quote receiver had exited would fall
+    /// back to its depth-only receivers and publish `status: ok` with zero quotes flowing - the
+    /// masking this module's contract forbids. Never removed, so bounded by the registry.
+    carrier_keys: HashSet<StatusKey>,
+}
+
+impl State {
+    /// `key`'s status key, falling back to the name level for a receiver never registered (only
+    /// [`FeedHealth::set`] on an unregistered key reaches that, which production never does).
+    fn status_key(&self, key: &ReceiverKey) -> StatusKey {
+        self.status_of.get(key).copied().unwrap_or((key.0, None))
+    }
 }
 
 /// Handle cloned into each receiver task and held by the reconciler.
 pub type SharedFeedHealth = Arc<FeedHealth>;
 
-/// Whether any registered **quote-bearing** receiver for `venue` is up, falling back to any
-/// registered receiver when this process has never run a quote-bearing one for the venue (a
-/// depth-only venue, or an MBO-only `--publisher-port` selection, would otherwise read permanently
-/// down and fire the headline alert forever).
+/// Whether any registered **quote-bearing** receiver under `status` is up, falling back to any
+/// registered receiver when this process has never run a quote-bearing one for it (a depth-only
+/// venue, or an MBO-only `--publisher-port` selection, would otherwise read permanently down and
+/// fire the headline alert forever).
 ///
-/// The fallback is gated on `carrier_venues`, not on what is in `up` right now: a carrier that
+/// The fallback is gated on `carrier_keys`, not on what is in `up` right now: a carrier that
 /// *stopped* must keep the venue honest rather than hand the aggregate to a depth-only peer.
-fn venue_up_in(state: &State, venue: &str) -> bool {
+fn status_up_in(state: &State, status: StatusKey) -> bool {
     let (mut carrier_up, mut any_up) = (false, false);
-    for ((v, _, kind, _), up) in state.up.iter() {
-        if *v != venue {
+    for (key, up) in state.up.iter() {
+        if state.status_key(key) != status {
             continue;
         }
         any_up |= *up;
-        if carries_venue_status(*kind) {
+        if carries_venue_status(key.2) {
             carrier_up |= *up;
         }
     }
-    if state.carrier_venues.contains(venue) {
+    if state.carrier_keys.contains(&status) {
         carrier_up
     } else {
         any_up
@@ -123,14 +146,20 @@ impl FeedHealth {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Apply `mutate` to the map and invoke `on_edge(venue_up)` — still holding the lock — iff the
-    /// venue aggregate flipped. The single place the edge is decided, so publication can never be
-    /// reordered against the transition that caused it.
-    fn with_edge(&self, venue: &str, mutate: impl FnOnce(&mut State), on_edge: impl FnOnce(bool)) {
+    /// Apply `mutate` to the map and invoke `on_edge(up)` — still holding the lock — iff the
+    /// aggregate for `key`'s status key flipped. The single place the edge is decided, so
+    /// publication can never be reordered against the transition that caused it.
+    fn with_edge(
+        &self,
+        key: &ReceiverKey,
+        mutate: impl FnOnce(&mut State),
+        on_edge: impl FnOnce(bool),
+    ) {
         let mut state = self.lock();
-        let was = venue_up_in(&state, venue);
+        let status = state.status_key(key);
+        let was = status_up_in(&state, status);
         mutate(&mut state);
-        let now = venue_up_in(&state, venue);
+        let now = status_up_in(&state, status);
         if was != now {
             on_edge(now);
         }
@@ -140,13 +169,19 @@ impl FeedHealth {
     /// receiver respawned into a down venue). Called once at receiver setup. `true` rather than
     /// "unknown" keeps the pre-existing healthy-until-proven-silent semantics: the idle watchdog
     /// takes the venue down within `IDLE_REJOIN` if no data actually arrives.
-    pub fn register(&self, key: ReceiverKey, on_edge: impl FnOnce(bool)) {
+    ///
+    /// `source_id` is the receiver's row's declared Source ID (`Feed::source_id`), which picks the
+    /// [`StatusKey`] this receiver aggregates under for the rest of its life.
+    pub fn register(&self, key: ReceiverKey, source_id: Option<u16>, on_edge: impl FnOnce(bool)) {
+        let status = (key.0, source_id);
+        // Recorded before `with_edge` reads it, so the edge is decided under the key it belongs to.
+        self.lock().status_of.insert(key, status);
         self.with_edge(
-            key.0,
+            &key,
             |s| {
                 s.up.insert(key, true);
                 if carries_venue_status(key.2) {
-                    s.carrier_venues.insert(key.0);
+                    s.carrier_keys.insert(status);
                 }
             },
             on_edge,
@@ -158,7 +193,7 @@ impl FeedHealth {
     /// would pin its venue down forever.
     pub fn deregister(&self, key: ReceiverKey, on_edge: impl FnOnce(bool)) {
         self.with_edge(
-            key.0,
+            &key,
             |s| {
                 s.up.remove(&key);
             },
@@ -166,10 +201,28 @@ impl FeedHealth {
         );
     }
 
-    /// Whether any registered quote-bearing receiver for `venue` is up. A venue with no registered
-    /// receivers is not up (nothing is serving it).
-    pub fn venue_up(&self, venue: &str) -> bool {
-        venue_up_in(&self.lock(), venue)
+    /// Whether any registered quote-bearing receiver under `status` is up. A key with no
+    /// registered receivers is not up (nothing is serving it).
+    pub fn status_up(&self, status: StatusKey) -> bool {
+        status_up_in(&self.lock(), status)
+    }
+
+    /// The health of the engine behind wire Source ID `source_id`, named `venue`: its own
+    /// [`StatusKey`] when a row in `rows` declares that ID, else the name-level `(venue, None)`
+    /// aggregate every undeclared row reports under. What a per-product `status` reads, since a
+    /// product carries its own Source ID.
+    ///
+    /// Decided from the **registry**, never from which receivers happen to be registered: an
+    /// engine whose declaring row is not running (unsubscribed, never bound, filtered out) must
+    /// read offline rather than borrow the health of an undeclared row sharing its name.
+    pub fn source_up(&self, rows: &[Feed], venue: &str, source_id: u16) -> bool {
+        let Some(row) = rows.iter().find(|f| f.venue == venue) else {
+            return false; // no row carries this name: nothing registers under it
+        };
+        let declared = rows
+            .iter()
+            .any(|f| f.venue == venue && f.source_id == Some(source_id));
+        self.status_up((row.venue, declared.then_some(source_id)))
     }
 
     /// This receiver's liveness as the reconciler's tape ownership orders it — a **three**-state
@@ -194,7 +247,7 @@ impl FeedHealth {
     /// `status` transition fires per venue change rather than one per receiver.
     pub fn set(&self, key: ReceiverKey, up: bool, on_edge: impl FnOnce(bool)) {
         self.with_edge(
-            key.0,
+            &key,
             |s| {
                 s.up.insert(key, up);
             },
@@ -225,7 +278,7 @@ mod tests {
     }
     fn register(h: &FeedHealth, k: ReceiverKey) -> Option<bool> {
         let edge = Cell::new(None);
-        h.register(k, |v| edge.set(Some(v)));
+        h.register(k, None, |v| edge.set(Some(v)));
         edge.get()
     }
     fn deregister(h: &FeedHealth, k: ReceiverKey) -> Option<bool> {
@@ -237,9 +290,9 @@ mod tests {
     #[test]
     fn first_registration_makes_the_venue_up() {
         let h = FeedHealth::new();
-        assert!(!h.venue_up(V), "unknown venue is not up");
+        assert!(!h.status_up((V, None)), "unknown venue is not up");
         assert_eq!(register(&h, key(9101)), Some(true), "venue edge to up");
-        assert!(h.venue_up(V));
+        assert!(h.status_up((V, None)));
         assert_eq!(register(&h, key(9201)), None, "already up: no second edge");
     }
 
@@ -254,13 +307,13 @@ mod tests {
             None,
             "no venue edge: 9201 still up"
         );
-        assert!(h.venue_up(V));
+        assert!(h.status_up((V, None)));
         assert_eq!(
             set(&h, key(9201), false),
             Some(false),
             "last publisher down -> venue edge to down"
         );
-        assert!(!h.venue_up(V));
+        assert!(!h.status_up((V, None)));
     }
 
     #[test]
@@ -294,7 +347,7 @@ mod tests {
         let h = FeedHealth::new();
         register(&h, key(9101));
         set(&h, key(9101), false);
-        assert!(!h.venue_up(V));
+        assert!(!h.status_up((V, None)));
         assert_eq!(
             register(&h, key(9201)),
             Some(true),
@@ -312,11 +365,11 @@ mod tests {
         register(&h, key(9201));
         set(&h, key(9101), false);
         assert_eq!(deregister(&h, key(9101)), None, "9201 still up: no edge");
-        assert!(h.venue_up(V), "only the live, up receiver counts");
+        assert!(h.status_up((V, None)), "only the live, up receiver counts");
         assert_eq!(set(&h, key(9201), false), Some(false));
         // Deregistering the last receiver leaves no receivers: the venue is not "up".
         assert_eq!(deregister(&h, key(9201)), None, "already down: no edge");
-        assert!(!h.venue_up(V));
+        assert!(!h.status_up((V, None)));
     }
 
     #[test]
@@ -324,7 +377,7 @@ mod tests {
         let h = FeedHealth::new();
         register(&h, key(9101));
         assert_eq!(deregister(&h, key(9101)), Some(false));
-        assert!(!h.venue_up(V));
+        assert!(!h.status_up((V, None)));
     }
 
     /// Venues are independent aggregates.
@@ -334,7 +387,7 @@ mod tests {
         register(&h, key(9101));
         register(&h, ("Other", C, FeedKind::TopOfBook, 9101));
         assert_eq!(set(&h, key(9101), false), Some(false));
-        assert!(h.venue_up("Other"), "other venue unaffected");
+        assert!(h.status_up(("Other", None)), "other venue unaffected");
     }
 
     /// A depth-only (MBO) receiver is not a quote-bearing carrier: it must neither take the venue
@@ -352,7 +405,7 @@ mod tests {
 
         // A wedged MBO mirror is not a venue outage while TOB streams.
         assert_eq!(set(&h, mbo, false), None);
-        assert!(h.venue_up(V));
+        assert!(h.status_up((V, None)));
 
         // ...and a live MBO must not mask the quote feed going fully silent.
         set(&h, mbo, true);
@@ -361,7 +414,7 @@ mod tests {
             Some(false),
             "all quote publishers down -> venue down even though MBO is up"
         );
-        assert!(!h.venue_up(V));
+        assert!(!h.status_up((V, None)));
     }
 
     /// A **stopped** quote carrier must not hand the venue aggregate to a depth-only peer. All the
@@ -382,7 +435,7 @@ mod tests {
             "the carrier exiting is not a recovery"
         );
         assert!(
-            !h.venue_up(V),
+            !h.status_up((V, None)),
             "depth-only receivers left: venue stays down"
         );
     }
@@ -394,7 +447,100 @@ mod tests {
         let h = FeedHealth::new();
         let mbo = ("DepthOnly", C, FeedKind::MarketByOrder, 10101);
         assert_eq!(register(&h, mbo), Some(true));
-        assert!(h.venue_up("DepthOnly"));
+        assert!(h.status_up(("DepthOnly", None)));
         assert_eq!(set(&h, mbo, false), Some(false));
+    }
+
+    /// Two engines under one registry name, each row declaring its own Source ID — the Binance
+    /// shape. Same venue, same kind, same base port; only the category tells the receivers apart.
+    fn engine(category: &'static str) -> ReceiverKey {
+        ("TwoEngines", category, FeedKind::TopOfBook, 30001)
+    }
+    fn register_as(h: &FeedHealth, k: ReceiverKey, id: Option<u16>) -> Option<bool> {
+        let edge = Cell::new(None);
+        h.register(k, id, |v| edge.set(Some(v)));
+        edge.get()
+    }
+    /// A registry row for `source_up`, which decides the status key from the rows.
+    fn row(venue: &'static str, category: &'static str, source_id: Option<u16>) -> Feed {
+        Feed {
+            venue,
+            category,
+            code: "c",
+            kind: FeedKind::TopOfBook,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 23),
+            publishers: &[],
+            emit_trades: true,
+            arbitration: crate::ingest::feeds::ArbitrationMode::Sticky,
+            mirror_offset: None,
+            source_id,
+        }
+    }
+
+    /// The point of the status key: one live engine must not mask the other's outage.
+    #[test]
+    fn engines_sharing_a_name_keep_their_own_status() {
+        let h = FeedHealth::new();
+        let (perp, spot) = (engine("usdsm"), engine("spot"));
+        assert_eq!(register_as(&h, perp, Some(6)), Some(true));
+        assert_eq!(
+            register_as(&h, spot, Some(8)),
+            Some(true),
+            "each engine raises its own key"
+        );
+
+        assert_eq!(set(&h, spot, false), Some(false), "spot's own edge fires");
+        assert!(!h.status_up(("TwoEngines", Some(8))));
+        assert!(h.status_up(("TwoEngines", Some(6))), "perp unaffected");
+
+        let rows = [
+            row("TwoEngines", "usdsm", Some(6)),
+            row("TwoEngines", "spot", Some(8)),
+        ];
+        assert!(!h.source_up(&rows, "TwoEngines", 8));
+        assert!(h.source_up(&rows, "TwoEngines", 6));
+    }
+
+    /// An engine whose declaring row is not running must read offline, never borrow the health of
+    /// an undeclared row that shares its name and is streaming.
+    #[test]
+    fn a_declared_engine_not_running_does_not_borrow_the_name_level_health() {
+        let h = FeedHealth::new();
+        let rows = [row("Mixed", "usdsm", Some(6)), row("Mixed", "other", None)];
+        register_as(&h, ("Mixed", "other", FeedKind::TopOfBook, 9001), None);
+        assert!(
+            h.source_up(&rows, "Mixed", 7),
+            "an undeclared ID reads the name level"
+        );
+        assert!(
+            !h.source_up(&rows, "Mixed", 6),
+            "ID 6's row declares it and has no receiver registered"
+        );
+    }
+
+    /// A row that declares no ID keeps the name-level key, and a product whose ID no row declares
+    /// reads that aggregate — today's behaviour for every existing row.
+    #[test]
+    fn an_undeclared_row_reports_at_the_name_level() {
+        let h = FeedHealth::new();
+        let k = ("NameLevel", C, FeedKind::TopOfBook, 9001);
+        assert_eq!(register_as(&h, k, None), Some(true));
+        assert!(h.status_up(("NameLevel", None)));
+        let rows = [row("NameLevel", C, None)];
+        assert!(h.source_up(&rows, "NameLevel", 1), "any ID under the name");
+        assert!(h.source_up(&rows, "NameLevel", 7));
+        set(&h, k, false);
+        assert!(!h.source_up(&rows, "NameLevel", 1));
+    }
+
+    /// The reconciler passes its own `FeedKey` to `liveness`; the status key must not have changed
+    /// what that takes.
+    #[test]
+    fn liveness_still_takes_the_reconcilers_key() {
+        let h = FeedHealth::new();
+        let key: crate::ingest::reconcile::FeedKey = engine("usdsm");
+        assert_eq!(h.liveness(&key), TapeLiveness::Unregistered);
+        register_as(&h, key, Some(6));
+        assert_eq!(h.liveness(&key), TapeLiveness::Up);
     }
 }

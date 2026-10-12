@@ -146,6 +146,23 @@ Modules are grouped by role under `src/`:
   is the one place that announces which document actually won (`"feed registry resolved"`,
   `origin`/`version`/`rows`/`receivers`); `connect.sh` greps it after startup and echoes it, since
   the URL-failure fallback above is silent by design and that log line is the only signal.
+  **The document that URL serves is not this file.** It is assembled by `malbeclabs/infra`'s
+  `scripts/feed-registry` from the venue fragments its `feeds/manifest.toml` lists, and republished
+  every 30 minutes; that aggregator is its only publisher. This repo published `registry.json` to
+  the same key for one merge (#161, removed again): the two pipelines overwrote each other, and the
+  copy here was the older one — `tiredsolid` where the ledger now says `edge-hyper-hl-*`, no
+  `xyz-perps` — so a host restarting in between got stale codes. `registry.json` is therefore the
+  **compiled-in last-known-good** only: keep its rows in step with the hosted document by hand, and
+  add a venue to the hosted document through a publisher fragment and the manifest, never here.
+  ⚠️ **Any** document change an already-deployed binary rejects at parse or validation must be
+  released, and the fleet upgraded, *before* it reaches a fragment or the manifest: that is the
+  republish.
+  A `sources` assignment a deployed binary cannot resolve is one instance of that class, not the
+  class — the `version` check is an equality test rather than a floor, and `kind`/`arbitration` are
+  closed enums whose unknown variant fails the parse of the whole document — and every one of them
+  degrades that host to its built-in copy, losing the rest of the republish with it. The
+  aggregator's validation cannot catch the class either: it checks the rules it knows, not every
+  deployed binary. `docs/self-hosting.md` states the rule.
   There is deliberately **no `deny_unknown_fields`** anywhere in the module — same rule as
   `doublezero-edge/src/types.rs` — so an additive upstream change is ignored and reported by path at
   `warn`, never rejected; a *missing required* field stays fatal, so a typo cannot quietly default.
@@ -154,7 +171,7 @@ Modules are grouped by role under `src/`:
   overflow, and a **port shape matching the protocol** — `MarketByPrice`/`MarketByOrder` bind three
   port roles, `TopOfBook`/`Midpoint` two, which is what turns a misspelled optional `snapshot` key
   from a
-  silently two-port block whose book never syncs into a startup error) **and the five cross-row
+  silently two-port block whose book never syncs into a startup error) **and the six cross-row
   invariants** — `(venue, category, kind)` uniqueness,
   one arbitration mode per **venue** (the granularity `Arbiter::set_mode` keys on, so disagreement
   cannot resolve last-write-wins by document order), `emit_trades` agreeing with
@@ -162,7 +179,9 @@ Modules are grouped by role under `src/`:
   `MarketByOrder` category** (a departing receiver releases its publishers' book standing by
   category — the one scope it and the `MarketKey` provably share, see
   `Arbiter::forget_publisher_books` — so two venues carrying that kind under one category would have
-  each exit release the other's live paths). The first four used to be
+  each exit release the other's live paths), plus **one declared `source_id` per `(venue,
+  category)`** (tape ownership and the book authority key on that pair, never on the Source ID, so
+  two engines declared in one universe would let one row mute the other's trades). The first four used to be
   `#[cfg(test)]` assertions over the built-in document, which stopped being sufficient the moment a
   document could be supplied at runtime. The rest is upstream policy this process cannot verify.
   `publishers` is a tagged union: `explicit` lists port blocks verbatim, `derived` carries a published
@@ -176,7 +195,7 @@ Modules are grouped by role under `src/`:
   installed by `feeds::init` (called once from `main` before any receiver spawns); the backing
   `OnceLock` is deliberately **not** `pub`, so a consumer reading it directly is a compile error
   rather than a silently-missing row. Each `Feed` is one multicast group mapped to one
-  venue, with a group `code` (`tiredsolid`/`edge-phoenix-tob` — the identifier `doublezero status` reports,
+  venue, with a group `code` (`edge-hyper-hl-tob`/`edge-phoenix-tob` — the identifier `doublezero status` reports,
   matched by the reconciler), a `FeedKind` (which protocol) and **N `FeedPublisher` rows**, one per
   publisher mirroring the feed, each with its own `FeedPorts` block (`TwoPort` for TOB/Midpoint, or
   `ThreePort` adding a snapshot port for MBO). One receiver task runs per publisher. A publisher's
@@ -211,9 +230,11 @@ Modules are grouped by role under `src/`:
   blocks unbound and the bridge ingesting about a third of the group's datagrams. (The rule used to
   live in the document's own notes; it moved here when those notes were rewritten for the operators
   who read them — `registry.json` states what a subscriber needs, this states how we verify it.)
-  One row-level fact that lived there too: Hyperliquid's `9011`/`10011` block is on the wire and in
-  no inventory, and its depth half is the group's highest-volume publisher — its owner is still to
-  be established, so **do not drop the row** for being unattributed. A third **Kalshi** row
+  Hyperliquid is two universes on four groups — `hl-perps` (`edge-hyper-hl-tob`/`-mbo`, the native
+  perps) and `xyz-perps` (`edge-hyper-xyz-*`, the XYZ builder DEX) — each row one port block shared
+  by three publishers; it replaced the one `tiredsolid` group of eleven blocks. Neither row declares
+  a `source_id`: `sources/spec.md` says ID 1 is still stamped on the builder DEXes too until its
+  publishers filter, so declaring 7 on `xyz-perps` would be a claim the wire does not make yet. A third **Kalshi** row
   (`edge-kalshi-sports-mbp`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
   under the same Source ID — hence its own `category` (`events`: sport is one kind of event
   market and the row carries more than sport, while the group `code` stays the ledger's
@@ -228,7 +249,21 @@ Modules are grouped by role under `src/`:
   universes are separate because their `channel_id` ranges do not overlap — the allocation is
   mid-migration, the numbering is owned upstream and nothing here enforces it; the `category` is the
   only thing that separates them. Each expanded `FeedPublisher` records the `channel` it came from
-  (`None` on an explicit block) — the fact the channel filter below is built on.
+  (`None` on an explicit block) — the fact the channel filter below is built on. The two **Binance**
+  rows are the first venue where **several Source IDs share one name**: USD-margined perps
+  (`edge-binance-usdsm-tob`, group `233.84.178.23`, Source ID 6, category `usdsm`) and spot
+  (`edge-binance-spot-tob`, `233.84.178.31`, Source ID 8, category `spot`), both `BINANCE`, both
+  Top-of-Book on the **same** `30001`/`30002` block from one publisher host, both `Sticky` and
+  claiming the tape (quotes only until the publisher sends `Trade`). Nothing in the name, kind or
+  port tells them apart, so each row declares its **`source_id`** (see `ingest/health.rs`) and the
+  per-receiver metrics carry `category`; the two engines list overlapping symbols (`BTCUSDT`), which
+  is what the WS `source_id` subscription filter exists for, and the `#channel.instrument` product-id
+  suffix separates them only if
+  their `(channel, instrument_id)` pairs differ, which no capture has confirmed; where they collide,
+  `products::render_ambiguous` names the category instead. ⚠️ Their ports come from the publisher's deployment inventory and are **not yet
+  confirmed by capture** — the rows' `notes` say so until PORT PROVENANCE's check passes. Only the
+  compiled-in rows carry `source_id` today: the hosted rows are copied from the publisher's fragments,
+  which gain it separately, and until then they report at the name-level `(BINANCE, None)` key.
 - **`ingest/channel_filter.rs`** — the **channel filter**: which channels of an activated feed this
   process decodes (`--channels`/`DZ_CHANNELS`, e.g. `edge-kalshi-sports-mbp=10,11`). It is an **allowlist**, not a
   threshold — the old name, "floor", implied a minimum, which is backwards: it restricts a set, and
@@ -344,9 +379,15 @@ Modules are grouped by role under `src/`:
   than off a `Desired` that was never applied. The desired receiver set is the subscribed rows' publishers **narrowed by the
   channel filter** (`ingest::channel_filter`) — an input to the set, not a second authority. Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
   finished handles so a died feed respawns. Fail-open / `--subscription-gating-disable` route through
-  one `static_desired()`. Also the **trade-tape row owner**: `tape_owners` ranks the running receivers
-  per `(venue, category)` — one owner per *universe*, since rows sharing a Source ID can carry
-  instrument sets that mirror nothing and a venue-wide rank mutes the loser's tape outright —
+  one `static_desired()`. Also the **trade-tape row owner**: `tape_owners_by_channel` ranks the running
+  receivers per `Universe` = `(venue, category, channel)` — one owner per *universe*, since rows
+  sharing a Source ID can carry instrument sets that mirror nothing and a venue-wide rank mutes the
+  loser's tape outright. The channel is the publisher's derived one, `None` for a shared port block:
+  a derived row's receivers carry one league each and pair with a sibling row's **per channel**, so
+  ranked per category a top-of-book row running some channels would mute every market-by-price
+  receiver, including those of channels it does not run (`derived_rows_elect_a_tape_owner_per_channel`);
+  a shared-block row's publishers each carry the whole tape and keep category-level ownership, and
+  the registry refuses a category mixing the two shapes (`MixedChannelShape`) —
   (`TopOfBook` over `MarketByPrice`, base port breaking ties; MBO/Midpoint never rank) and
   `apply_feeds` publishes the result onto a `TapeOwner` (`Arc<AtomicBool>`) each processor reads per
   print, so ownership moves **without a respawn** — a respawn would drop a healthy publisher's books
@@ -366,7 +407,14 @@ Modules are grouped by role under `src/`:
   that departing row's own `(venue, category, channel)` slice from all three: the catalog
   (`InstrumentSnapshot`, a `retain`), the book (routed through `Arbiter::forget_channel_books`, never
   a direct replay-map delete, so the accumulator/replay/`StickyAuthority` triple drops together), and
-  `history::Store::forget_channel`. Category-precise throughout so a departing channel can never
+  `history::Store::forget_channel` — **except what a sibling row the filter still admits on that
+  channel supplies**: two derived rows of one category share that key and the filter narrows each
+  alone, so any admitted sibling keeps the catalog and history, and a book-building one keeps the
+  book too (`a_channel_a_sibling_row_still_admits_is_not_purged`). Admission, not "running": the
+  purge is the filter's decision, and an unsubscribed sibling keeps its state just as a lone row's
+  subscription loss does. A purge also never runs while any receiver on that channel is still
+  draining — it sets that entry's `purge` and reruns when the receiver is reaped, so a final write
+  cannot restore what it removed (`a_purge_waits_for_a_draining_sibling_on_its_channel`). Category-precise throughout so a departing channel can never
   over-drop a live peer universe sharing the same numeric id — see `ingest/feeds.rs`'s
   mid-migration warning on `channel_id`.
 - **`ingest/receiver.rs`** — the ingest hot path. All socket plumbing is **protocol-agnostic and shared**:
@@ -384,7 +432,12 @@ Modules are grouped by role under `src/`:
   (the same tuple as `reconcile::FeedKey`; `(venue, kind)` is not an identity once a venue carries two
   universes),
   aggregated to the **venue**-level `status`/`dz_feed_up` PROTOCOL.md promises, so one wedged
-  publisher never takes a venue down while a peer streams. Only quote-bearing kinds count
+  publisher never takes a venue down while a peer streams. "Venue" is a `StatusKey`
+  `(venue, source_id)`: a row that declares its optional `source_id` (validated against the
+  resolving `sources` table under its own `venue`) aggregates, emits its wire `status`, lists in
+  `/v1/status` and labels `dz_feed_up` under that ID alone, so two engines sharing a name (Binance's
+  6 and 8) never mask each other's outage; an undeclared row keeps `(venue, None)`. `ReceiverKey`
+  stays the reconciler's `FeedKey` — the status key is recorded once, at `register`. Only quote-bearing kinds count
   (`carries_venue_status`; MBO is depth-only and must neither declare an outage nor mask one), with a
   fallback to any registered receiver for a venue this process runs **no** quote-bearing receiver for
   — gated on a sticky per-venue carrier set, since a carrier that *stopped* leaves the liveness map
@@ -429,9 +482,12 @@ Modules are grouped by role under `src/`:
   `dz_tape_path_transfers_total`. ⚠️ Two residual limits, both inherited from the unauthenticated
   wire: on a venue with no `book` traffic the authority tracks nobody, so a forged publisher printing first
   holds the tape until it goes quiet for a window — the same primitive `StickyAuthority::admit`'s
-  no-dark-start already exposes for `book` — and the gate spans a whole **category**, so rows sharing one
-  that *sharded* prints rather than mirroring them would lose the non-serving path's fills (giving them
-  distinct categories is the registry's job). The two `books` lookups inside it read the authority at
+  no-dark-start already exposes for `book` — and the gate runs at the **reconciler's grain**:
+  `tape_leader` is keyed `(source, category, Option<channel>)`, `Some` only for a derived row's
+  receiver (`DatagramCtx::per_channel` → `Arbiter::emit_scoped`), so a channel served from another
+  host is never muted by a leader streaming a different one, while a shared-block row — whose
+  `channel_id` names mirrors — keeps one leader per category. Paths that *sharded* one gated
+  scope's prints rather than mirroring them would still lose the non-serving path's fills. The two `books` lookups inside it read the authority at
   the same `(venue, category)` grain, so the deferral can only ever name a path elected on *this*
   universe. `no_id_owner` is skipped entirely
   for `Sticky` venues: it is the `Coordinated` guard, and it cannot see a gate-approved handover.
@@ -950,9 +1006,11 @@ Modules are grouped by role under `src/`:
   match no baselined market (every pass, where no feed carries books) sends nothing and the pace is
   still the thing being read. Implements the
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
-  firehose) over four dimensions — `venue` (case-insensitive), `symbol`, `channel` and message
-  `type` — through **one** `SubFilter::matches` that both the symbol-bearing and the venue-level
-  (`status`) paths call, so a new dimension can't silently exempt half the feed; a channelless
+  firehose) over five dimensions — `venue` (case-insensitive), `source_id` (the one that separates
+  several Source IDs sharing a name, e.g. Binance's 6 and 8; `status` carries one too, so it gets
+  no carve-out; a book frame matches on its replay key's id, since that is what its bootstrap is
+  matched on), `symbol`, `channel` and message `type` — through **one** `SubFilter::matches` that
+  both the symbol-bearing and the venue-level (`status`) paths call, so a new dimension can't silently exempt half the feed; a channelless
   message is excluded by an explicit `channel` filter, with `status` (venue-level) the one carve-out —
   `instrument` carries its own channel and is filtered like `book`, including on the replay path. Plus app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
   (max clients/subs/inbound-rate, broadcast backpressure where a slow client drops oldest). The

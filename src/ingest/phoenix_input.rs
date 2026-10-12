@@ -28,7 +28,9 @@ use serde::Deserialize;
 use crate::{
     ingest::{
         arbiter::{lock, SharedArbiter, Transport},
-        public_input::{self, finite_non_negative, resolve_instrument, PublicVenue},
+        public_input::{
+            self, finite_non_negative, resolve_instrument, PublicVenue, ResolvedInstrument,
+        },
     },
     metrics::metrics,
     model::{
@@ -167,8 +169,11 @@ impl PhoenixVenue {
         // resolved market set is logged at startup (see `run`) so a divergence is at least visible.
         // Resolves precision AND the (channel, instrument_id) identity in one scan — see
         // `resolve_instrument`'s doc for why a bare symbol match is safe for this venue.
-        let Some((channel, instrument_id)) =
-            resolve_instrument(instruments, PHOENIX_SOURCE_ID, symbol)
+        let Some(ResolvedInstrument {
+            channel,
+            instrument_id,
+            ..
+        }) = resolve_instrument(instruments, PHOENIX_SOURCE_ID, symbol)
         else {
             return; // precision unknown / symbol not defined by the edge; drop
         };

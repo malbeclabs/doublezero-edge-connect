@@ -63,6 +63,13 @@ impl Bridge {
             "",
             "--admin-bind",
             "",
+            // Pinned rather than the compiled-in copy, which tracks the hosted document and moves
+            // with it: the replayed fixtures are sent to the groups and ports `replay.rs` names,
+            // and this file is what keeps those two in agreement.
+            "--feed-registry",
+            "tests/fixtures/e2e-registry.json",
+            "--feed-registry-url",
+            "",
         ];
         args.extend_from_slice(extra_args);
         let mut child = Command::new(bin)

@@ -18,8 +18,9 @@ user-facing docs for all three.
 **Out, explicitly:**
 - Any change to how the bridge itself is deployed. It stays a container. The package carries the CLI
   and nothing else — no systemd unit, no dependencies, no maintainer scripts, nothing privileged.
-- The unified multi-repo feed registry. The hosted document is hand-curated for now; the plumbing to
-  combine feeds from several repos is a separate piece of work.
+- The unified multi-repo feed registry. The hosted document is assembled from the venues' own
+  fragments by `malbeclabs/infra`'s `scripts/feed-registry`, separate work from this design; this
+  repo's `src/ingest/registry.json` is only the copy compiled into the image.
 - macOS and non-amd64. The installer is already Linux/amd64-only because the image is.
 
 ## Packaging

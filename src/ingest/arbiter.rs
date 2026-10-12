@@ -1447,15 +1447,24 @@ pub struct Arbiter {
     /// Bounded like `instrument_defs`: one entry per `(source, symbol)` that ever carries a zero-id
     /// print, which no live feed does today.
     no_id_owner: HashMap<(SourceKey, Arc<str>), (Transport, u64)>,
-    /// Which **path** serves each `Sticky` universe's tape, keyed on `(source, category)`. See
-    /// [`Arbiter::tape_path_admits`]. One entry per `Sticky` universe that has ever printed.
+    /// Which **path** serves each `Sticky` universe's tape, keyed on `(source, category)` plus — for
+    /// a print from a derived row ([`Arbiter::emit_scoped`]'s `per_channel`) — its canonical
+    /// `channel`, `None` otherwise. See [`Arbiter::tape_path_admits`]. One entry per `Sticky`
+    /// universe and channel that has ever printed — bounded by 257 per universe.
+    ///
+    /// Per channel because a universe's channels need not come off the same paths: a derived
+    /// row's league channels pair with a sibling row's per channel (`reconcile::Universe`), and the
+    /// reconciler can hand channel 11's tape to a market-by-price receiver on one host while a
+    /// top-of-book receiver on another serves channel 10. One leader per category would then drop
+    /// every channel-11 print, and the silence handover would never fire while channel 10 streams.
+    /// Mirrored paths still collapse: they stamp the same canonical channel.
     ///
     /// Venue alone would let a publisher on one universe mute a publisher on a disjoint one: a
     /// single Source ID can carry universes that mirror nothing, and the gate below drops every
     /// print from a path that is not the leader. That drop has no bound in practice — the silence
     /// handover only fires once the incumbent stops, and an incumbent streaming its own universe
     /// never does — so the loser's tape goes dark for the life of the process.
-    tape_leader: HashMap<ScopeKey, TapeLead>,
+    tape_leader: HashMap<(ScopeKey, Option<u8>), TapeLead>,
     /// Whether the zero-id double-print warning has fired; the metric carries the ongoing rate.
     no_id_conflict_logged: bool,
     /// Whether the "batches carry no `last`" warning has fired.
@@ -1644,8 +1653,18 @@ fn pub_idx(p: Transport) -> usize {
 /// Pre-resolved `dz_*` metric children for one venue. Built once per venue via [`VenueMetrics::new`];
 /// every field is a cheap-to-`inc()` handle, so the per-message emit path pays no label lookup.
 struct VenueMetrics {
-    /// `dz_emit_total{kind}` indexed by kind: quote/trade/instrument/midpoint/depth/status/book.
-    emit: [IntCounter; 7],
+    /// This venue's label, for resolving [`Self::emit`] children on first use.
+    venue: Arc<str>,
+    /// `dz_emit_total{source_id, kind}` per Source ID, indexed by kind:
+    /// quote/trade/instrument/midpoint/depth/status/book. Keyed per ID because several IDs may
+    /// share one name; bounded by the IDs sharing this label, since every ID past the unregistered
+    /// cap shares `UNREGISTERED` and is collapsed to `0` here exactly as `SourceKey` does. A `Vec`
+    /// scanned linearly rather than a map: it holds one entry for nearly every name, and this is
+    /// read on every emitted message under the arbiter mutex.
+    emit: Vec<(u16, [IntCounter; 7])>,
+    /// Whether [`Self::venue`] is the shared `UNREGISTERED` label, decided once rather than by a
+    /// string comparison per message.
+    unregistered: bool,
     /// `dz_quotes_admitted_total{publisher}` / `dz_trades_admitted_total{publisher}`, `[edge, public]`.
     quotes_admitted: [IntCounter; 2],
     trades_admitted: [IntCounter; 2],
@@ -1680,9 +1699,36 @@ struct VenueMetrics {
 }
 
 impl VenueMetrics {
-    fn new(venue: &str) -> Self {
+    /// The `dz_emit_total` children for wire `source_id` under this venue, resolved on first use.
+    fn emit_for(&mut self, source_id: u16) -> &[IntCounter; 7] {
+        let id = if self.unregistered { 0 } else { source_id };
+        let idx = match self.emit.iter().position(|(have, _)| *have == id) {
+            Some(idx) => idx,
+            None => {
+                let label = id.to_string();
+                let emit_kind = |k: &str| {
+                    metrics()
+                        .emit
+                        .with_label_values(&[self.venue.as_ref(), label.as_str(), k])
+                };
+                let children = [
+                    emit_kind("quote"),
+                    emit_kind("trade"),
+                    emit_kind("instrument"),
+                    emit_kind("midpoint"),
+                    emit_kind("depth"),
+                    emit_kind("status"),
+                    emit_kind("book"),
+                ];
+                self.emit.push((id, children));
+                self.emit.len() - 1
+            }
+        };
+        &self.emit[idx].1
+    }
+
+    fn new(venue: &Arc<str>) -> Self {
         let m = metrics();
-        let emit_kind = |k: &str| m.emit.with_label_values(&[venue, k]);
         // Pre-resolve the `[edge, public]` children of a `{venue, publisher}` counter, in `pub_idx`
         // order (edge=0, public=1) so the emit path indexes with `pub_idx(publisher)`.
         let by_pub = |c: &prometheus::IntCounterVec| {
@@ -1700,15 +1746,9 @@ impl VenueMetrics {
             ]
         };
         Self {
-            emit: [
-                emit_kind("quote"),
-                emit_kind("trade"),
-                emit_kind("instrument"),
-                emit_kind("midpoint"),
-                emit_kind("depth"),
-                emit_kind("status"),
-                emit_kind("book"),
-            ],
+            venue: venue.clone(),
+            emit: Vec::new(),
+            unregistered: venue.as_ref() == crate::ingest::sources::UNREGISTERED,
             quotes_admitted: by_pub(&m.quotes_admitted),
             trades_admitted: by_pub(&m.trades_admitted),
             quote_ticks_won: by_pub(&m.quote_ticks_won),
@@ -1954,7 +1994,7 @@ impl Arbiter {
     }
 
     /// The pre-resolved metric children for `venue`, created on first use.
-    fn vm(&mut self, venue: &Arc<str>) -> &VenueMetrics {
+    fn vm(&mut self, venue: &Arc<str>) -> &mut VenueMetrics {
         self.venue_metrics
             .entry(venue.clone())
             .or_insert_with(|| VenueMetrics::new(venue))
@@ -2698,7 +2738,7 @@ impl Arbiter {
                 .entry(key.clone())
                 .or_default()
                 .rebaselined(&[], seed_ts, &mut self.guard);
-            self.vm(&b.venue).emit[EMIT_BOOK].inc();
+            self.vm(&b.venue).emit_for(b.source_id)[EMIT_BOOK].inc();
             let _ = self.tx.send(Arc::new(FeedMessage::Book(cleared)));
             return true;
         };
@@ -2706,7 +2746,7 @@ impl Arbiter {
             .entry(key.clone())
             .or_default()
             .rebaselined(&full.changes, seed_ts, &mut self.guard);
-        self.vm(&b.venue).emit[EMIT_BOOK].inc();
+        self.vm(&b.venue).emit_for(b.source_id)[EMIT_BOOK].inc();
         let _ = self.tx.send(Arc::new(FeedMessage::Book(full)));
         true
     }
@@ -2759,7 +2799,7 @@ impl Arbiter {
             self.track_book_market(key);
         }
         self.apply_book_replay(key, &b);
-        self.vm(&b.venue).emit[EMIT_BOOK].inc();
+        self.vm(&b.venue).emit_for(b.source_id)[EMIT_BOOK].inc();
         let _ = self.tx.send(Arc::new(FeedMessage::Book(b)));
     }
 
@@ -2940,12 +2980,13 @@ impl Arbiter {
     /// venue with **no `book` traffic** the authority tracks and elects nobody, so a forged publisher that
     /// prints first holds the tape until it goes quiet for a window — the same primitive
     /// [`StickyAuthority::admit`]'s no-dark-start already exposes for the `book` product, and not
-    /// closable without an identity the wire does not carry. And the gate spans a whole **category**:
-    /// it assumes the rows sharing one carry mirrored tapes, so if two of them instead sharded prints
-    /// between them the non-serving path's exclusive fills would be dropped — the registry's job is to
-    /// give sharded rows distinct categories. `dz_tape_path_dropped_total` is what makes either visible
-    /// — deliberately its own counter, not folded into `dz_trades_dropped_total`, whose steady state
-    /// here is the challenger's whole feed.
+    /// closable without an identity the wire does not carry. And the gate spans a whole category's
+    /// **channel**: it assumes the paths printing one canonical channel carry mirrored tapes, so if
+    /// two of them instead sharded that channel's prints the non-serving path's exclusive fills would
+    /// be dropped. Sharding *by channel* is safe on a derived row — each channel has its own leader;
+    /// a shared-block row keeps one leader per category, since its channel ids name mirrors.
+    /// `dz_tape_path_dropped_total` is what makes either visible — deliberately its own counter, not
+    /// folded into `dz_trades_dropped_total`, whose steady state here is the challenger's whole feed.
     ///
     /// The two `books` lookups below read the authority at the **same** `(source, category)` grain
     /// this gate runs at, so the deferral can only ever name a path elected on *this* universe. While
@@ -2959,12 +3000,15 @@ impl Arbiter {
         t: &NormalizedTrade,
         publisher: Transport,
         category: &'static str,
+        per_channel: bool,
     ) -> bool {
         // Interned, so the per-print key is two refcount bumps rather than an allocation. One key for
         // the tape gate and the authority alike: they must not disagree about what a universe is.
-        let key: ScopeKey = (SourceKey::of(t), category_arc(category));
-        let elected = self.books.scope_leader(&key);
-        let tracked = self.books.tracks_path(&key, publisher);
+        let scope: ScopeKey = (SourceKey::of(t), category_arc(category));
+        let elected = self.books.scope_leader(&scope);
+        let tracked = self.books.tracks_path(&scope, publisher);
+        let books = &self.books;
+        let key = (scope, per_channel.then_some(t.channel));
         let Some(lead) = self.tape_leader.get_mut(&key) else {
             self.tape_leader.insert(
                 key,
@@ -2978,7 +3022,7 @@ impl Arbiter {
         };
         let transfer = lead.path != publisher;
         if transfer {
-            let displaces_uncorroborated = tracked && !self.books.tracks_path(&key, lead.path);
+            let displaces_uncorroborated = tracked && !books.tracks_path(&key.0, lead.path);
             let new_election = elected == Some(publisher) && lead.honored_election != elected;
             let silent = t.recv_ts_ns.saturating_sub(lead.last_ns) > NO_ID_TAPE_HANDOVER_NS;
             if !(displaces_uncorroborated || new_election || silent) {
@@ -3104,6 +3148,22 @@ impl Arbiter {
     /// Metric children are pre-resolved per venue (see [`VenueMetrics`]) so this per-message path
     /// increments a cached handle rather than doing a label-map lookup for each counter.
     pub fn emit(&mut self, msg: FeedMessage, publisher: Transport, category: &'static str) {
+        self.emit_scoped(msg, publisher, category, false)
+    }
+
+    /// [`Self::emit`] from a receiver of a row that derives a port per channel (`per_channel`):
+    /// its prints are gated per `(source, category, channel)` rather than per category. The grain
+    /// is the reconciler's own (`reconcile::Universe`), so ownership and the gate always agree: a
+    /// derived row's receivers carry one league each and pair with a sibling row per channel,
+    /// while a shared-block row's publishers each carry the whole tape — there `channel_id`
+    /// identifies *mirrors*, and gating per channel would give each mirror a leader of its own.
+    pub fn emit_scoped(
+        &mut self,
+        msg: FeedMessage,
+        publisher: Transport,
+        category: &'static str,
+        per_channel: bool,
+    ) {
         match &msg {
             FeedMessage::Quote(q) => {
                 // `source_ts == 0` is the "not available" sentinel (per CLAUDE.md, never a real
@@ -3112,7 +3172,7 @@ impl Arbiter {
                 if q.source_ts_ns == 0 {
                     let vm = self.vm(&q.venue);
                     vm.quotes_no_source_ts.inc();
-                    vm.emit[EMIT_QUOTE].inc();
+                    vm.emit_for(q.source_id)[EMIT_QUOTE].inc();
                     let _ = self.tx.send(Arc::new(msg));
                     return;
                 }
@@ -3142,7 +3202,7 @@ impl Arbiter {
                 let vm = self.vm(&q.venue);
                 match decision {
                     Admit::Emitted { opened_tick } => {
-                        vm.emit[EMIT_QUOTE].inc();
+                        vm.emit_for(q.source_id)[EMIT_QUOTE].inc();
                         // Attribute the admitted quote to its winning publisher. A rise in
                         // `publisher="public"` is the direct signal of the public backstop filling
                         // an edge gap (in steady state the edge publisher leads every tick).
@@ -3181,7 +3241,7 @@ impl Arbiter {
                 // `Sticky` universe's two paths mirror one tape with no shared identity to collapse
                 // them on. Scoped by `(source, category)`, not by venue — see `tape_path_admits`.
                 let sticky = self.mode_for(&t.venue) == ArbitrationMode::Sticky;
-                if sticky && !self.tape_path_admits(t, publisher, category) {
+                if sticky && !self.tape_path_admits(t, publisher, category, per_channel) {
                     metrics()
                         .tape_path_dropped
                         .with_label_values(&[t.venue.as_ref()])
@@ -3205,7 +3265,7 @@ impl Arbiter {
                     let conflict = !sticky && self.claim_no_id_tape(t, publisher);
                     let vm = self.vm(&t.venue);
                     vm.trades_no_id.inc();
-                    vm.emit[EMIT_TRADE].inc();
+                    vm.emit_for(t.source_id)[EMIT_TRADE].inc();
                     if conflict {
                         vm.trades_no_id_conflict.inc();
                     }
@@ -3227,7 +3287,7 @@ impl Arbiter {
                 let vm = self.vm(&t.venue);
                 match decision {
                     Admit::Emitted { .. } => {
-                        vm.emit[EMIT_TRADE].inc();
+                        vm.emit_for(t.source_id)[EMIT_TRADE].inc();
                         vm.trades_admitted[pub_idx(publisher)].inc();
                         let _ = self.tx.send(Arc::new(msg));
                     }
@@ -3269,7 +3329,7 @@ impl Arbiter {
                     vm.instruments_dropped.inc();
                     return;
                 }
-                vm.emit[EMIT_INSTRUMENT].inc();
+                vm.emit_for(i.source_id)[EMIT_INSTRUMENT].inc();
                 let _ = self.tx.send(Arc::new(msg));
             }
             FeedMessage::Midpoint(mp) => {
@@ -3278,7 +3338,7 @@ impl Arbiter {
                 // overwrites the fresher. Which of `book_ts`/`compute_ts` a floor could latch on is
                 // undecidable until this codec's offsets are validated; both are preconditions of
                 // enabling a `FeedKind::Midpoint` row (CLAUDE.md's Midpoint note).
-                self.vm(&mp.venue).emit[EMIT_MIDPOINT].inc();
+                self.vm(&mp.venue).emit_for(mp.source_id)[EMIT_MIDPOINT].inc();
                 let _ = self.tx.send(Arc::new(msg));
             }
             FeedMessage::Depth(d) => {
@@ -3307,7 +3367,7 @@ impl Arbiter {
                 match decision {
                     Admit::Emitted { opened_tick } => {
                         let vm = self.vm(&d.venue);
-                        vm.emit[EMIT_DEPTH].inc();
+                        vm.emit_for(d.source_id)[EMIT_DEPTH].inc();
                         // Attribute the admitted depth to its winning publisher — the depth mirror of
                         // `quotes_admitted`. A rise for a given transport shows which publisher currently
                         // leads the reconstructed book (and, were a public depth backstop ever added,
@@ -3495,7 +3555,7 @@ impl Arbiter {
                 }
                 if rebaseline_now {
                     let re = self.rebaseline_book(&key, publisher);
-                    self.vm(&b.venue).emit[EMIT_BOOK].inc();
+                    self.vm(&b.venue).emit_for(b.source_id)[EMIT_BOOK].inc();
                     match re {
                         // The path's whole book, this batch included, so it replaces it on the wire.
                         Some(mut full) => {
@@ -3514,7 +3574,7 @@ impl Arbiter {
                 } else {
                     self.apply_book_replay(&key, b);
                 }
-                self.vm(&b.venue).emit[EMIT_BOOK].inc();
+                self.vm(&b.venue).emit_for(b.source_id)[EMIT_BOOK].inc();
                 // Withheld only when this path's slot is behind what the market has published —
                 // a handover between publishers whose boundary streams sit slots apart. The clone
                 // is that case alone; the steady state sends the message it was handed.
@@ -3535,7 +3595,7 @@ impl Arbiter {
             // {kind="status"}` is unreachable in practice today. The path is kept for match
             // exhaustiveness and stays correct if a future call site ever emits status through here.
             FeedMessage::Status(s) => {
-                self.vm(&s.venue).emit[EMIT_STATUS].inc();
+                self.vm(&s.venue).emit_for(s.source_id)[EMIT_STATUS].inc();
                 let _ = self.tx.send(Arc::new(msg));
             }
         }
@@ -3567,6 +3627,23 @@ mod tests {
     /// the whole suite must behave exactly as it did before the tape gate was scoped, which is what
     /// makes the two category tests below evidence of the scope change and not of a rewrite.
     const TEST_CATEGORY: &str = "testcategory";
+
+    /// Two engines under one name count apart on `dz_emit_total`, by the message's own Source ID;
+    /// one merged series would hide one engine going quiet behind the other's volume.
+    #[test]
+    fn emit_counts_each_source_id_under_a_name_apart() {
+        let venue = "EmitPerSourceTest";
+        let mut vm = VenueMetrics::new(&Arc::from(venue));
+        vm.emit_for(6)[EMIT_QUOTE].inc();
+        vm.emit_for(8)[EMIT_QUOTE].inc_by(2);
+        let get = |id| {
+            metrics()
+                .emit
+                .with_label_values(&[venue, id, "quote"])
+                .get()
+        };
+        assert_eq!((get("6"), get("8")), (1, 2));
+    }
 
     #[test]
     fn quote_first_sample_admits() {
@@ -3999,6 +4076,33 @@ mod tests {
             TEST_CATEGORY,
         );
         assert_eq!(drain_quotes(&mut rx).len(), 2);
+    }
+
+    /// The Binance shape: perps (6) and spot (8) are both `BINANCE`, both list `BTCUSDT`, and both
+    /// are published by one host — so they arrive from the **same** source IP address, under their
+    /// own categories. Neither latches the other's floor: both copies at one `source_ts` are
+    /// admitted, and one engine running ahead never makes the other's later tick look stale.
+    #[test]
+    fn binance_engines_quoting_one_symbol_keep_separate_floors() {
+        let host = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let btc = |source_id, ts, bid| {
+            let mut q = quote(ts, bid, bid + 1.0);
+            q.source_id = source_id;
+            q.venue = "BINANCE".into();
+            q.source_name = "BINANCE".into();
+            q.symbol = "BTCUSDT".into();
+            FeedMessage::Quote(q)
+        };
+        a.emit(btc(6, 1000, 100.0), host, "usdsm");
+        a.emit(btc(8, 1000, 100.0), host, "spot");
+        a.emit(btc(6, 2000, 101.0), host, "usdsm");
+        a.emit(btc(8, 1500, 99.0), host, "spot");
+        assert_eq!(
+            drain_quotes(&mut rx),
+            vec![(1000, 100.0), (1000, 100.0), (2000, 101.0), (1500, 99.0)]
+        );
     }
 
     /// Same for trades: one ID's trade_id window does not swallow the other's.
@@ -6293,6 +6397,45 @@ mod tests {
             a.emit(FeedMessage::Trade(t), p, TEST_CATEGORY);
         }
         assert_eq!(drain_trades(&mut rx), 2);
+    }
+
+    /// A universe's channels need not come off the same paths: the reconciler can hand channel 11's
+    /// tape to a market-by-price receiver on one host while a top-of-book receiver on another serves
+    /// channel 10. Each channel elects its own leader, so neither mutes the other — while a second
+    /// path on a channel that already has one is still collapsed.
+    #[test]
+    fn each_channel_of_a_sticky_universe_has_its_own_tape_leader() {
+        let venue = "TapePerChannel";
+        let (mut a, mut rx) = sticky_tape(venue);
+        let print = |a: &mut Arbiter, p, channel, id| {
+            let mut t = trade(id);
+            t.venue = venue.into();
+            t.channel = channel;
+            t.recv_ts_ns = 1_000;
+            a.emit_scoped(FeedMessage::Trade(t), p, TEST_CATEGORY, true);
+        };
+        print(&mut a, path(1), 10, 1);
+        print(&mut a, path(2), 11, 2);
+        assert_eq!(drain_trades(&mut rx), 2, "one leader per channel");
+        print(&mut a, path(2), 10, 3);
+        assert_eq!(drain_trades(&mut rx), 0, "channel 10 already has a leader");
+    }
+
+    /// A shared-block row keeps **one** leader per category: there `channel_id` names a mirror,
+    /// and mirrors stamping different ids with no `publisher_offset` to fold them would otherwise
+    /// each lead a tape of their own and print every fill twice.
+    #[test]
+    fn a_shared_block_rows_mirrors_share_one_tape_leader() {
+        let venue = "TapeSharedBlock";
+        let (mut a, mut rx) = sticky_tape(venue);
+        for (p, channel, id) in [(path(1), 0u8, 1u64), (path(2), 100, 2)] {
+            let mut t = trade(id);
+            t.venue = venue.into();
+            t.channel = channel;
+            t.recv_ts_ns = 1_000;
+            a.emit(FeedMessage::Trade(t), p, TEST_CATEGORY);
+        }
+        assert_eq!(drain_trades(&mut rx), 1, "the second mirror is collapsed");
     }
 
     /// A dead leader must not mute the tape: past the handover window the challenger takes it, and the
