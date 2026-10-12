@@ -643,10 +643,12 @@ pub struct BookAccumulator {
     wire_ts_ns: u64,
     pending_wire_ts_ns: u64,
     pending_batch_id: Option<u32>,
-    /// The venue's committed slot the accumulated state stands at — see
+    /// The venue's committed slot the accumulated state stands at or past — see
     /// [`NormalizedBook::batch_id`]. Committed with the event clock, so it names a slot whose
     /// changes are actually folded in rather than one still waiting for its `last` batch.
     batch_id: Option<u32>,
+    /// Whether the last fold was closed by a batch naming a slot — see [`Self::exact_batch_id`].
+    batch_id_exact: bool,
     /// Whether a producer re-baseline has been folded in, i.e. whether these levels are the market's
     /// **whole** book rather than only what has changed since accumulation started. See
     /// [`BookAccumulator::baselined`].
@@ -704,6 +706,7 @@ impl BookAccumulator {
             pending_wire_ts_ns: 0,
             pending_batch_id: None,
             batch_id: None,
+            batch_id_exact: false,
             baselined: false,
         }
     }
@@ -849,6 +852,7 @@ impl BookAccumulator {
         }
         self.source_ts_ns = self.pending_ts_ns;
         self.batch_id = self.pending_batch_id;
+        self.batch_id_exact = b.batch_id.is_some();
         self.wire_ts_ns = self.pending_wire_ts_ns;
     }
 
@@ -936,9 +940,16 @@ impl BookAccumulator {
             })
     }
 
-    /// The committed slot this accumulated state stands at, or `None` if no batch has named one.
+    /// The committed slot most recently named by a folded batch, or `None` if none has. The state
+    /// is at least that slot's — see [`Self::exact_batch_id`].
     pub fn batch_id(&self) -> Option<u32> {
         self.batch_id
+    }
+
+    /// [`Self::batch_id`] only while the state stands exactly at it. A fold closed by a batch naming
+    /// no slot, as after a boundary lapse, keeps the old label over newer state.
+    pub fn exact_batch_id(&self) -> Option<u32> {
+        self.batch_id.filter(|_| self.batch_id_exact)
     }
 
     /// The `recv_ts_ns` of the newest batch **folded in**, or `0` if none has been. This is the
@@ -2096,6 +2107,27 @@ mod tests {
             "the abandoned event's slot is not the state's"
         );
         assert_eq!(acc.source_ts_ns(), 100, "nor its event time");
+    }
+
+    /// A close naming no slot keeps the label but leaves the state past it, until a named close.
+    #[test]
+    fn only_a_close_naming_a_slot_stands_exactly_at_it() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        let close = |slot| {
+            let mut b = book(
+                vec![order(BookAction::Update, BookSide::Bid, 1.0, 1.0, 0)],
+                false,
+                true,
+            );
+            b.batch_id = slot;
+            b
+        };
+        acc.apply(&close(Some(900)));
+        assert_eq!(acc.exact_batch_id(), Some(900));
+        acc.apply(&close(None));
+        assert_eq!((acc.batch_id(), acc.exact_batch_id()), (Some(900), None));
+        acc.apply(&close(Some(901)));
+        assert_eq!(acc.exact_batch_id(), Some(901));
     }
 
     /// A connecting client is bootstrapped with price levels by default, so an L2 consumer never pays

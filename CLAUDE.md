@@ -671,8 +671,10 @@ Modules are grouped by role under `src/`:
   `edge-phoenix-mbp` alone, whose publishers stamp the venue slot): `Arbiter::seamless_handover` then
   compares the **replay entry** (what reached the wire; a withheld batch can make the outgoing path's
   own accumulator differ from the consumer's book) against the incoming path's accumulator, before
-  that path's batch is folded, and requires both complete, between events, at one equal slot no lower
-  than `wire_slot`, and `BookAccumulator::same_state`. Undeclared, it always re-baselines: two paths'
+  that path's batch is folded, and requires both complete, between events, standing exactly at one
+  equal slot no lower than `wire_slot` (`BookAccumulator::exact_batch_id`: an event closed by a batch
+  naming no slot folds in under the old label, and comparing that would count a boundary lapse as a
+  divergence), and `BookAccumulator::same_state`. Undeclared, it always re-baselines: two paths'
   slots are otherwise unrelated counters, and a false "equal" corrupts a book silently. A mismatch at
   an equal slot counts `dz_book_path_divergence_total` and re-baselines.
   Tunables are the `--arb-*` flags (see docs/metrics.md).

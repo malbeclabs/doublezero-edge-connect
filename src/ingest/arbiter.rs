@@ -1989,8 +1989,9 @@ impl Arbiter {
 
     /// Whether a handover of `key` onto `publisher` can go out as a plain delta: the scope is
     /// declared, and what reached the wire and `publisher`'s own book are both complete, between
-    /// events, at the same committed slot (not behind the published one) and identical. Read before
-    /// `publisher`'s batch is accumulated, since that batch is the first delta from the shared state.
+    /// events, exactly at the same committed slot (not behind the published one) and identical.
+    /// Read before `publisher`'s batch is accumulated, since that batch is the first delta from the
+    /// shared state.
     ///
     /// A mismatch at an equal slot means two paths disagree about one venue state, so it is counted
     /// and the market re-baselines.
@@ -2020,11 +2021,11 @@ impl Arbiter {
                 return false;
             };
             let whole = |a: &BookAccumulator| a.baselined() && a.pending_empty();
-            let slot = served.batch_id();
+            let slot = served.exact_batch_id();
             if !whole(served)
                 || !whole(incoming)
                 || slot.is_none()
-                || slot != incoming.batch_id()
+                || slot != incoming.exact_batch_id()
                 || market.wire_slot > slot
             {
                 return false;
@@ -6331,6 +6332,39 @@ mod tests {
             before,
             "a different slot is not a divergence"
         );
+    }
+
+    /// An event closed by a batch naming no slot moves the incoming book past the label it shares.
+    #[test]
+    fn an_incoming_close_naming_no_slot_is_not_an_equal_slot() {
+        let venue = "BookSeamlessIncomingUnnamed";
+        let before = divergences(venue);
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 10.0)], 10);
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 9.0)], true, 1_500),
+            path(2),
+            TEST_CATEGORY,
+        );
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(rebaselines(&out), 1);
+        assert_eq!(divergences(venue), before);
+    }
+
+    /// The same on the consumer's side of the comparison.
+    #[test]
+    fn a_served_close_naming_no_slot_is_not_an_equal_slot() {
+        let venue = "BookSeamlessServedUnnamed";
+        let before = divergences(venue);
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 10.0)], 10);
+        let past = replay_acc(&[
+            at_slot(venue, vec![clear_both(), bid(0.40, 10.0)], true, 10, 1),
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 9.0)], true, 2),
+        ]);
+        assert_eq!(past.batch_id(), Some(10));
+        replace_replay(&mut a, venue, past);
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(rebaselines(&out), 1);
+        assert_eq!(divergences(venue), before);
     }
 
     /// An incoming path holding an unterminated event is not at its committed slot.
