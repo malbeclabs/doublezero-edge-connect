@@ -734,8 +734,8 @@ pub enum SeqCheck {
     /// An advance past [`MAX_SEQ_ADVANCE`] on a bounded tracker. Accepted, but the anchor stays, so
     /// one forged high sequence cannot make the channel's real datagrams read as stale.
     Bounded,
-    /// Advances past the bound for [`SEQ_RESEAT_NS`] with no in-bound datagram between: the anchor
-    /// re-seats to the highest sequence seen. Accepted.
+    /// A run of advances past the bound has lasted [`SEQ_RESEAT_NS`]: the anchor re-seats to this
+    /// datagram's sequence. Accepted.
     Reseat,
 }
 
@@ -743,15 +743,18 @@ pub enum SeqCheck {
 /// datagrams an event; a longer outage re-seats through [`SEQ_RESEAT_NS`].
 pub(crate) const MAX_SEQ_ADVANCE: u64 = 1_024;
 
-/// How long a bounded tracker refuses every advance before re-seating, which is also the longest a
-/// forged sequence can hold a legitimate channel's staleness check off its real anchor.
+/// How long a run of advances past the bound must last before a bounded tracker re-seats. A run is
+/// consecutive such datagrams each within [`MAX_SEQ_ADVANCE`] of the one before, with no in-bound
+/// datagram between, so an outlier restarts it rather than becoming the anchor. ⚠️ This does not
+/// cover a channel quiet for that long: two consistent far-ahead datagrams that far apart re-seat
+/// it, and every real datagram after them is `Stale` until `Reset Count` changes.
 pub(crate) const SEQ_RESEAT_NS: u64 = 5_000_000_000;
 
 #[derive(Clone, Copy)]
 struct SeqAnchor {
     reset_count: u8,
     sequence: u64,
-    /// When the current run of out-of-bound advances began, and the highest sequence it has seen.
+    /// When the current run of out-of-bound advances began, and its latest sequence.
     bounded: Option<(u64, u64)>,
 }
 
@@ -813,16 +816,15 @@ impl SeqTracker {
             *entry = anchor(sequence);
             return SeqCheck::Ok; // forward progress or a duplicate of the last sequence
         }
-        let (since, highest) = entry
-            .bounded
-            .map_or((now_ns, sequence), |(since, highest)| {
-                (since, highest.max(sequence))
-            });
+        let since = match entry.bounded {
+            Some((since, latest)) if sequence.abs_diff(latest) <= MAX_SEQ_ADVANCE => since,
+            _ => now_ns,
+        };
         if now_ns.saturating_sub(since) >= SEQ_RESEAT_NS {
-            *entry = anchor(highest);
+            *entry = anchor(sequence);
             return SeqCheck::Reseat;
         }
-        entry.bounded = Some((since, highest));
+        entry.bounded = Some((since, sequence));
         SeqCheck::Bounded
     }
 }
@@ -1826,6 +1828,27 @@ mod tests {
         s.check(0, 0, 90_000, 10 * SEQ_RESEAT_NS);
         s.check(0, 0, 50_004, 10 * SEQ_RESEAT_NS + 1);
         assert_eq!(s.check(0, 0, 90_001, 11 * SEQ_RESEAT_NS), SeqCheck::Bounded);
+    }
+
+    /// An outlier inside a real outage's run restarts the run rather than becoming the anchor, and
+    /// two far-ahead datagrams that are not a run never re-seat.
+    #[test]
+    fn a_reseat_lands_on_the_run_never_on_an_outlier() {
+        use super::{SeqCheck, SeqTracker, SEQ_RESEAT_NS};
+        let mut s = SeqTracker::bounded();
+        s.check(0, 0, 100, 0);
+        assert_eq!(s.check(0, 0, 50_000, 1), SeqCheck::Bounded);
+        assert_eq!(s.check(0, 0, 90_000, SEQ_RESEAT_NS + 1), SeqCheck::Bounded);
+        assert_eq!(
+            s.check(0, 0, u64::MAX, SEQ_RESEAT_NS + 2),
+            SeqCheck::Bounded
+        );
+        assert_eq!(s.check(0, 0, 50_001, SEQ_RESEAT_NS + 3), SeqCheck::Bounded);
+        assert_eq!(
+            s.check(0, 0, 50_002, 2 * SEQ_RESEAT_NS + 3),
+            SeqCheck::Reseat
+        );
+        assert_eq!(s.check(0, 0, 50_003, 2 * SEQ_RESEAT_NS + 4), SeqCheck::Ok);
     }
 
     /// The idle interval doubles per fruitless rejoin and stops at the cap, so a permanently-silent

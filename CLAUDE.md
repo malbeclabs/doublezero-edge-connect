@@ -838,9 +838,9 @@ Modules are grouped by role under `src/`:
   datagram end, or the republish would go out `last: true` holding an intermediate book. It also runs
   the shared `SeqTracker` per
   publisher — **bounded** here alone (`SeqTracker::bounded`: an advance past `MAX_SEQ_ADVANCE`, 1,024,
-  is processed without moving the anchor, and `SEQ_RESEAT_NS`, 5 s, of such advances with none in
-  bound re-seats to the highest seen), so one forged high sequence cannot make every real boundary read
-  stale; top-of-book stays unbounded because its channel-0 sequence is global across groups and jumps
+  is processed without moving the anchor, and `SEQ_RESEAT_NS`, 5 s, of such advances, each within the bound of the one before and none in
+  bound of the anchor, re-seats to the latest, so an outlier restarts the run rather than becoming the anchor), so one far-ahead sequence cannot make every real boundary read
+  stale (⚠️ a channel quiet for 5 s is not covered: two consistent far-ahead datagrams that far apart re-seat it); top-of-book stays unbounded because its channel-0 sequence is global across groups and jumps
   routinely — on the **market-data role only** and drops a `SeqCheck::Stale` datagram whole, as
   `TobProcessor` does: a stale datagram's deltas are refused as duplicates anyway, but a
   `BatchBoundary` carries no sequence of its own, so an old one moves `last_batch` backwards and
