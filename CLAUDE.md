@@ -258,12 +258,15 @@ Modules are grouped by role under `src/`:
   port tells them apart, so each row declares its **`source_id`** (see `ingest/health.rs`) and the
   per-receiver metrics carry `category`; the two engines list overlapping symbols (`BTCUSDT`), which
   is what the WS `source_id` subscription filter exists for, and the `#channel.instrument` product-id
-  suffix separates them only if
-  their `(channel, instrument_id)` pairs differ, which no capture has confirmed; where they collide,
-  `products::render_ambiguous` names the category instead. ⚠️ Their ports come from the publisher's deployment inventory and are **not yet
-  confirmed by capture** — the rows' `notes` say so until PORT PROVENANCE's check passes. Only the
-  compiled-in rows carry `source_id` today: the hosted rows are copied from the publisher's fragments,
-  which gain it separately, and until then they report at the name-level `(BINANCE, None)` key.
+  suffix separates them where their `(channel, instrument_id)` pairs differ (they do live: perps on
+  channel 0, spot on 1, e.g. `BINANCE:BTCUSDT#0.2895029187` vs `#1.271`); where they collide,
+  `products::render_ambiguous` names the category instead. Both rows were **confirmed by capture**
+  on 2026-10-02 from the Chicago edge terminal: group, ports, Source IDs 6/8 and channels 0/1 all as
+  declared, 566 and 1,372 products. ⚠️ That capture also found the publishers sending at multicast
+  TTL 8, which died inside the fabric before Chicago while nearer subscribers received normally;
+  they now send at 64 (malbeclabs/binance#123). A row that binds and stays silent at one site but
+  not another is that, not a wrong port. The hosted rows carry `source_id` too
+  (malbeclabs/binance#116).
 - **`ingest/channel_filter.rs`** — the **channel filter**: which channels of an activated feed this
   process decodes (`--channels`/`DZ_CHANNELS`, e.g. `edge-kalshi-sports-mbp=10,11`). It is an **allowlist**, not a
   threshold — the old name, "floor", implied a minimum, which is backwards: it restricts a set, and
