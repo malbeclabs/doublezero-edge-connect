@@ -292,6 +292,10 @@ impl StickyAuthority {
         if self.path_ordinal(&scope_of(key), publisher) == OTHER_PATH {
             return;
         }
+        // Healthy is the absent default, so marking an untracked market healthy records nothing.
+        if healthy && !self.markets.contains_key(key) {
+            return;
+        }
         let m = self.market_mut(key);
         if healthy {
             m.unhealthy.remove(&publisher);
@@ -402,6 +406,18 @@ impl StickyAuthority {
         m.last_admitted = Some(publisher);
         m.overridden_from = overridden_from;
         Admit::Emitted { opened_tick }
+    }
+
+    /// [`Self::admit`] for a batch no datagram delivered (a silent channel's close). It is no
+    /// evidence its path is alive, so it moves no silence clock, election or hold, and is served
+    /// only where that path is still the one the consumer follows.
+    pub fn admit_synthesized(&mut self, key: &MarketKey, publisher: Transport) -> Admit<Transport> {
+        self.hold_released = None;
+        if self.serving(key) == Some(publisher) && self.last_admitted(key) == Some(publisher) {
+            Admit::Emitted { opened_tick: false }
+        } else {
+            Admit::Dropped
+        }
     }
 
     /// Force a scope's authority, returning whether it moved. The margin path; silence goes through
@@ -821,6 +837,13 @@ mod tests {
         );
     }
 
+    #[test]
+    fn marking_an_absent_market_healthy_creates_no_entry() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        a.set_health(&key(), path(1), true);
+        assert!(a.markets.is_empty());
+    }
+
     /// A path past the labelled cap is never authoritative, so a health report from one — the source IP address
     /// is spoofable — must not enter per-market state either.
     #[test]
@@ -942,6 +965,18 @@ mod tests {
             !a.admit(key(), path(2), 1_000 + TIMEOUT).emitted(),
             "not yet past"
         );
+        assert!(a.admit(key(), path(2), 1_001 + TIMEOUT).emitted());
+        assert_eq!(a.scope_leader(&scope()), Some(path(2)));
+    }
+
+    /// A dead leader's synthesized close is served, and the peer still takes over on time.
+    #[test]
+    fn a_synthesized_batch_moves_no_silence_clock() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        a.admit(key(), path(1), 1_000);
+        a.admit(key(), path(2), 1_001);
+        assert!(a.admit_synthesized(&key(), path(1)).emitted());
+        assert_eq!(a.admit_synthesized(&key(), path(2)), Admit::Dropped);
         assert!(a.admit(key(), path(2), 1_001 + TIMEOUT).emitted());
         assert_eq!(a.scope_leader(&scope()), Some(path(2)));
     }
@@ -1148,6 +1183,16 @@ mod tests {
         let mut a = on_hold();
         a.set_health(&key(), path(1), true);
         keep_live(&mut a, &[path(1)], 2 * SEC, 5 * SEC);
+        assert!(a.admit(key(), path(1), 5 * SEC).emitted());
+    }
+
+    /// ...including one whose own close the receive loop synthesized while it was silent.
+    #[test]
+    fn a_synthesized_close_does_not_keep_a_silent_holder() {
+        let mut a = on_hold();
+        a.set_health(&key(), path(1), true);
+        keep_live(&mut a, &[path(1)], 2 * SEC, 5 * SEC);
+        assert!(a.admit_synthesized(&key(), path(2)).emitted());
         assert!(a.admit(key(), path(1), 5 * SEC).emitted());
     }
 

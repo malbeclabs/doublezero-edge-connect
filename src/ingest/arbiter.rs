@@ -3226,7 +3226,7 @@ impl Arbiter {
     /// Metric children are pre-resolved per venue (see [`VenueMetrics`]) so this per-message path
     /// increments a cached handle rather than doing a label-map lookup for each counter.
     pub fn emit(&mut self, msg: FeedMessage, publisher: Transport, category: &'static str) {
-        self.emit_scoped(msg, publisher, category, false)
+        self.emit_scoped(msg, publisher, category, false, false)
     }
 
     /// [`Self::emit`] from a receiver of a row that derives a port per channel (`per_channel`):
@@ -3235,12 +3235,15 @@ impl Arbiter {
     /// derived row's receivers carry one league each and pair with a sibling row per channel,
     /// while a shared-block row's publishers each carry the whole tape — there `channel_id`
     /// identifies *mirrors*, and gating per channel would give each mirror a leader of its own.
+    ///
+    /// `synthesized` marks a batch no datagram delivered (`DatagramCtx::synthesized`).
     pub fn emit_scoped(
         &mut self,
         msg: FeedMessage,
         publisher: Transport,
         category: &'static str,
         per_channel: bool,
+        synthesized: bool,
     ) {
         match &msg {
             FeedMessage::Quote(q) => {
@@ -3528,8 +3531,10 @@ impl Arbiter {
                 let leader_before = self.books.scope_leader(&scope);
                 // A hold waiting on a leader that is healthy again must not outlive an incomplete
                 // replay entry: a quiet holder never closes an event, so it never republishes one.
-                // Only the leader's batch can take the market back; the holder's may be the republish.
-                if leader_before == Some(publisher)
+                // Only a batch the leader delivered can take the market back; the holder's may be the
+                // republish.
+                if !synthesized
+                    && leader_before == Some(publisher)
                     && self.books.holding_revert(&key)
                     && self.replay_incomplete(&key)
                 {
@@ -3539,7 +3544,11 @@ impl Arbiter {
                 let prev = self.books.last_admitted(&key);
                 let overridden_from = self.books.overridden_from(&key);
                 let healthy_here = self.books.healthy(&key, publisher);
-                let decision = self.books.admit(key.clone(), publisher, b.recv_ts_ns);
+                let decision = if synthesized {
+                    self.books.admit_synthesized(&key, publisher)
+                } else {
+                    self.books.admit(key.clone(), publisher, b.recv_ts_ns)
+                };
                 if let Some(release) = self.books.take_hold_release() {
                     count_revert_hold(&b.venue, release);
                 }
@@ -6846,7 +6855,7 @@ mod tests {
             t.venue = venue.into();
             t.channel = channel;
             t.recv_ts_ns = 1_000;
-            a.emit_scoped(FeedMessage::Trade(t), p, TEST_CATEGORY, true);
+            a.emit_scoped(FeedMessage::Trade(t), p, TEST_CATEGORY, true, false);
         };
         print(&mut a, path(1), 10, 1);
         print(&mut a, path(2), 11, 2);

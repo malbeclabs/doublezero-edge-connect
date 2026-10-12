@@ -69,6 +69,7 @@ fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
             mirror_offset: None,
             declared_source_id: None,
             per_channel: false,
+            synthesized: false,
         };
         p.on_datagram(datagram, &ctx);
     }
@@ -141,6 +142,7 @@ fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
             mirror_offset: None,
             declared_source_id: None,
             per_channel: false,
+            synthesized: false,
         };
         p.on_datagram(datagram, &ctx);
     }
