@@ -209,14 +209,23 @@ The document that maps venues to multicast groups/ports (`src/ingest/registry.rs
 https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json
 ```
 
-served fresh at every container start — no rebuild needed to pick up a new venue or port. Override
-with your own `DZ_FEED_REGISTRY_URL`, or with a bind-mounted file via `DZ_FEED_REGISTRY` (the
-installer clears the default URL for you in that case — see the table above). A host that can't
+served fresh at every container start — no rebuild needed to pick up a new venue or port.
+
+**That document is assembled by `malbeclabs/infra`'s `scripts/feed-registry`** from each venue's
+own published fragment, and republished every 30 minutes, so a new venue, a moved port or a changed
+channel set reaches the fleet at the next container start rather than at the next image rebuild.
+Each publish also leaves an immutable timestamped copy beside it under `…/feeds/`, which is what to
+pin `DZ_FEED_REGISTRY_URL` at if a host must not move when the document is republished. This repo's
+`src/ingest/registry.json` is the copy compiled into the image as a fallback; it is not what the
+URL serves.
+
+Override with your own `DZ_FEED_REGISTRY_URL`, or with a bind-mounted file via `DZ_FEED_REGISTRY`
+(the installer clears the default URL for you in that case — see the table above). A host that can't
 reach the URL falls back to the built-in copy **silently by design**; the bridge's own startup log
 says which document actually won, and the one-liner echoes it for you:
 
 ```
-==> Feed registry: origin="url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json" version=1 rows=6 receivers=56
+==> Feed registry: origin="url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json" version=1 rows=9 receivers=69
 ```
 
 That line only appears at startup, so `/v1/status` reports it too — which is how you check a
@@ -225,7 +234,7 @@ running process, or compare a fleet, without reading logs on each box:
 ```bash
 doublezero-edge status --jq '.registry'
 # {"origin":"url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json",
-#  "version":1,"rows":3,"receivers":33}
+#  "version":1,"rows":9,"receivers":69}
 ```
 
 An `origin` of `built-in` on a host you expected to be using the hosted document means the fetch

@@ -44,7 +44,12 @@ struct PreparedFrame {
     kind: &'static str,
     /// The message's venue, for subscription filtering.
     venue: Arc<str>,
-    /// The message's symbol, or `None` for a venue-level `status` (matched by venue alone).
+    /// The message's Source ID, for subscription filtering: several IDs may share one venue name,
+    /// and this is what tells them apart. For a `book`/`order_book` frame it is `book_market`'s
+    /// (collapsed) id rather than the wire field — see [`prepare`].
+    source_id: u16,
+    /// The message's symbol, or `None` for a venue-level `status`. `None` only exempts it from a
+    /// `symbol` (and `channel`) filter; it is still matched on `venue`, `source_id` and `type`.
     symbol: Option<Arc<str>>,
     /// The message's `channel_id`, or `None` for a type that carries none. Populated when the
     /// incremental `book` message lands; every current type is `None`.
@@ -176,10 +181,19 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
         ),
         _ => (None, 0),
     };
+    // ⚠️ A book frame filters on its replay key's id, never the wire field. The bootstrap
+    // (`replay_scoped`, `withheld_bootstrap`) only has the `SourceKey`, which collapses every ID
+    // past the unregistered-source cap to `0`; filtering the live frame on the wire id instead would
+    // hand a `{"source_id":N}` subscriber incremental batches for a market whose bootstrap it was
+    // refused — a book it does not hold.
+    let source_id = book_market
+        .as_ref()
+        .map_or_else(|| m.source_id(), |k| k.0.id());
     Some(Arc::new(PreparedFrame {
         payload,
         kind,
         venue,
+        source_id,
         symbol,
         channel: m.channel(),
         book_market,
@@ -229,6 +243,12 @@ struct SubFilter {
     /// key exists to prevent. ANDed like `venue`, so all three spellings compose.
     #[serde(default, rename = "source")]
     deprecated_source_name: Option<String>,
+    /// The wire Source ID. The one dimension that tells apart several IDs sharing one `venue` name —
+    /// Binance's USD-margined perps (6) and spot (8) are both `BINANCE`, and list the same symbols
+    /// — so a consumer need not filter on the message's `source_id` client-side. Every message
+    /// carries one, `status` included, so it has no venue-level carve-out.
+    #[serde(default)]
+    source_id: Option<u16>,
     #[serde(default)]
     symbol: Option<String>,
     /// The wire `channel_id` — the competition, not the path. Path identity is deliberately not
@@ -256,7 +276,14 @@ impl SubFilter {
     /// satisfies a filter on that dimension — a venue-level message is about the whole venue, so a
     /// symbol- or channel-scoped subscriber must still receive it. A filter dimension the message
     /// *does* carry is matched normally.
-    fn matches(&self, venue: &str, symbol: Option<&str>, channel: Option<u8>, kind: &str) -> bool {
+    fn matches(
+        &self,
+        source_id: u16,
+        venue: &str,
+        symbol: Option<&str>,
+        channel: Option<u8>,
+        kind: &str,
+    ) -> bool {
         // Venue codes are registry identifiers, not free text - match case-insensitively so a
         // subscription for `PHOENIX` / `phoenix` still selects the wire venue `Phoenix`. Symbol and
         // type stay exact (venues name symbols precisely; types are a closed protocol set).
@@ -271,6 +298,7 @@ impl SubFilter {
                 .deprecated_source_name
                 .as_deref()
                 .is_none_or(|s| s.eq_ignore_ascii_case(venue))
+            && self.source_id.is_none_or(|id| id == source_id)
             // `type` is a *kind* selector and so is absolute, with no carve-out: a client that named
             // one type asked for that type. Filters are a union, so wanting books plus definitions is
             // two subscriptions. `venue`/`symbol`/`channel` below are *scope* selectors — which
@@ -482,6 +510,7 @@ fn withheld_bootstrap(
     let wanted = subs.is_empty()
         || subs.iter().any(|f| {
             f.matches(
+                key.0.id(),
                 key.0.name(),
                 Some(acc.symbol()),
                 Some(key.2),
@@ -619,11 +648,11 @@ where
 {
     // Each kind passes its own channel: a channel-bearing kind that passed `None` would leave a
     // `{"channel":N}` client with no bootstrap at all.
-    let pass = |venue: &str, symbol: &str, channel: Option<u8>, kind: &str| {
+    let pass = |source_id: u16, venue: &str, symbol: &str, channel: Option<u8>, kind: &str| {
         subs.is_empty()
             || subs
                 .iter()
-                .any(|f| f.matches(venue, Some(symbol), channel, kind))
+                .any(|f| f.matches(source_id, venue, Some(symbol), channel, kind))
     };
     // Every lock is taken and released before any `await`: a `std::sync::MutexGuard` held across an
     // await point does not compile here, and would be a latency bug regardless.
@@ -635,7 +664,15 @@ where
         let guard = crate::model::lock(instruments);
         guard
             .values()
-            .filter(|i| pass(&i.venue, &i.symbol, Some(i.channel), "instrument"))
+            .filter(|i| {
+                pass(
+                    i.source_id,
+                    &i.venue,
+                    &i.symbol,
+                    Some(i.channel),
+                    "instrument",
+                )
+            })
             .cloned()
             .map(FeedMessage::Instrument)
             .collect()
@@ -646,7 +683,7 @@ where
         let guard = crate::model::lock(depth);
         guard
             .values()
-            .filter(|d| pass(&d.venue, &d.symbol, None, "depth"))
+            .filter(|d| pass(d.source_id, &d.venue, &d.symbol, None, "depth"))
             .cloned()
             .map(FeedMessage::Depth)
             .collect()
@@ -663,7 +700,13 @@ where
             // Filtered and tagged under the market's *own* type, matching the live feed it
             // precedes: a client subscribed to `order_book` alone must still be bootstrapped, and
             // one subscribed to `book` alone must not be handed a market it cannot apply.
-            if !pass(key.0.name(), acc.symbol(), Some(key.2), book_kind(acc)) {
+            if !pass(
+                key.0.id(),
+                key.0.name(),
+                acc.symbol(),
+                Some(key.2),
+                book_kind(acc),
+            ) {
                 continue;
             }
             // A market accumulated partway through holds only the levels that have moved since, so
@@ -986,6 +1029,7 @@ async fn serve_client(
                     let pass = subs.is_empty()
                         || subs.iter().any(|f| {
                             f.matches(
+                                frame.source_id,
                                 &frame.venue,
                                 frame.symbol.as_deref(),
                                 frame.channel,
@@ -1047,15 +1091,35 @@ mod tests {
         serde_json::from_str(json).expect("filter parses")
     }
 
+    /// The next text frame within `within`, skipping the server's heartbeat Pings; `None` on timeout.
+    async fn next_text<S>(ws: &mut S, within: Duration) -> Option<String>
+    where
+        S: futures_util::StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        timeout(within, async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(WsMessage::Text(t))) => return t.to_string(),
+                    Some(Ok(_)) => continue,
+                    other => panic!("stream ended: {other:?}"),
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
     #[test]
     fn venue_matches_case_insensitively() {
         // The wire venue is `Phoenix`; a filter spelled any case must still select it (the
         // PROTOCOL.md example historically showed `PHOENIX`, which would silently drop the feed
         // under an exact match).
-        assert!(filter(r#"{"venue":"PHOENIX"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
-        assert!(filter(r#"{"venue":"phoenix"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
-        assert!(filter(r#"{"venue":"PHOENIX"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
+        assert!(filter(r#"{"venue":"PHOENIX"}"#).matches(2, "PHOENIX", Some("BTC"), None, "quote"));
+        assert!(filter(r#"{"venue":"phoenix"}"#).matches(2, "PHOENIX", Some("BTC"), None, "quote"));
+        assert!(filter(r#"{"venue":"PHOENIX"}"#).matches(2, "PHOENIX", Some("BTC"), None, "quote"));
         assert!(!filter(r#"{"venue":"HYPERLIQUID"}"#).matches(
+            2,
             "PHOENIX",
             Some("BTC"),
             None,
@@ -1065,47 +1129,47 @@ mod tests {
 
     #[test]
     fn omitted_field_matches_any_symbol_exact() {
-        assert!(filter("{}").matches("PHOENIX", Some("BTC"), None, "quote")); // {} = everything
-        assert!(filter(r#"{"symbol":"BTC"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
+        assert!(filter("{}").matches(2, "PHOENIX", Some("BTC"), None, "quote")); // {} = everything
+        assert!(filter(r#"{"symbol":"BTC"}"#).matches(2, "PHOENIX", Some("BTC"), None, "quote"));
         // symbol stays exact
-        assert!(!filter(r#"{"symbol":"btc"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
+        assert!(!filter(r#"{"symbol":"btc"}"#).matches(2, "PHOENIX", Some("BTC"), None, "quote"));
     }
 
     /// The omitted-field-matches-anything rule must survive the two new dimensions.
     #[test]
     fn empty_filter_still_matches_everything() {
         let f = filter("{}");
-        assert!(f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "book"));
-        assert!(f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
-        assert!(f.matches("KALSHI", None, None, "status"));
+        assert!(f.matches(3, "KALSHI", Some("KXBTCPERP"), Some(2), "book"));
+        assert!(f.matches(1, "HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(f.matches(3, "KALSHI", None, None, "status"));
     }
 
     #[test]
     fn type_filter_selects_one_message_kind() {
         let f = filter(r#"{"type":"book"}"#);
-        assert!(f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "book"));
-        assert!(!f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "quote"));
+        assert!(f.matches(3, "KALSHI", Some("KXBTCPERP"), Some(2), "book"));
+        assert!(!f.matches(3, "KALSHI", Some("KXBTCPERP"), Some(2), "quote"));
     }
 
     /// `type` is matched exactly, like `symbol`: the wire values are a closed set the protocol
     /// defines, so a near-miss is a client bug worth surfacing as "no data" rather than guessing.
     #[test]
     fn type_filter_is_exact() {
-        assert!(!filter(r#"{"type":"BOOK"}"#).matches("KALSHI", Some("X"), None, "book"));
+        assert!(!filter(r#"{"type":"BOOK"}"#).matches(3, "KALSHI", Some("X"), None, "book"));
     }
 
     #[test]
     fn channel_filter_selects_one_channel() {
         let f = filter(r#"{"channel":2}"#);
-        assert!(f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "book"));
-        assert!(!f.matches("KALSHI", Some("KXBTCPERP"), Some(1), "book"));
+        assert!(f.matches(3, "KALSHI", Some("KXBTCPERP"), Some(2), "book"));
+        assert!(!f.matches(3, "KALSHI", Some("KXBTCPERP"), Some(1), "book"));
     }
 
     /// An explicit channel filter must not pass a message that carries no channel — otherwise
     /// `{"channel":2}` would receive every quote on every venue.
     #[test]
     fn channel_filter_excludes_channelless_messages() {
-        assert!(!filter(r#"{"channel":2}"#).matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(!filter(r#"{"channel":2}"#).matches(1, "HYPERLIQUID", Some("SOL"), None, "quote"));
     }
 
     /// `instrument` carries its own channel, so it is filtered like `book`: a channel-scoped client
@@ -1113,15 +1177,37 @@ mod tests {
     #[test]
     fn channel_filter_selects_one_channels_instrument_definitions() {
         let f = filter(r#"{"channel":2}"#);
-        assert!(f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "instrument"));
-        assert!(!f.matches("KALSHI", Some("KXETHPERP"), Some(1), "instrument"));
+        assert!(f.matches(3, "KALSHI", Some("KXBTCPERP"), Some(2), "instrument"));
+        assert!(!f.matches(3, "KALSHI", Some("KXETHPERP"), Some(1), "instrument"));
         // `symbol` still narrows instruments independently of the channel.
         assert!(!filter(r#"{"channel":2,"symbol":"SOL"}"#).matches(
+            3,
             "KALSHI",
             Some("KXBTCPERP"),
             Some(2),
             "instrument"
         ));
+    }
+
+    /// Several Source IDs share one name (Binance's perps 6 and spot 8 are both `BINANCE`, and both
+    /// list `BTCUSDT`). A `source_id` filter selects one engine on every kind, `status` included; a
+    /// `venue`-only filter still matches both.
+    #[test]
+    fn source_id_filter_selects_one_engine_under_a_shared_name() {
+        let spot = filter(r#"{"venue":"BINANCE","source_id":8}"#);
+        for kind in ["quote", "trade", "instrument"] {
+            assert!(spot.matches(8, "BINANCE", Some("BTCUSDT"), Some(1), kind));
+            assert!(
+                !spot.matches(6, "BINANCE", Some("BTCUSDT"), Some(0), kind),
+                "{kind}"
+            );
+        }
+        assert!(spot.matches(8, "BINANCE", None, None, "status"));
+        assert!(!spot.matches(6, "BINANCE", None, None, "status"));
+
+        let venue = filter(r#"{"venue":"BINANCE"}"#);
+        assert!(venue.matches(6, "BINANCE", Some("BTCUSDT"), Some(0), "quote"));
+        assert!(venue.matches(8, "BINANCE", Some("BTCUSDT"), Some(1), "quote"));
     }
 
     /// `status` is venue-level: no symbol and no channel, so it matches on venue and type alone —
@@ -1130,15 +1216,15 @@ mod tests {
     #[test]
     fn status_matches_on_venue_despite_symbol_and_channel_filters() {
         let f = filter(r#"{"venue":"KALSHI","symbol":"KXBTCPERP","channel":2}"#);
-        assert!(f.matches("KALSHI", None, None, "status"));
-        assert!(!f.matches("HYPERLIQUID", None, None, "status"));
+        assert!(f.matches(3, "KALSHI", None, None, "status"));
+        assert!(!f.matches(1, "HYPERLIQUID", None, None, "status"));
     }
 
     /// ...but an explicit `type` filter still excludes it, so a consumer that asked for `book` only
     /// does not get status frames it never requested.
     #[test]
     fn type_filter_still_excludes_status() {
-        assert!(!filter(r#"{"type":"book"}"#).matches("KALSHI", None, None, "status"));
+        assert!(!filter(r#"{"type":"book"}"#).matches(3, "KALSHI", None, None, "status"));
     }
 
     /// The venue's committed slot is omitted while unknown, never sent as a placeholder: a consumer
@@ -1227,9 +1313,30 @@ mod tests {
         );
     }
 
+    /// A book frame is filtered on the same `source_id` its bootstrap is: the replay key's. Past the
+    /// unregistered-source cap that key collapses every ID to `0`, so a live frame filtered on its
+    /// wire id would reach a `{"source_id":N}` subscriber whose bootstrap `replay_scoped` refused.
+    #[test]
+    fn a_book_frame_filters_on_its_replay_keys_source_id() {
+        use super::prepare;
+        let unregistered = crate::ingest::sources::UNREGISTERED;
+        let mut b = book_batch("X", Vec::new(), true);
+        b.venue = unregistered.into();
+        b.source_name = unregistered.into();
+        b.source_id = 4242;
+        let f = prepare(&FeedMessage::Book(b)).expect("serializes");
+        assert_eq!(f.book_market.as_ref().map(|k| k.0.id()), Some(0));
+        assert_eq!(f.source_id, 0, "the replay key's id, not the wire's");
+
+        let mut q = sample_quote();
+        q.source_id = 4242;
+        let f = prepare(&FeedMessage::Quote(q)).expect("serializes");
+        assert_eq!(f.source_id, 4242, "a non-book frame keeps its wire id");
+    }
+
     #[test]
     fn venue_stays_case_insensitive() {
-        assert!(filter(r#"{"venue":"kalshi"}"#).matches("KALSHI", Some("X"), None, "book"));
+        assert!(filter(r#"{"venue":"kalshi"}"#).matches(3, "KALSHI", Some("X"), None, "book"));
     }
 
     /// Poll `cond` until it holds, failing the test if it doesn't within ~2s. The metric updates we
@@ -1460,26 +1567,6 @@ mod tests {
             .await
             .unwrap();
 
-        // The next text frame, skipping the server's heartbeat Pings.
-        async fn next_text<S>(ws: &mut S, within: Duration) -> Option<String>
-        where
-            S: futures_util::StreamExt<
-                    Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
-                > + Unpin,
-        {
-            timeout(within, async {
-                loop {
-                    match ws.next().await {
-                        Some(Ok(WsMessage::Text(t))) => return t.to_string(),
-                        Some(Ok(_)) => continue,
-                        other => panic!("stream ended: {other:?}"),
-                    }
-                }
-            })
-            .await
-            .ok()
-        }
-
         // Connect-time replay is unfiltered: both definitions arrive.
         let mut connect_replay = Vec::new();
         for _ in 0..2 {
@@ -1530,6 +1617,133 @@ mod tests {
             None,
             "a re-subscribe must not replay again"
         );
+
+        srv.abort();
+    }
+
+    /// The `source_id` dimension runs on the replay path and the live path alike: a subscriber for
+    /// one engine of a shared name is bootstrapped with that engine's definition alone, and then
+    /// receives that engine's `quote` and `status` and not its sibling's. `#[serial]` for the shared
+    /// `dz_ws_clients` gauge.
+    #[tokio::test]
+    #[serial]
+    async fn source_id_subscription_scopes_replay_and_live_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
+
+        let mut defs = HashMap::new();
+        for (source_id, channel) in [(6u16, 0u8), (8, 1)] {
+            defs.insert(
+                (
+                    crate::model::SourceKey::new(source_id, "BINANCE".into()),
+                    Arc::<str>::from("default"),
+                    channel,
+                    7u32,
+                ),
+                NormalizedInstrument {
+                    tick_size: 0,
+                    venue: "BINANCE".into(),
+                    source_name: "BINANCE".into(),
+                    source_id,
+                    symbol: "BTCUSDT".into(),
+                    channel,
+                    instrument_id: 7,
+                    category: "default".into(),
+                    price_exponent: -2,
+                    qty_exponent: -2,
+                },
+            );
+        }
+        let instruments = Arc::new(Mutex::new(defs));
+        let depth = Arc::new(Mutex::new(HashMap::new()));
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 16,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
+            bootstrap_release_deadline: super::BOOTSTRAP_RELEASE_DEADLINE,
+        };
+        let books = Arc::new(Mutex::new(BookReplay::default()));
+        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        // The unfiltered connect replay carries both engines' definitions.
+        for _ in 0..2 {
+            next_text(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("replayed instrument");
+        }
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"venue":"BINANCE","source_id":8}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        let replayed = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("scoped replay frame");
+        // Parsed rather than substring-matched: `"source_id":8` is also a prefix of `"source_id":80`.
+        let source_id_of = |t: &str| {
+            serde_json::from_str::<serde_json::Value>(t).expect("json")["source_id"].as_u64()
+        };
+        assert!(
+            replayed.contains("\"instrument\"") && source_id_of(&replayed) == Some(8),
+            "got {replayed}"
+        );
+        assert_eq!(
+            next_text(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "the other engine's definition must not be replayed"
+        );
+
+        let quote = |source_id| {
+            FeedMessage::Quote(NormalizedQuote {
+                venue: "BINANCE".into(),
+                source_name: "BINANCE".into(),
+                source_id,
+                symbol: "BTCUSDT".into(),
+                bid: 1.0,
+                ask: 2.0,
+                bid_size: 1.0,
+                ask_size: 1.0,
+                bid_n: 0,
+                ask_n: 0,
+                source_ts_ns: 1,
+                recv_ts_ns: 1,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            })
+        };
+        let status = |source_id| {
+            FeedMessage::Status(crate::model::FeedStatus {
+                venue: "BINANCE".into(),
+                source_name: "BINANCE".into(),
+                source_id,
+                state: "down".to_string(),
+                stale_ms: 1,
+                ts_ns: 1,
+            })
+        };
+        for msg in [quote(6), status(6), quote(8), status(8)] {
+            tx.send(Arc::new(msg)).unwrap();
+        }
+        let mut live = Vec::new();
+        while let Some(t) = next_text(&mut ws, Duration::from_millis(300)).await {
+            live.push(t);
+        }
+        assert_eq!(live.len(), 2, "only engine 8's quote and status: {live:?}");
+        assert!(live.iter().all(|t| source_id_of(t) == Some(8)), "{live:?}");
 
         srv.abort();
     }
@@ -1594,25 +1808,6 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
             .unwrap();
-
-        async fn next_text<S>(ws: &mut S, within: Duration) -> Option<String>
-        where
-            S: futures_util::StreamExt<
-                    Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
-                > + Unpin,
-        {
-            timeout(within, async {
-                loop {
-                    match ws.next().await {
-                        Some(Ok(WsMessage::Text(t))) => return t.to_string(),
-                        Some(Ok(_)) => continue,
-                        other => panic!("stream ended: {other:?}"),
-                    }
-                }
-            })
-            .await
-            .ok()
-        }
 
         // Connect-time replay has no subscriptions to scope by: both definitions arrive.
         for _ in 0..2 {
@@ -3842,10 +4037,10 @@ mod tests {
             serde_json::from_str(r#"{"source_name":"HYPERLIQUID"}"#).unwrap();
         for kind in ["quote", "trade", "status"] {
             assert_eq!(
-                by_venue.matches("HYPERLIQUID", Some("SOL"), None, kind),
-                by_source.matches("HYPERLIQUID", Some("SOL"), None, kind),
+                by_venue.matches(1, "HYPERLIQUID", Some("SOL"), None, kind),
+                by_source.matches(1, "HYPERLIQUID", Some("SOL"), None, kind),
             );
-            assert!(!by_source.matches("PHOENIX", Some("SOL"), None, kind));
+            assert!(!by_source.matches(2, "PHOENIX", Some("SOL"), None, kind));
         }
     }
 
@@ -3853,7 +4048,7 @@ mod tests {
     #[test]
     fn a_source_name_filter_is_case_insensitive() {
         let f: SubFilter = serde_json::from_str(r#"{"source_name":"HYPERLIQUID"}"#).unwrap();
-        assert!(f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(f.matches(1, "HYPERLIQUID", Some("SOL"), None, "quote"));
     }
 
     /// Both keys present and disagreeing must match nothing — silently honouring one would make a
@@ -3862,8 +4057,8 @@ mod tests {
     fn disagreeing_source_name_and_venue_keys_match_nothing() {
         let f: SubFilter =
             serde_json::from_str(r#"{"venue":"HYPERLIQUID","source_name":"PHOENIX"}"#).unwrap();
-        assert!(!f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
-        assert!(!f.matches("PHOENIX", Some("SOL"), None, "quote"));
+        assert!(!f.matches(1, "HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(!f.matches(2, "PHOENIX", Some("SOL"), None, "quote"));
     }
 
     /// The pre-rename `source` key still narrows, and — the reason it is its own field rather than a
@@ -3873,18 +4068,18 @@ mod tests {
     #[test]
     fn the_retired_source_key_narrows_and_composes_with_the_new_one() {
         let retired: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
-        assert!(retired.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
-        assert!(!retired.matches("PHOENIX", Some("SOL"), None, "quote"));
+        assert!(retired.matches(1, "HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(!retired.matches(2, "PHOENIX", Some("SOL"), None, "quote"));
 
         let both: SubFilter =
             serde_json::from_str(r#"{"source":"HYPERLIQUID","source_name":"HYPERLIQUID"}"#)
                 .expect("both spellings must parse, not collide");
-        assert!(both.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(both.matches(1, "HYPERLIQUID", Some("SOL"), None, "quote"));
 
         // ANDed like `venue`, so a disagreeing pair matches nothing rather than honouring one.
         let disagreeing: SubFilter =
             serde_json::from_str(r#"{"source":"HYPERLIQUID","source_name":"PHOENIX"}"#).unwrap();
-        assert!(!disagreeing.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
-        assert!(!disagreeing.matches("PHOENIX", Some("SOL"), None, "quote"));
+        assert!(!disagreeing.matches(1, "HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(!disagreeing.matches(2, "PHOENIX", Some("SOL"), None, "quote"));
     }
 }

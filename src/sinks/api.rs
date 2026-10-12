@@ -406,7 +406,8 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         "instrument_id": i.instrument_id,
         "price_increment": price_increment_string(i.tick_size, i.price_exponent),
         "base_increment": increment_string(i.qty_exponent),
-        "status": if state.health.venue_up(i.venue.as_ref()) { "online" } else { "offline" },
+        // The product's own engine: two Source IDs sharing one name keep separate health.
+        "status": if state.health.source_up(feeds(), i.venue.as_ref(), i.source_id) { "online" } else { "offline" },
     });
     let (feed_kind, book_complete) = feed_kind_for(state, i);
     entry["feed_kind"] = json!(feed_kind);
@@ -492,16 +493,25 @@ fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> (&'static str, O
             return ("market_by_order", None);
         }
     }
-    let kinds: HashSet<FeedKind> = feeds()
+    (registry_kind(feeds(), &i.venue, &i.category), None)
+}
+
+/// The registry rung of [`feed_kind_for`]: the one kind the rows of `(venue, category)` carry, or
+/// `"unknown"` when they carry several (or none). Filtered by category and not by venue alone,
+/// because one venue can hold universes whose rows differ: a venue-wide filter would see every
+/// universe's kinds together and report `"unknown"` for a category that has exactly one. A pure
+/// function of the rows so that is testable without depending on what the production document
+/// happens to hold.
+fn registry_kind(rows: &[Feed], venue: &str, category: &str) -> &'static str {
+    let kinds: HashSet<FeedKind> = rows
         .iter()
-        .filter(|f| f.venue == i.venue.as_ref() && f.category == i.category.as_ref())
+        .filter(|f| f.venue == venue && f.category == category)
         .map(|f| f.kind)
         .collect();
-    let kind = match kinds.len() {
+    match kinds.len() {
         1 => feed_kind_label(*kinds.iter().next().expect("len() == 1")),
         _ => "unknown",
-    };
-    (kind, None)
+    }
 }
 
 fn feed_kind_label(kind: FeedKind) -> &'static str {
@@ -1022,18 +1032,7 @@ fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
 // ---------------------------------------------------------------------------------------------
 
 fn status(state: &ApiState) -> Response {
-    let mut venues: Vec<&'static str> = feeds().iter().map(|f| f.venue).collect();
-    venues.sort_unstable();
-    venues.dedup();
-    let venues_json: Vec<Value> = venues
-        .iter()
-        .map(|v| {
-            json!({
-                "venue": v,
-                "status": if state.health.venue_up(v) { "online" } else { "offline" },
-            })
-        })
-        .collect();
+    let venues_json = venues_block(feeds(), &state.health);
 
     let history_json = {
         let stats = crate::model::lock(&state.history).stats();
@@ -1058,6 +1057,29 @@ fn status(state: &ApiState) -> Response {
         "process": process_block(),
         "registry": registry_block(),
     }))
+}
+
+/// The `venues` block: one entry per status key (`health::StatusKey`). A row that declares its
+/// Source ID gets its own entry carrying `source_id`, so two engines sharing a name report
+/// separately; rows that declare none share the name-level entry, exactly as before.
+fn venues_block(rows: &[Feed], health: &crate::ingest::health::FeedHealth) -> Vec<Value> {
+    let mut keys: Vec<(&'static str, Option<u16>)> =
+        rows.iter().map(|f| (f.venue, f.source_id)).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys.into_iter()
+        .map(|key| {
+            let mut entry = json!({
+                "venue": key.0,
+                "status": if health.status_up(key) { "online" } else { "offline" },
+            });
+            // Additive, and absent for a name-level entry: an older `doublezero-edge` ignores it.
+            if let Some(id) = key.1 {
+                entry["source_id"] = json!(id);
+            }
+            entry
+        })
+        .collect()
 }
 
 /// The `registry` block: which feed-registry document this process resolved (a URL, a bind-mounted
@@ -1547,7 +1569,11 @@ mod tests {
             .lock()
             .unwrap()
             .insert(("HYPERLIQUID".into(), "perps".into(), 0u8, 41u32), btc);
-        health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
+        health.register(
+            ("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001),
+            None,
+            |_| {},
+        );
 
         let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products")).await.unwrap();
@@ -1837,6 +1863,8 @@ mod tests {
             role,
             publisher,
             mirror_offset: None,
+            declared_source_id: None,
+            per_channel: false,
         };
         let mut proc = MbpProcessor::new(Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
@@ -3140,7 +3168,11 @@ mod tests {
             ("PHOENIX".into(), "perps".into(), 0u8, 7u32),
             inst_in("perps", 2, "PHOENIX", "SOL", 0, 7, -3, -4),
         );
-        health.register(("PHOENIX", "perps", FeedKind::TopOfBook, 9201), |_| {});
+        health.register(
+            ("PHOENIX", "perps", FeedKind::TopOfBook, 9201),
+            None,
+            |_| {},
+        );
 
         let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products/PHOENIX:SOL"))
@@ -3594,7 +3626,11 @@ mod tests {
     #[tokio::test]
     async fn status_reports_venue_health_and_history_counters() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
-        health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
+        health.register(
+            ("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001),
+            None,
+            |_| {},
+        );
         {
             let mut store = history.lock().unwrap();
             let now = crate::model::now_ns() / 1_000_000_000;
@@ -3657,16 +3693,45 @@ mod tests {
         assert_eq!(r["receivers"], expected.receivers);
     }
 
+    /// The registry rung filters by `(venue, category)`, not by venue: on a made-up venue whose
+    /// `single` category carries one kind and whose `mixed` sibling carries two, `single` resolves
+    /// and `mixed` does not. A venue-wide filter would see three rows and two kinds and report
+    /// `"unknown"` for both, which is exactly what this would then catch.
+    #[test]
+    fn registry_kind_filters_by_category_not_by_venue() {
+        let row = |category, kind| Feed {
+            venue: "V",
+            category,
+            code: "c",
+            kind,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 99),
+            publishers: &[],
+            emit_trades: false,
+            arbitration: crate::ingest::feeds::ArbitrationMode::Sticky,
+            mirror_offset: None,
+            shared_batch_id: false,
+            source_id: None,
+        };
+        let rows = [
+            row("single", FeedKind::MarketByPrice),
+            row("mixed", FeedKind::TopOfBook),
+            row("mixed", FeedKind::MarketByPrice),
+        ];
+        assert_eq!(registry_kind(&rows, "V", "single"), "market_by_price");
+        assert_eq!(registry_kind(&rows, "V", "mixed"), "unknown");
+        assert_eq!(registry_kind(&rows, "V", "absent"), "unknown");
+        assert_eq!(registry_kind(&rows, "OTHER", "single"), "unknown");
+    }
+
     /// Pins all four rungs of `feed_kind_for`'s derivation ladder against one snapshot: a
     /// `BookSnapshot` entry wins outright; failing that a `DepthSnapshot` entry; failing that, the
-    /// registry rung filtered by `(venue, category)` — Kalshi's `events` category carries exactly
+    /// registry rung filtered by `(venue, category)` — Binance's `usdsm` category carries exactly
     /// one `FEEDS` kind and resolves it; and `"unknown"` — never a guess — for Kalshi's `perps`
     /// and Phoenix's `perps` categories, which genuinely carry two (Top-of-Book +
-    /// Market-by-Price) with no evidence yet for this exact identity. A fixture with only one
-    /// category per venue could not express the difference the `(venue, category)` filter makes:
-    /// a venue-wide filter would see Kalshi's four rows together (three kinds across two
-    /// categories) and report `"unknown"` for `events` too, which would be a false negative for
-    /// the very venue this fix targets.
+    /// Market-by-Price) with no evidence yet for this exact identity. Whether that rung filters by
+    /// `(venue, category)` rather than by venue is pinned by `registry_kind_filters_by_category_not_by_venue`
+    /// instead: the production rows no longer hold a category whose kinds differ from its venue's,
+    /// so no assertion here would notice a venue-wide filter.
     #[tokio::test]
     async fn feed_kind_ladder_prefers_book_then_depth_then_registry_then_unknown() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
@@ -3689,8 +3754,8 @@ mod tests {
                 inst_in("perps", 3, "KALSHI", "UNRESOLVED", 9, 4, -4, -2),
             );
             map.insert(
-                ("KALSHI".into(), "events".into(), 20u8, 5u32),
-                inst_in("events", 3, "KALSHI", "SINGLE_CATEGORY", 20, 5, -4, -2),
+                ("BINANCE".into(), "usdsm".into(), 0u8, 5u32),
+                inst_in("usdsm", 6, "BINANCE", "SINGLE_CATEGORY", 0, 5, -4, -2),
             );
         }
         books.lock().unwrap().insert(
@@ -3750,9 +3815,9 @@ mod tests {
         );
         assert_eq!(
             kind_of("SINGLE_CATEGORY"),
-            "market_by_price",
-            "Kalshi's events category has exactly one FEEDS kind, distinct from its ambiguous \
-             perps category on the same venue"
+            "top_of_book",
+            "Binance's usdsm category has exactly one FEEDS kind, distinct from its spot category \
+             under the same name"
         );
     }
 
@@ -3907,7 +3972,7 @@ mod tests {
     fn sports_row() -> Feed {
         *feeds()
             .iter()
-            .find(|f| f.category == "events")
+            .find(|f| f.code == "edge-kalshi-sports-mbp")
             .expect("the built-in registry has an events row")
     }
 
@@ -4019,7 +4084,11 @@ mod tests {
             .find(|p| p.channel == Some(10))
             .expect("fixture sanity: the sports row carries channel 10")
             .base_port();
-        health.register((row.venue, row.category, row.kind, base_port_10), |_| {});
+        health.register(
+            (row.venue, row.category, row.kind, base_port_10),
+            None,
+            |_| {},
+        );
         // Channel 11 is admitted but nothing ever registers for it — the "subscribed group, dead
         // or not-yet-bound receiver" case `ingest::health::TapeLiveness::Unregistered` exists for.
         // Channel 12 is excluded by the filter outright; nothing registers for it either.
@@ -4154,6 +4223,72 @@ mod tests {
         }
     }
 
+    /// Two engines under one name, each row declaring its Source ID: `/v1/status` lists one entry
+    /// per engine, each with its own state, and a row declaring none keeps the name-level entry.
+    #[test]
+    fn venues_lists_engines_sharing_a_name_separately() {
+        use crate::ingest::health::FeedHealth;
+        const TOB: &[FeedPublisher] = &[FeedPublisher {
+            ports: FeedPorts::TwoPort {
+                mktdata: 30001,
+                refdata: 30002,
+            },
+            channel: None,
+            label: None,
+        }];
+        let engine = |category, source_id| Feed {
+            venue: "BINANCE",
+            category,
+            code: "c",
+            kind: FeedKind::TopOfBook,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 23),
+            publishers: TOB,
+            emit_trades: true,
+            arbitration: crate::ingest::feeds::ArbitrationMode::Sticky,
+            mirror_offset: None,
+            shared_batch_id: false,
+            source_id,
+        };
+        let rows = [
+            engine("usdsm", Some(6)),
+            engine("spot", Some(8)),
+            Feed {
+                venue: "HYPERLIQUID",
+                ..engine("perps", None)
+            },
+        ];
+        let health = FeedHealth::new();
+        health.register(
+            ("BINANCE", "usdsm", FeedKind::TopOfBook, 30001),
+            Some(6),
+            |_| {},
+        );
+        health.register(
+            ("BINANCE", "spot", FeedKind::TopOfBook, 30001),
+            Some(8),
+            |_| {},
+        );
+        health.register(
+            ("HYPERLIQUID", "perps", FeedKind::TopOfBook, 30001),
+            None,
+            |_| {},
+        );
+        health.set(
+            ("BINANCE", "spot", FeedKind::TopOfBook, 30001),
+            false,
+            |_| {},
+        );
+
+        assert_eq!(
+            venues_block(&rows, &health),
+            vec![
+                json!({"venue": "BINANCE", "status": "online", "source_id": 6}),
+                json!({"venue": "BINANCE", "status": "offline", "source_id": 8}),
+                json!({"venue": "HYPERLIQUID", "status": "online"}),
+            ]
+        );
+    }
+
     /// A channel this row's publisher was given a `label` for must report it verbatim; a sibling
     /// channel with none must have the field **absent** (`get` returns `None`), not present as
     /// `null` — a client's `#[serde(default)]` only stays honest if the two states are visibly
@@ -4176,6 +4311,7 @@ mod tests {
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
             shared_batch_id: false,
+            source_id: None,
         };
         let enabled = vec![row];
 
@@ -4251,6 +4387,7 @@ mod tests {
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
             shared_batch_id: false,
+            source_id: None,
         };
         let sports_row = Feed {
             venue: "KALSHI",
@@ -4263,6 +4400,7 @@ mod tests {
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
             shared_batch_id: false,
+            source_id: None,
         };
         let enabled = vec![perps_row, sports_row];
 
@@ -4359,6 +4497,7 @@ mod tests {
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
             shared_batch_id: false,
+            source_id: None,
         };
         let enabled = vec![row];
 
@@ -4421,6 +4560,7 @@ mod tests {
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
             shared_batch_id: false,
+            source_id: None,
         };
         let enabled = vec![row];
 

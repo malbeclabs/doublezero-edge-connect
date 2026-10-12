@@ -82,6 +82,15 @@ pub enum RegistryError {
         field: &'static str,
     },
     UnknownVenue(String),
+    /// A row declares a `source_id` the resolving `sources` table does not assign to its `venue` —
+    /// unassigned, or assigned to another name.
+    SourceIdMismatch {
+        venue: String,
+        category: String,
+        source_id: u16,
+        /// What the table names that ID, if anything.
+        assigned: Option<String>,
+    },
     /// A `sources` row carries no `name`, or a name that is not the uppercase form consumers see.
     BadSourceName {
         id: u16,
@@ -144,6 +153,21 @@ pub enum RegistryError {
         category: String,
         kind: &'static str,
     },
+    /// Two rows of one `(venue, category)` declare different Source IDs (or one declares an ID and
+    /// the other none). Rows sharing a category are one universe to tape ownership and the book
+    /// authority, so two engines there would contest one tape and one row would mute the other's
+    /// trades.
+    SourceIdDisagreement {
+        venue: String,
+        category: String,
+    },
+    /// Two tape-claiming rows of one `(venue, category)` disagree on shape: one derives a port per
+    /// channel and the other shares one port block. Tape ownership pairs derived rows per channel and
+    /// shared-block rows per category, so a mix would elect an owner on each and print twice.
+    MixedChannelShape {
+        venue: String,
+        category: String,
+    },
     /// A row's `emit_trades` contradicts whether its kind can ever own a tape.
     EmitTradesDisagrees {
         venue: String,
@@ -200,6 +224,24 @@ impl std::fmt::Display for RegistryError {
                 "venue `{v}` resolves to no Source ID; its messages would be dropped and its \
                  status feed would go unrecorded"
             ),
+            RegistryError::SourceIdMismatch {
+                venue,
+                category,
+                source_id,
+                assigned,
+            } => match assigned {
+                Some(name) => write!(
+                    f,
+                    "{venue}/{category}: `source_id` {source_id} is assigned to `{name}`, not \
+                     `{venue}`; the row's health and status would report under another venue's \
+                     engine"
+                ),
+                None => write!(
+                    f,
+                    "{venue}/{category}: `source_id` {source_id} is not assigned in the `sources` \
+                     table; its traffic would be labelled unregistered"
+                ),
+            },
             RegistryError::EmptyPublishedSet { venue, category } => {
                 write!(f, "{venue}/{category}: derived published set is empty")
             }
@@ -234,6 +276,18 @@ impl std::fmt::Display for RegistryError {
                 f,
                 "{venue}/{category}: two `{kind}` rows share one identity; the second would be \
                  dropped by feed selection and never bound"
+            ),
+            RegistryError::SourceIdDisagreement { venue, category } => write!(
+                f,
+                "{venue}/{category}: rows declare different `source_id`s; rows sharing a category \
+                 are one universe to tape ownership, so one engine's row would mute the other's \
+                 trades — give each engine its own category"
+            ),
+            RegistryError::MixedChannelShape { venue, category } => write!(
+                f,
+                "{venue}/{category}: tape-claiming rows mix a per-channel (`derived`) shape with a \
+                 shared port block; tape ownership pairs the first per channel and the second per \
+                 category, so each would elect its own owner and the tape would print twice"
             ),
             RegistryError::ArbitrationDisagreement { venue } => write!(
                 f,
@@ -383,6 +437,11 @@ struct FeedRow {
     /// becomes downstream.
     #[serde(default)]
     publisher_offset: Option<u8>,
+    /// The Source ID this row's publishers stamp. Optional so every existing document still loads,
+    /// and an older binary ignores it (no `deny_unknown_fields`) rather than refusing the document.
+    /// See [`crate::ingest::feeds::Feed::source_id`].
+    #[serde(default)]
+    source_id: Option<u16>,
     #[serde(default)]
     #[allow(dead_code)]
     notes: serde_json::Value,
@@ -715,6 +774,15 @@ fn build(text: &str, origin: &str) -> Result<Loaded, RegistryError> {
         rows.push(feed_from(row, sources)?);
     }
     check_cross_row_invariants(&rows)?;
+    let table = sources.unwrap_or_else(sources::assignments);
+    for (venue, category) in undeclared_shared_rows(&rows, table) {
+        info!(
+            venue,
+            category,
+            "feed registry row declares no source_id although several Source IDs share its \
+             venue name; its engines' health and status are reported together under the name"
+        );
+    }
 
     Ok(Loaded {
         rows: Box::leak(rows.into_boxed_slice()),
@@ -722,6 +790,29 @@ fn build(text: &str, origin: &str) -> Result<Loaded, RegistryError> {
         origin: origin.to_string(),
         version: doc.version,
     })
+}
+
+/// The `(venue, category)` of every row that declares no `source_id` although the resolving table
+/// gives its venue name several Source IDs — the rows whose engines `FeedHealth` cannot tell apart,
+/// so one engine streaming masks another's outage under the shared name.
+///
+/// Reported, not refused (#187): the hosted Hyperliquid rows are such rows today, and declaring 7 on
+/// `xyz-perps` would contradict a wire that still stamps 1 on the builder DEX too. Refusing them is
+/// the follow-up once the publishers stamp one id per engine and their fragments declare it — and
+/// infra's validator has to refuse them first.
+fn undeclared_shared_rows(
+    rows: &[Feed],
+    table: &[SourceAssignment],
+) -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&'static str, &'static str)> = rows
+        .iter()
+        .filter(|f| f.source_id.is_none())
+        .filter(|f| table.iter().filter(|a| a.name == f.venue).count() > 1)
+        .map(|f| (f.venue, f.category))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Names `sources::source_label` synthesizes for an unassigned Source ID, so a block may not claim
@@ -828,6 +919,10 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
     let mut triples = std::collections::HashSet::new();
     let mut modes: std::collections::HashMap<&str, ArbitrationMode> =
         std::collections::HashMap::new();
+    let mut declared: std::collections::HashMap<(&str, &str), Option<u16>> =
+        std::collections::HashMap::new();
+    let mut shapes: std::collections::HashMap<(&str, &str), bool> =
+        std::collections::HashMap::new();
     let mut group_ports = std::collections::HashSet::new();
     let mut mbo_categories: std::collections::HashMap<&str, &str> =
         std::collections::HashMap::new();
@@ -881,6 +976,43 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
                 venue: f.venue.to_string(),
                 category: f.category.to_string(),
             });
+        }
+
+        // Tape ownership (`reconcile::tape_owners`) and the book authority's scope key on
+        // `(venue, category)`, never on the Source ID, so rows sharing one are a single universe.
+        // Two engines declared there would contest one tape and the owning row would mute the
+        // other's trades outright. `None` against `Some` disagrees too: that is a document that
+        // declared an engine on one row of the universe and forgot its sibling.
+        match declared.entry((f.venue, f.category)) {
+            std::collections::hash_map::Entry::Occupied(e) if *e.get() != f.source_id => {
+                return Err(RegistryError::SourceIdDisagreement {
+                    venue: f.venue.to_string(),
+                    category: f.category.to_string(),
+                })
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(f.source_id);
+            }
+        }
+
+        // Tape ownership is elected per `(venue, category, channel)` for a derived row and per
+        // `(venue, category)` for a shared-block one (`reconcile::Universe`), which is only sound if
+        // a category's tape-claiming rows are all one or all the other.
+        if crate::ingest::reconcile::tape_rank_is_some(f.kind) {
+            let derived = f.publishers.iter().any(|p| p.channel.is_some());
+            match shapes.entry((f.venue, f.category)) {
+                std::collections::hash_map::Entry::Occupied(e) if *e.get() != derived => {
+                    return Err(RegistryError::MixedChannelShape {
+                        venue: f.venue.to_string(),
+                        category: f.category.to_string(),
+                    })
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(derived);
+                }
+            }
         }
 
         // `emit_trades` is a capability claim the reconciler's ranking has to agree with, in both
@@ -987,6 +1119,23 @@ fn feed_from(
     if !resolves {
         return Err(RegistryError::UnknownVenue(row.venue.clone()));
     }
+    // The name resolving is not enough once several IDs share it: with `{6, BINANCE}` alone in
+    // the table, a row declaring 8 would validate on its name and its traffic would be labelled
+    // unregistered. The declared ID must be one the same table assigns to this very name.
+    if let Some(id) = row.source_id {
+        let assigned = match sources {
+            Some(a) => a.iter().find(|s| s.id == id).map(|s| s.name),
+            None => sources::source_name(id),
+        };
+        if assigned != Some(row.venue.as_str()) {
+            return Err(RegistryError::SourceIdMismatch {
+                venue: row.venue.clone(),
+                category: row.category.clone(),
+                source_id: id,
+                assigned: assigned.map(str::to_string),
+            });
+        }
+    }
 
     // Row-level: which mirror scheme (if any) a deployment runs is a property of the feed, not of
     // whether its publishers are written out explicitly or derived — both shapes carry it the same
@@ -1033,6 +1182,7 @@ fn feed_from(
         arbitration: row.arbitration.into(),
         shared_batch_id: row.shared_batch_id,
         mirror_offset,
+        source_id: row.source_id,
     })
 }
 
@@ -1205,7 +1355,7 @@ pub(crate) fn sports_channel_ids() -> Vec<u8> {
     let row = doc
         .feeds
         .iter()
-        .find(|f| f.category == "events")
+        .find(|f| f.code == "edge-kalshi-sports-mbp")
         .expect("built-in document has no events row");
     match &row.publishers {
         Publishers::Derived(d) => published_set_entries(row, &d.channels)
@@ -1994,6 +2144,211 @@ mod tests {
         let block = r#"{"id":3,"name":"KALSHI"},{"id":4,"name":"KALSHI"}"#;
         let loaded = build(&doc_with_sources(block, SPORTS_ROW), "test").expect("loads");
         assert_eq!(loaded.sources.expect("installed").len(), 2);
+    }
+
+    /// Two engines under one name, each row declaring its own Source ID — the shape the Binance
+    /// rows take. `{source_id}` placeholders let each test vary one row.
+    fn two_engine_rows(perp_id: &str, spot_id: &str) -> String {
+        format!(
+            r#"{{
+            "venue":"BINANCE","category":"usdsm","code":"edge-binance-usdsm-tob","kind":"TopOfBook",
+            "group":"233.84.178.23","emit_trades":true,"arbitration":"Sticky"{perp_id},
+            "publishers":{{"explicit":[{{"mktdata":30001,"refdata":30002}}]}}}},{{
+            "venue":"BINANCE","category":"spot","code":"edge-binance-spot-tob","kind":"TopOfBook",
+            "group":"233.84.178.31","emit_trades":true,"arbitration":"Sticky"{spot_id},
+            "publishers":{{"explicit":[{{"mktdata":30001,"refdata":30002}}]}}}}"#
+        )
+    }
+    const BOTH_BINANCE_IDS: &str = r#"{"id":6,"name":"BINANCE"},{"id":8,"name":"BINANCE"}"#;
+
+    /// Each row carries the ID it declares, so health and status can tell the engines apart.
+    #[test]
+    fn a_row_carries_its_declared_source_id() {
+        let rows = two_engine_rows(r#","source_id":6"#, r#","source_id":8"#);
+        let loaded = build(&doc_with_sources(BOTH_BINANCE_IDS, &rows), "test").expect("loads");
+        let ids: Vec<_> = loaded
+            .rows
+            .iter()
+            .map(|f| (f.category, f.source_id))
+            .collect();
+        assert_eq!(ids, vec![("usdsm", Some(6)), ("spot", Some(8))]);
+    }
+
+    /// The name resolving is not enough: with only `{6, BINANCE}` assigned, the spot row's name
+    /// resolves while its declared ID does not, and its traffic would be labelled unregistered.
+    #[test]
+    fn a_source_id_the_block_does_not_assign_is_fatal() {
+        let rows = two_engine_rows(r#","source_id":6"#, r#","source_id":8"#);
+        let err = build(
+            &doc_with_sources(r#"{"id":6,"name":"BINANCE"}"#, &rows),
+            "test",
+        )
+        .map(|_| ())
+        .expect_err("ID 8 is unassigned");
+        assert!(
+            matches!(
+                &err,
+                RegistryError::SourceIdMismatch { category, source_id: 8, assigned: None, .. }
+                    if category == "spot"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// An ID assigned to another name would file this row's health under that venue's engine.
+    #[test]
+    fn a_source_id_assigned_to_another_venue_is_fatal() {
+        let block = format!(r#"{BOTH_BINANCE_IDS},{{"id":1,"name":"HYPERLIQUID"}}"#);
+        let rows = two_engine_rows(r#","source_id":6"#, r#","source_id":1"#);
+        let err = build(&doc_with_sources(&block, &rows), "test")
+            .map(|_| ())
+            .expect_err("ID 1 is HYPERLIQUID's");
+        assert!(
+            matches!(
+                &err,
+                RegistryError::SourceIdMismatch { source_id: 1, assigned: Some(n), .. }
+                    if n == "HYPERLIQUID"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// Rows sharing a `(venue, category)` are one universe to tape ownership, so declaring two
+    /// engines there would let one row mute the other's trades. A second row of the usdsm category
+    /// (a market-by-price sibling) declaring spot's ID is refused, and so is one declaring none.
+    #[test]
+    fn rows_of_one_category_declaring_different_source_ids_are_refused() {
+        let sibling = |id: &str| {
+            format!(
+                r#",{{
+            "venue":"BINANCE","category":"usdsm","code":"x","kind":"MarketByPrice",
+            "group":"233.84.178.40","emit_trades":true,"arbitration":"Sticky"{id},
+            "publishers":{{"explicit":[{{"mktdata":31001,"refdata":31002,"snapshot":31003}}]}}}}"#
+            )
+        };
+        let rows = two_engine_rows(r#","source_id":6"#, r#","source_id":8"#);
+        for id in [r#","source_id":8"#, ""] {
+            let doc = doc_with_sources(BOTH_BINANCE_IDS, &format!("{rows}{}", sibling(id)));
+            let err = build(&doc, "test")
+                .map(|_| ())
+                .expect_err("one universe, two engines");
+            assert!(
+                matches!(&err, RegistryError::SourceIdDisagreement { category, .. } if category == "usdsm"),
+                "{id:?}: {err:?}"
+            );
+        }
+        let doc = doc_with_sources(
+            BOTH_BINANCE_IDS,
+            &format!("{rows}{}", sibling(r#","source_id":6"#)),
+        );
+        build(&doc, "test").expect("a sibling agreeing on the ID loads");
+    }
+
+    /// A category whose tape-claiming rows mix a derived row with a shared-block one is refused:
+    /// ownership would be elected per channel for one and per category for the other, and both would
+    /// print. Two derived rows (the Kalshi events and elections pairs) load.
+    #[test]
+    fn a_category_mixing_channel_shapes_is_refused() {
+        let flat_tob = r#"{
+            "venue":"KALSHI","category":"sports","code":"t","kind":"TopOfBook",
+            "group":"233.84.178.17","emit_trades":true,"arbitration":"Sticky",
+            "publishers":{"explicit":[{"mktdata":33000,"refdata":43000}]}}"#;
+        let err = build(&doc_with(&format!("{SPORTS_ROW},{flat_tob}")), "test")
+            .map(|_| ())
+            .expect_err("a derived and a shared-block row in one category");
+        assert!(
+            matches!(&err, RegistryError::MixedChannelShape { category, .. } if category == "sports"),
+            "{err:?}"
+        );
+        let derived_tob = r#"{
+            "venue":"KALSHI","category":"sports","code":"t","kind":"TopOfBook",
+            "group":"233.84.178.17","emit_trades":true,"arbitration":"Sticky",
+            "publishers":{"derived":{"channels":[{"range":[10,12]},{"id":49}],
+                "ports":{"mktdata":35000,"refdata":45000}}}}"#;
+        build(&doc_with(&format!("{SPORTS_ROW},{derived_tob}")), "test")
+            .expect("two derived rows share a category");
+    }
+
+    /// A row is reported when its venue name has several Source IDs and it declares none — the
+    /// hosted Hyperliquid rows' state — and not when it declares one, or when its name has a
+    /// single id. Reported per `(venue, category)`, once.
+    #[test]
+    fn undeclared_rows_of_a_shared_name_are_reported() {
+        let block = r#"{"id":1,"name":"HYPERLIQUID"},{"id":7,"name":"HYPERLIQUID"},
+            {"id":6,"name":"BINANCE"},{"id":8,"name":"BINANCE"},{"id":3,"name":"KALSHI"}"#;
+        let hl = |category: &str, code: &str, group: &str| {
+            format!(
+                r#"{{"venue":"HYPERLIQUID","category":"{category}","code":"{code}",
+                "kind":"TopOfBook","group":"{group}","emit_trades":true,
+                "arbitration":"Coordinated",
+                "publishers":{{"explicit":[{{"mktdata":20000,"refdata":20001}}]}}}}"#
+            )
+        };
+        let rows = [
+            hl("hl-perps", "a", "233.84.178.27"),
+            hl("xyz-perps", "b", "233.84.178.29"),
+            two_engine_rows(r#","source_id":6"#, r#","source_id":8"#),
+            PERPS_ROW.to_string(),
+        ]
+        .join(",");
+        let loaded = build(&doc_with_sources(block, &rows), "test").expect("loads");
+        let table = loaded.sources.expect("block installed");
+        assert_eq!(
+            undeclared_shared_rows(loaded.rows, table),
+            vec![("HYPERLIQUID", "hl-perps"), ("HYPERLIQUID", "xyz-perps")],
+            "BINANCE declares its ids and KALSHI has one: neither is reported"
+        );
+    }
+
+    /// Optional: a row declaring none loads exactly as before, at the name-level status key.
+    #[test]
+    fn a_row_without_a_source_id_loads_as_before() {
+        let loaded = build(
+            &doc_with_sources(BOTH_BINANCE_IDS, &two_engine_rows("", "")),
+            "test",
+        )
+        .expect("loads");
+        assert!(loaded.rows.iter().all(|f| f.source_id.is_none()));
+    }
+
+    /// The arbitration mode is keyed by venue alone, and the two Binance engines share one. The
+    /// built-in document with its spot row switched to `Coordinated` is refused rather than having
+    /// the venue's mode depend on which row the document happens to list last.
+    #[test]
+    fn the_binance_rows_disagreeing_on_arbitration_are_refused() {
+        let spot = r#""code": "edge-binance-spot-tob","#;
+        let at = BUILT_IN.find(spot).expect("the built-in spot row");
+        let (head, tail) = BUILT_IN.split_at(at);
+        let tail = tail.replacen(
+            r#""arbitration": "Sticky""#,
+            r#""arbitration": "Coordinated""#,
+            1,
+        );
+        let err = build(&format!("{head}{tail}"), "test")
+            .map(|_| ())
+            .expect_err("two modes for BINANCE");
+        assert!(
+            matches!(&err, RegistryError::ArbitrationDisagreement { venue } if venue == "BINANCE"),
+            "{err:?}"
+        );
+    }
+
+    /// A document with no `sources` block checks the declared ID against the compiled-in table,
+    /// the same table its `venue` resolves against.
+    #[test]
+    fn with_no_block_a_source_id_is_checked_against_the_compiled_in_table() {
+        let with = |id: &str| {
+            SPORTS_ROW.replace(
+                r#""arbitration":"Sticky""#,
+                &format!(r#""arbitration":"Sticky","source_id":{id}"#),
+            )
+        };
+        let loaded = build(&doc_with(&with("3")), "test").expect("3 is KALSHI's");
+        assert_eq!(loaded.rows[0].source_id, Some(3));
+        assert!(matches!(
+            build(&doc_with(&with("2")), "test"),
+            Err(RegistryError::SourceIdMismatch { source_id: 2, .. })
+        ));
     }
 
     /// The synthesized-label namespace and the `0` sentinel are reserved: a block claiming either
