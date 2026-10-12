@@ -431,7 +431,7 @@ Modules are grouped by role under `src/`:
   `TICK_INTERVAL` (the MBP `BOUNDARY_TIMEOUT_NS`); a timeout calls `DatagramProcessor::on_tick` (no-op
   by default) and leaves the rejoin decision to the watchdog, so `MbpProcessor` closes the events a
   **silent** block left open — without it a dead single-publisher channel held every consumer's
-  open event for good. The tick fires only when the whole port block is silent.
+  open event for good. The tick fires only when the whole port block is silent. Its batches carry `DatagramCtx::synthesized`, so the book authority serves them only on the path the consumer follows and never counts them as that path being alive (`StickyAuthority::admit_synthesized`): counted as an arrival, a dead leader's close would hold off its peer's silence takeover for another `leader_timeout`.
 - **`ingest/health.rs`** — `FeedHealth`: every receiver's liveness keyed `(venue, category, kind, base port)`
   (the same tuple as `reconcile::FeedKey`; `(venue, kind)` is not an identity once a venue carries two
   universes),

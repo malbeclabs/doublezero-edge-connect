@@ -1865,6 +1865,7 @@ mod tests {
             mirror_offset: None,
             declared_source_id: None,
             per_channel: false,
+            synthesized: false,
         };
         let mut proc = MbpProcessor::new(Arc::new(std::sync::atomic::AtomicBool::new(false)));
 

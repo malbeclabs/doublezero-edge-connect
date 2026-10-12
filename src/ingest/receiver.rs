@@ -144,6 +144,9 @@ pub struct DatagramCtx<'a> {
     /// `Some`). Its prints are then tape-gated per channel, the grain the reconciler elects this
     /// receiver's tape ownership at (`reconcile::Universe`); see `Arbiter::emit_scoped`.
     pub per_channel: bool,
+    /// Built by [`DatagramProcessor::on_tick`] with no datagram behind it: what it emits is no
+    /// evidence its path is alive.
+    pub synthesized: bool,
 }
 
 impl DatagramCtx<'_> {
@@ -186,6 +189,7 @@ impl DatagramCtx<'_> {
             Transport::Edge(self.publisher),
             self.category,
             self.per_channel,
+            self.synthesized,
         );
     }
 }
@@ -1032,6 +1036,7 @@ async fn drive<P: DatagramProcessor>(
                 mirror_offset,
                 declared_source_id: source_id,
                 per_channel,
+                synthesized: false,
             };
             processor.on_datagram(&channels[idx].buf[..n], &ctx);
         }
@@ -1416,6 +1421,7 @@ mod tests {
             mirror_offset: None,
             declared_source_id: declared,
             per_channel: false,
+            synthesized: false,
         };
         let quote = |source_id, ts| {
             FeedMessage::Quote(NormalizedQuote {
@@ -1531,6 +1537,7 @@ mod tests {
             mirror_offset: None,
             declared_source_id: None,
             per_channel: false,
+            synthesized: false,
         };
         let quote = NormalizedQuote {
             venue: wire_venue.into(),

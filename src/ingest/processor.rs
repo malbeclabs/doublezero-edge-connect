@@ -3017,6 +3017,7 @@ impl DatagramProcessor for MbpProcessor {
                 mirror_offset: tick.mirror_offset,
                 declared_source_id: tick.declared_source_id,
                 per_channel: tick.per_channel,
+                synthesized: true,
             };
             if let Some(state) = self.batching.get_mut(&(publisher, channel)) {
                 state.slot_lapsed = true;
@@ -4237,6 +4238,7 @@ mod tests {
             mirror_offset: None,
             declared_source_id: None,
             per_channel: false,
+            synthesized: false,
         }
     }
 
@@ -8875,6 +8877,46 @@ mod tests {
         ));
         assert!(drain_books(&mut rx).is_empty());
         assert!(proc.batching[&(TEST_PUB, 0)].open.contains(&41));
+    }
+
+    /// The close still goes out, but the peer's takeover runs from the dead path's last datagram.
+    #[test]
+    fn mbp_a_dead_leaders_tick_close_does_not_delay_its_peers_takeover() {
+        let (arbiter, instruments, _books, [(a, mut proc_a), (b, mut proc_b)]) =
+            mbp_two_paths_on_one_id();
+        let at = |publisher, ns| {
+            let mut c = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+            c.publisher = publisher;
+            c.recv_ts_ns = ns;
+            c
+        };
+        let level = |qty| mbp_level_with_source(41, 2, MBP_BID, 6200, qty, 7_001, 1);
+        let boundary = mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+            batch_id: 900,
+            batch_time: 5,
+        });
+        proc_a.on_datagram(&mbp_wire::datagram(0, 0, 4, &[boundary]), &at(a, TICK_T0));
+        proc_a.on_datagram(
+            &mbp_wire::datagram(0, 0, 5, &[level(11)]),
+            &at(a, TICK_T0 + 1),
+        );
+        assert!(proc_a.batching[&(a, 0)].open.contains(&41), "precondition");
+
+        let tick = TICK_T0 + super::BOUNDARY_TIMEOUT_NS + 2;
+        proc_a.on_tick(&tick_at(&arbiter, &instruments, tick));
+        assert!(
+            proc_a.batching[&(a, 0)].open.is_empty(),
+            "the close went out"
+        );
+        proc_b.on_datagram(&mbp_wire::datagram(0, 0, 4, &[level(12)]), &at(b, tick));
+        let scope = (
+            crate::model::SourceKey::from_id(1),
+            category_arc("testcategory"),
+        );
+        assert_eq!(
+            lock(&arbiter).authority().scope_leader(&scope),
+            Some(Transport::Edge(b))
+        );
     }
 
     /// The datagram backstop, which is reachable only where `recv_ts_ns` is the `0` sentinel and
