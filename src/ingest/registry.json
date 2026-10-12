@@ -477,6 +477,7 @@
       "group": "233.84.178.25",
       "emit_trades": true,
       "arbitration": "Coordinated",
+      "shared_batch_id": true,
       "notes": [
         "Phoenix perpetuals, market-by-price depth, on its own group. The same publisher process as",
         "edge-phoenix-tob, so the same manifest, the same instrument ids and the same schema v3.",
@@ -485,6 +486,10 @@
         "stated there.",
         "",
         "PUBLISHERS. Three, all on these ports and channel 1 with no mirror offset, told apart by source IP address.",
+        "",
+        "SHARED BATCH ID. Every host stamps batch_id with the venue slot, so two hosts at one committed slot",
+        "hold one venue state and a failover between them needs no re-baseline when their books agree. The",
+        "rc.4 cross-host comparison agreed on 1,114 of 1,114 boundaries.",
         "",
         "TAPE. Both rows claim it: this row's mktdata role carries Trade byte-identical to the top-of-book",
         "row's. The reconciler ranks TopOfBook above MarketByPrice when both run, and the overlap at a",

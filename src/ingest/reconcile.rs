@@ -1318,6 +1318,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Coordinated,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id: None,
         }
     }
@@ -1898,6 +1899,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id: None,
         };
         let feed_b = Feed {
@@ -1910,6 +1912,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id: None,
         };
         let mut r = test_reconciler(vec![feed_a, feed_b]);
@@ -2006,6 +2009,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id: None,
         };
         let feed_sports = Feed {
@@ -2018,6 +2022,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id: None,
         };
         let mut r = test_reconciler(vec![feed_perps, feed_sports]);

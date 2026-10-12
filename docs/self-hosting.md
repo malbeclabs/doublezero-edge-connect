@@ -131,7 +131,8 @@ that host to its built-in copy, whatever the field.** The others the schema allo
 - a **`version` bump** — the loader's check is an equality test, not a floor, so a binary that
   understands `1` rejects `2` outright rather than reading what it recognizes;
 - a new **`kind`** or **`arbitration`** value — both are closed enums, so an unknown variant fails
-  the parse of the *whole document*, not of the row that carries it.
+  the parse of the *whole document*, not of the row that carries it;
+- **`shared_batch_id`** on a row with no book, or disagreeing between the book rows of one `(venue, category)`. A binary that predates the field ignores it, so declaring it correctly needs no release first; a misplaced one is refused by every binary that reads the field.
 
 So until the fleet is upgraded, a document may only use values every deployed binary already
 accepts; introducing one is a release *and* a republish, in that order.

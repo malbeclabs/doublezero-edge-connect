@@ -213,6 +213,11 @@ pub struct Feed {
     /// How this venue's mirrored publishers are arbitrated. Declared per row but consumed per
     /// venue, so a venue's rows must agree (pinned by `arbitration_mode_agrees_across_a_venues_rows`).
     pub arbitration: ArbitrationMode,
+    /// Whether this row's publishers stamp `batch_id` from one venue coordinate (Phoenix: the venue
+    /// slot), so two paths at an equal committed slot holding equal levels hold the same book and
+    /// the arbiter may hand a market between them without re-baselining. Undeclared, the arbiter
+    /// re-baselines whatever the numbers say: two paths' slots are otherwise unrelated counters.
+    pub shared_batch_id: bool,
     /// A second publisher mirrors this row's whole published set on the **same ports**, stamping every
     /// wire `channel_id` raised by this amount (`publisher_offset` in the document, a row-level
     /// field — an `explicit` row can declare it exactly like a `derived` one) — so the socket

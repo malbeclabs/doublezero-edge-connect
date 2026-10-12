@@ -523,6 +523,7 @@ mod tests {
             emit_trades: true,
             arbitration: crate::ingest::feeds::ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id: None,
         }
     }

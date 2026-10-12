@@ -665,6 +665,18 @@ Modules are grouped by role under `src/`:
   two alternates traded a market on every message, each trade a re-baseline. A hold is discarded when
   an election moves the leader, the holder goes unhealthy or silent, or the leader sends a batch while the replay entry is incomplete
   (a quiet holder would never republish it; the holder's own batch may be that republish); `dz_book_revert_holds_total{release}` counts the endings.
+  ⚠️ **A handover skips the re-baseline only where the registry declares `shared_batch_id`** (one value
+  per `(venue, category)` over the book rows, refused at load on a row with no book, installed
+  beside the arbitration mode; true on
+  `edge-phoenix-mbp` alone, whose publishers stamp the venue slot): `Arbiter::seamless_handover` then
+  compares the **replay entry** (what reached the wire; a withheld batch can make the outgoing path's
+  own accumulator differ from the consumer's book) against the incoming path's accumulator, before
+  that path's batch is folded, and requires both complete, between events, standing exactly at one
+  equal slot no lower than `wire_slot` (`BookAccumulator::exact_batch_id`: an event closed by a batch
+  naming no slot folds in under the old label, and comparing that would count a boundary lapse as a
+  divergence), and `BookAccumulator::same_state`. Undeclared, it always re-baselines: two paths'
+  slots are otherwise unrelated counters, and a false "equal" corrupts a book silently. A mismatch at
+  an equal slot counts `dz_book_path_divergence_total` and re-baselines.
   Tunables are the `--arb-*` flags (see docs/metrics.md).
   **Anything but "the path that last reached the wire for this market" re-baselines the consumer**: a
   serving-path change (margin, silence, or that health override), a market's first admission, a market
@@ -707,13 +719,13 @@ Modules are grouped by role under `src/`:
   admission slots. `dz_path_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-path phase against an unrelated earlier message, and structurally
   non-negative). The `FEEDS` rows of that kind are `edge-kalshi-perps-mbp` and `edge-phoenix-mbp`, both live; on a
-  host subscribed to neither the matcher never engages at all. Where it does, a **single-publisher row is the
-  degenerate case and the matcher's two series diverge on it**: a pair needs two paths, so `dz_path_lead_ns`
-  populates only for Kalshi's mirrored pair and never for Phoenix, while every Phoenix print still *enters* the
-  matcher (the authority tracks its one path, so `race_eligible` holds) and expires unpaired onto
-  `dz_path_unmatched_trades_total{venue="PHOENIX"}` — permanently, at the venue's whole trade rate. That series'
-  alarm reading, "the paths are barely pairing," cannot apply to a row that has one path; docs/metrics.md carries
-  the same caveat, since a dashboard alerting on the ratio would otherwise show a standing false positive.
+  host subscribed to neither the matcher never engages at all. Where it does, **pairing is two-way while
+  Phoenix carries three paths**: a print pairs its first two copies and the third expires unpaired onto
+  `dz_path_unmatched_trades_total{venue="PHOENIX"}` — permanently, at the venue's whole trade rate — and a
+  lead reaches the election only when the leader is one of the pair, so a print the leader delivered last is
+  no evidence either way. That series' alarm reading, "the paths are barely pairing," applies only to a
+  two-path row (Kalshi's); docs/metrics.md carries the same caveat, since a dashboard alerting on the ratio
+  would otherwise show a standing false positive.
 - **`ingest/public_input.rs`** — venue-generic **public WS input** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
