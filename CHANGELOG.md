@@ -502,7 +502,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
-- Registry rows may declare `shared_batch_id` (default false, one value per venue and category), set on `edge-phoenix-mbp`. In a declared scope, a book failover between paths at the same committed slot holding identical levels goes out as an ordinary delta rather than a re-baseline; a mismatch counts `dz_book_path_divergence_total{venue}` and re-baselines as before.
+- Registry rows may declare `shared_batch_id` (default false, one value per venue and category, refused on a row with no book), set on `edge-phoenix-mbp` in the built-in document only: the hosted document does not declare it yet, so a host loading that one still re-baselines every handover. In a declared scope, a book failover between paths at the same committed slot holding identical levels goes out as an ordinary delta rather than a re-baseline; a mismatch counts `dz_book_path_divergence_total{venue}` and re-baselines as before.
 - **Binance feeds: USD-margined perpetuals and spot, Top-of-Book.** Two rows in the compiled-in
   feed registry, `edge-binance-usdsm-tob` (group `233.84.178.23`, Source ID 6) and
   `edge-binance-spot-tob` (`233.84.178.31`, Source ID 8), both `BINANCE`, both on ports

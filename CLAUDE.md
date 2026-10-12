@@ -719,13 +719,13 @@ Modules are grouped by role under `src/`:
   admission slots. `dz_path_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-path phase against an unrelated earlier message, and structurally
   non-negative). The `FEEDS` rows of that kind are `edge-kalshi-perps-mbp` and `edge-phoenix-mbp`, both live; on a
-  host subscribed to neither the matcher never engages at all. Where it does, a **single-publisher row is the
-  degenerate case and the matcher's two series diverge on it**: a pair needs two paths, so `dz_path_lead_ns`
-  populates only for Kalshi's mirrored pair and never for Phoenix, while every Phoenix print still *enters* the
-  matcher (the authority tracks its one path, so `race_eligible` holds) and expires unpaired onto
-  `dz_path_unmatched_trades_total{venue="PHOENIX"}` — permanently, at the venue's whole trade rate. That series'
-  alarm reading, "the paths are barely pairing," cannot apply to a row that has one path; docs/metrics.md carries
-  the same caveat, since a dashboard alerting on the ratio would otherwise show a standing false positive.
+  host subscribed to neither the matcher never engages at all. Where it does, **pairing is two-way while
+  Phoenix carries three paths**: a print pairs its first two copies and the third expires unpaired onto
+  `dz_path_unmatched_trades_total{venue="PHOENIX"}` — permanently, at the venue's whole trade rate — and a
+  lead reaches the election only when the leader is one of the pair, so a print the leader delivered last is
+  no evidence either way. That series' alarm reading, "the paths are barely pairing," applies only to a
+  two-path row (Kalshi's); docs/metrics.md carries the same caveat, since a dashboard alerting on the ratio
+  would otherwise show a standing false positive.
 - **`ingest/public_input.rs`** — venue-generic **public WS input** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
