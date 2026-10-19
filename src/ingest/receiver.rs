@@ -21,10 +21,9 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use nix::sys::socket::{
-    recvmsg, setsockopt, sockopt::ReceiveTimestampns, ControlMessageOwned, MsgFlags,
-    SockaddrStorage,
-};
+use nix::sys::socket::{recvmsg, MsgFlags, RecvMsg, SockaddrStorage};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use nix::sys::socket::{setsockopt, sockopt::ReceiveTimestampns, ControlMessageOwned};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{io::unix::AsyncFd, time::timeout};
 use tracing::{info, warn};
@@ -585,14 +584,7 @@ async fn recv_with_ts(sock: &TsSocket, buf: &mut [u8]) -> Result<(usize, u64, u6
             let mut cmsg = nix::cmsg_space!(nix::sys::time::TimeSpec);
             let r = recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsg), MsgFlags::empty())
                 .map_err(std::io::Error::from)?;
-            let mut kernel_ns = 0u64;
-            if let Ok(cmsgs) = r.cmsgs() {
-                for c in cmsgs {
-                    if let ControlMessageOwned::ScmTimestampns(ts) = c {
-                        kernel_ns = (ts.tv_sec() as u64) * 1_000_000_000 + ts.tv_nsec() as u64;
-                    }
-                }
-            }
+            let kernel_ns = kernel_rx_ns(&r);
             let src = datagram_src_ip(r.address);
             Ok((r.bytes, kernel_ns, src))
         });
@@ -602,6 +594,26 @@ async fn recv_with_ts(sock: &TsSocket, buf: &mut [u8]) -> Result<(usize, u64, u6
             Err(_would_block) => continue,
         }
     }
+}
+
+/// The `SCM_TIMESTAMPNS` timestamp `recvmsg` attached, or 0 if none.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn kernel_rx_ns(r: &RecvMsg<'_, '_, SockaddrStorage>) -> u64 {
+    let mut kernel_ns = 0u64;
+    if let Ok(cmsgs) = r.cmsgs() {
+        for c in cmsgs {
+            if let ControlMessageOwned::ScmTimestampns(ts) = c {
+                kernel_ns = (ts.tv_sec() as u64) * 1_000_000_000 + ts.tv_nsec() as u64;
+            }
+        }
+    }
+    kernel_ns
+}
+
+/// Without `SO_TIMESTAMPNS` (Linux and Android only) there is never a kernel timestamp.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn kernel_rx_ns(_: &RecvMsg<'_, '_, SockaddrStorage>) -> u64 {
+    0
 }
 
 /// The source IP address of a received datagram (its `recvmsg` source address), used to demultiplex
@@ -705,6 +717,7 @@ pub fn bind_multicast(
     let std_sock: std::net::UdpSocket = socket.into();
     // Kernel software RX timestamps (SCM_TIMESTAMPNS). Best-effort: if the option is not
     // supported the bridge still works, falling back to the user-space recv timestamp.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Err(e) = setsockopt(&std_sock, ReceiveTimestampns, &true) {
         warn!("SO_TIMESTAMPNS unavailable on port {port}: {e}; using user-space recv ts only");
     }
@@ -1899,6 +1912,27 @@ mod tests {
     #[test]
     fn datagram_src_ip_defaults_when_absent() {
         assert_eq!(datagram_src_ip(None), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    /// Pins the platform gate: an inverted one still compiles and silently zeroes `kernel_rx_ts_ns`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn recv_with_ts_returns_the_kernel_rx_timestamp() {
+        use nix::sys::socket::{setsockopt, sockopt::ReceiveTimestampns};
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        setsockopt(&rx, ReceiveTimestampns, &true).unwrap();
+        let to = rx.local_addr().unwrap();
+        let sock = tokio::io::unix::AsyncFd::new(rx).unwrap();
+        let before = crate::model::now_ns();
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.send_to(b"x", to).unwrap();
+        let (n, kernel_ns, user_ns, _) = super::recv_with_ts(&sock, &mut [0u8; 8]).await.unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            (before..=user_ns).contains(&kernel_ns),
+            "kernel {kernel_ns} outside [{before}, {user_ns}]"
+        );
     }
 
     #[test]
