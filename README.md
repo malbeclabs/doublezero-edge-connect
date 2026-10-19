@@ -410,10 +410,7 @@ active measurement, and the answer moves with topology), so the block carries it
 `doublezero connect multicast` inside the container — which stays a deliberate `docker exec` rather
 than something an HTTP surface with no authentication can trigger.
 
-The full flag reference (`--jq`, `--template`, `--output table`) is in `--help`. Note:
-`doublezero-edge` builds and runs on macOS as well as Linux. The bridge now compiles there too, but
-it is a separate workspace member because the CLI shares no types with it and carries no path
-dependency on it.
+The full flag reference (`--jq`, `--template`, `--output table`) is in `--help`. Note: `doublezero-edge` builds and runs on macOS as well as Linux. The bridge compiles on macOS, but its multicast ingest does not work there: the default `--recv-buf` exceeds the stock macOS socket-buffer ceiling, so every receiver fails to bind, and `--iface` is resolved with `ip(8)`, which macOS does not ship.
 
 ## Standalone shred-proxy
 

@@ -6,8 +6,7 @@ Six tasks. Each ends with something independently verifiable.
 
 ## Global constraints
 
-- Build and test in the Linux container; the crate does not build on macOS. The `doublezero-edge`
-  crate does build natively.
+- Build and test in the Linux container; the bridge crate compiles on macOS, but its multicast ingest does not work there. The `doublezero-edge` crate does build natively.
 - Lint contract is `cargo +nightly fmt --all -- --check --config imports_granularity=Crate` and
   `cargo +stable clippy --workspace --all-targets -- -Dclippy::all -Dwarnings`. Plain `cargo fmt`
   is weaker than CI in both respects.
