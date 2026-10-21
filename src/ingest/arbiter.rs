@@ -1679,7 +1679,7 @@ pub struct Arbiter {
     quote_id_clock: Box<dyn Fn() -> u64 + Send>,
     trades: WindowedDedup<(SourceKey, Arc<str>), u64, Transport>,
     /// Cross-publisher dedup for MBO `depth`. Each publisher reconstructs its own book (per
-    /// `(publisher, instrument)` in [`crate::ingest::processor::MboProcessor`]) and emits full-state
+    /// `(publisher, channel, instrument)` in [`crate::ingest::processor::MboProcessor`]) and emits full-state
     /// snapshots; this floor collapses the redundant publishers' depth the same way the quote floor
     /// collapses redundant BBOs — latch-to-leader per `(source, symbol)` tick, keyed on [`DepthId`].
     ///
@@ -2406,8 +2406,8 @@ impl Arbiter {
     }
 
     /// Clear one `(source, symbol)` latched depth-floor entry and its WS-replay entry — the
-    /// session-reset escape hatch, called by the MBO processor on `EndOfSession` (per latched
-    /// symbol) and `InstrumentReset` (the book re-snapshots, and the post-reset anchor may carry a
+    /// session-reset escape hatch, called by the MBO processor on `EndOfSession` (per symbol
+    /// latched on the ending channel) and `InstrumentReset` (the book re-snapshots, and the post-reset anchor may carry a
     /// lower `source_ts`). Without it a venue restarting its event clock below the latched
     /// high-water would have every later depth dropped as stale, permanently. The replay entry goes
     /// too: it holds the ended session's book, and nothing else removes it for an instrument the
