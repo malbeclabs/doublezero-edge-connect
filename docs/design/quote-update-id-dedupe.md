@@ -130,6 +130,12 @@ says a difference seen while paths hold different definitions is not evidence. S
 the price and quantity exponents the admitted quote was scaled under. A later copy of the same ID
 scaled under other exponents drops as `skew`, not `conflict`, and disables nothing.
 
+**Content is compared exactly.** Under equal exponents two copies of one ID are compared on their raw
+wire integers (both prices, both quantities), not on `QuoteId`, which rounds to `10^-8`: at a
+quantity exponent of `-9`, raw sizes `1` and `2` would round alike and a constant-padding "ID" would
+read as `duplicate` instead of `conflict`. The raw integers and exponents reach the arbiter as
+producer-only `#[serde(skip)]` fields on `NormalizedQuote`, beside the channel.
+
 Counted by `dz_quotes_update_id_disabled_total{venue}`, and logged once per disable.
 
 ### The zero collision
@@ -218,8 +224,8 @@ mirror. The metric stays an alert signal rather than a measure of idle instrumen
 The ID state is its own map, keyed `(SourceKey, channel, symbol)`, beside today's quote floor, which
 has no channel dimension. An entry is created by the first ID-bearing quote for its key, including
 one with `source_ts 0` that today's floor never stores, so this is a new population of keys rather
-than an extension of the floor's. Each entry holds a `u32` last ID, the admitted quote's `QuoteId`
-without its counts, the exponents it was scaled under, the last-admit instant, and an optional
+than an extension of the floor's. Each entry holds a `u32` last ID, the admitted quote's raw prices
+and quantities (two `i64`, two `u64`), the exponents it was scaled under, the last-admit instant, and an optional
 candidate (`u32` and its `Transport`). The candidate needs no age: an admit clears it, and with
 nothing admitted the whole entry expires on the regime timeout first.
 
