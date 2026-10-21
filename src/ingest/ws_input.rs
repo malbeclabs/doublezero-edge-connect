@@ -223,10 +223,11 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
     let (Some(bid), Some(ask)) = (&d.bbo[0], &d.bbo[1]) else {
         return; // one-sided book; cannot form a two-sided quote
     };
-    let Some(category) = resolve_instrument(instruments, HL_SOURCE_ID, &d.coin)
-        .and_then(|r| row_category(&r.category))
-    else {
+    let Some(resolved) = resolve_instrument(instruments, HL_SOURCE_ID, &d.coin) else {
         return; // precision unknown; drop until the edge refdata defines this instrument
+    };
+    let Some(category) = row_category(&resolved.category) else {
+        return;
     };
     let (Some((bid_px, bid_sz, bid_n)), Some((ask_px, ask_sz, ask_n))) =
         (parse_level(bid), parse_level(ask))
@@ -254,7 +255,13 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         kernel_rx_ts_ns: 0, // no kernel RX timestamp for a user-space WS read (0 = sentinel)
         ws_send_ts_ns: 0,   // stamped by the WS server just before send
         venue_update_id: 0, // the public feed carries no venue update counter
-        wire: crate::model::QuoteWire::default(),
+        // The catalog's (canonical) channel, so this copy lands on the edge quote's `Venue Update
+        // ID` key: on a key in the ID regime it is suppressed like any ID-less copy, instead of
+        // missing the key and reaching the `source_ts` floor, which ID admissions never advance.
+        wire: crate::model::QuoteWire {
+            channel: resolved.channel,
+            ..crate::model::QuoteWire::default()
+        },
     };
     metrics()
         .ws_input_messages
@@ -432,6 +439,64 @@ mod tests {
             }
             other => panic!("expected a quote, got {other:?}"),
         }
+    }
+
+    /// The public backstop reaches the edge quote's `Venue Update ID` key, channel included: with
+    /// the instrument on a nonzero catalog channel and that key in the ID regime, a public copy is
+    /// dropped as `regime` rather than slipping past to the `source_ts` floor.
+    #[test]
+    fn a_public_bbo_lands_on_the_edge_quote_update_id_key() {
+        let (arbiter, mut rx) = arbiter_with_rx();
+        let instruments: InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        instruments.lock().unwrap().insert(
+            (hl_venue().into(), "hl-perps".into(), 7u8, 1u32),
+            NormalizedInstrument {
+                tick_size: 0,
+                venue: hl_venue().into(),
+                source_name: hl_venue().into(),
+                source_id: HL_SOURCE_ID,
+                symbol: "BTC".into(),
+                channel: 7,
+                instrument_id: 1,
+                category: "hl-perps".into(),
+                price_exponent: -2,
+                qty_exponent: -2,
+            },
+        );
+        let edge = NormalizedQuote {
+            venue: venue_arc(hl_venue()),
+            source_name: venue_arc(hl_venue()),
+            source_id: HL_SOURCE_ID,
+            symbol: "BTC".into(),
+            bid: 104783.0,
+            ask: 104784.0,
+            bid_size: 1.5,
+            ask_size: 2.0,
+            bid_n: 3,
+            ask_n: 4,
+            source_ts_ns: 0,
+            recv_ts_ns: now_ns(),
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+            venue_update_id: 9,
+            wire: crate::model::QuoteWire {
+                channel: 7,
+                ..crate::model::QuoteWire::default()
+            },
+        };
+        let edge_path = Transport::Edge(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        lock(&arbiter).emit(FeedMessage::Quote(edge), edge_path, "hl-perps");
+        let frame = r#"{"channel":"bbo","data":{"coin":"BTC","time":1700000000000,
+            "bbo":[{"px":"104783.0","sz":"1.5","n":3},{"px":"104784.0","sz":"2.0","n":4}]}}"#;
+        handle_text(frame, &arbiter, &instruments);
+        let mut quotes = 0;
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Quote(q) = &*m {
+                quotes += 1;
+                assert_eq!(q.venue_update_id, 9, "only the edge copy goes out: {q:?}");
+            }
+        }
+        assert_eq!(quotes, 1);
     }
 
     /// Precision-before-price: a quote for an unknown instrument is dropped (snapshot empty).
