@@ -1,8 +1,9 @@
 # Dedupe quotes on the Venue Update ID — design
 
 **Date:** 2026-10-21
-**Status:** draft
-**Depends on:** malbeclabs/edge-feed-spec#97 (top-of-book `3.2.0`)
+**Status:** accepted; implemented in #196
+**Depends on:** malbeclabs/edge-feed-spec#97 (top-of-book `3.2.0`) and #98 (a subscriber holding a value
+may drop any ID-`0` quote, with or without `source_ts`), both merged 2026-10-21
 
 ## Goal
 
@@ -68,8 +69,12 @@ it to `0` (`src/ingest/ws_input.rs:241`).
 
 ## The rule
 
-Per key `(SourceKey, symbol)`, the same key as today's floor. A key is in the **ID regime** while it
-holds ID state.
+Per key `(SourceKey, channel, symbol)`: today's floor key plus the quote's Channel ID, because the
+spec compares two values only within one Source ID **and channel**. Without the channel, one Source
+ID carrying a symbol on two channels with independent counters would keep one key admitting the
+busier counter, so the timeout never fires and the other channel drops as `stale` or `jump`
+indefinitely. Two paths of one feed publish the same Channel ID, so the channel does not separate
+their copies. A key is in the **ID regime** while it holds ID state.
 
 The key stays the symbol, not `(channel, instrument_id)`: Instrument IDs are assigned per publisher,
 and two paths of one engine need not agree on them, so an ID-keyed state would never see the second
@@ -82,7 +87,7 @@ today's quote floor and every consumer's quote key, so this design does not try 
 |---|---|---|
 | ID `!= 0` | no ID state | Admit. Store `last = id`. The key enters the ID regime. |
 | ID `!= 0` | ID regime | Admit iff `newer(id, last)` and within the jump cap. Else drop. The path does not matter. |
-| ID `0` | ID regime | Drop, counted as `regime`, whatever its `source_ts`. |
+| ID `0` | ID regime | Drop, counted as `regime`, whatever its `source_ts` (edge-feed-spec#98). |
 | ID `0`, `source_ts > 0` | no ID state | Today's floor, unchanged. |
 | ID `0`, `source_ts 0` | no ID state | Today's bypass, unchanged. |
 
@@ -97,8 +102,18 @@ copy of each ID wins and the output is serially increasing per key.
 A nonzero `source_ts` on an ID-bearing quote still passes the existing future-skew check first
 (`arbiter.rs:3273`, `MAX_FUTURE_SKEW_NS` at `:90`). It does not order anything.
 
-When no ID quote is in flight the arbiter does no extra lookup: an ID-`0` quote checks whether any key
-holds ID state at all, and with none takes today's code path unchanged.
+When no ID quote is in flight the arbiter does no extra lookup: an ID-`0` quote checks whether its own
+key holds ID state, and with none takes today's code path unchanged, with no clock read and no
+content identity built.
+
+### A Source ID whose field is not a counter
+
+A publisher whose own encoder wrote nonzero padding before `3.2.0` sends one constant "ID" on every
+quote. Every quote after the first would drop as `duplicate` or `conflict`, and the timeout would
+readmit one per instrument every 5 s: the feed degrades quietly. So the first `conflict` on a
+`SourceKey` puts it in a disabled set, as the spec's SHOULD asks: its quotes take today's floor or
+bypass from then on, for the life of the process, and its ID state is dropped. Counted by
+`dz_quotes_update_id_disabled_total{venue}` and logged once per `SourceKey`.
 
 ### The zero collision
 
@@ -201,8 +216,13 @@ Following `dz_quotes_no_source_ts_total` and `dz_depth_floor_resets_total`:
   real reordering would vanish into that. `conflict` is also dropped: one ID is one book state, so two
   contents mean a path is not carrying a venue counter, for example an encoder from before `3.2.0`
   that writes nonzero padding. edge-feed-spec#97 says a subscriber SHOULD then stop using the field
-  for that Source ID. That is not built: every known encoder writes `0`, and the metric shows the case
-  if it occurs.
+  for that Source ID, and the first `conflict` does exactly that (*A Source ID whose field is not a
+  counter*). A second path's copy counts as `duplicate` only if it arrives before the next ID is
+  admitted. On a busy instrument whose inter-path skew exceeds its update interval most copies land in
+  `stale`, so `stale` does not by itself isolate real reordering. ID-regime keys do not feed
+  `dz_quote_lead_ns`, and a public backstop on an ID key counts as `regime` for as long as it runs.
+- `dz_quotes_update_id_disabled_total{venue}`, `SourceKey`s that stopped using the field after a
+  `conflict`.
 - `dz_quote_floor_resets_total{venue, reason}`, `reason` one of `regime_timeout`,
   `corroborated_jump`, `venue_reset`.
 
