@@ -108,8 +108,11 @@ none. A silent upgraded path then cannot black out a key that a working old path
 same timeout reopens a quiet key fresh, which also covers a counter that moved more than `2^31` while
 the key was idle.
 
-The check runs when the next quote for the key arrives, against that quote's receive clock
-(`recv_ts_ns`, the clock the tape handover already uses at `arbiter.rs:3105`). Nothing sweeps.
+The check runs when the next quote for the key arrives, against the host's monotonic clock
+(`model::now_mono_ns`), sampled in the arbiter. Not `recv_ts_ns`: that is wall time
+(`model::now_ns`), so an NTP step would stretch or cut the timeout, and a 60 s step back would hold an
+ID-less backstop muted for 65 s. The future-skew check keeps wall time, because it compares against
+`source_ts`. Nothing sweeps.
 
 One cost of reopening fresh: a copy that arrives more than 5 s late, on a key that was quiet that
 long, is admitted even if its ID is older. Paths that far apart are not mirrors in any useful sense,
@@ -129,15 +132,17 @@ ahead is admitted and every real quote after it compares as older.
 
 1. **Jump cap.** Admit only if `id.wrapping_sub(last) <= cap`. A larger forward jump is dropped,
    counted as `jump`, and kept as a candidate `(id, Transport)`.
-2. **Escape by corroboration.** A candidate is accepted, and the key reset to the corroborating ID,
-   when a **different** `Transport` delivers an ID within the cap of it, in either direction. Two
-   honest paths therefore heal a real jump, or a forged ID that got in as the key's first, at the next
-   pair of real copies.
-3. **Escape by timeout.** One path alone that keeps delivering IDs past the cap admits nothing, so the
-   regime timeout clears the key and the next ID is admitted fresh.
+2. **Escape by corroboration, forward only.** A candidate is accepted, and the key reset to the
+   corroborating ID, when a **different** `Transport` delivers an ID within the cap of it, in either
+   direction. Two honest paths therefore heal a real forward jump at the next pair of real copies, and
+   so a forged first ID that sits more than the cap *behind* the real counter.
+3. **Escape by timeout.** Everything else waits for the regime timeout: one path alone delivering IDs
+   past the cap, and every ID that compares as **older** than `last`.
 
-A forged value inside the cap makes real quotes compare as stale. Nothing is admitted, so the key heals
-on the regime timeout at the latest, or sooner when the real counter passes the forged value. A forger
+Older IDs never become candidates. A forged value ahead of the real counter, inside the cap or not,
+makes real quotes compare as older, so nothing is admitted and the key heals on the regime timeout, or
+sooner when the real counter passes the forged value. Corroborating older copies instead would be
+unsafe: with three paths, two delayed mirrors delivering the same older ID would rewind a healthy key. A forger
 that keeps sending can hold a key; that is the same residual the tape gate and the `book` authority
 already document for an unauthenticated wire.
 
@@ -156,8 +161,9 @@ publisher's. Like today's quote floor (`arbiter.rs:1384-1389`), the ID state is 
 session-reset path. No `EndOfSession`, `ChannelReset` or Source ID purge clears it.
 
 A venue that resets its counter produces IDs that compare as older, or as a jump past the cap. Nothing
-is admitted, and the escapes above apply: a second path corroborates the jump at once, and otherwise
-the regime timeout clears the key. The clear goes through one reset helper shaped like
+is admitted. A jump past the cap heals when a second path corroborates it. A counter that restarts
+lower compares as older on every path, so it heals only on the regime timeout: one 5 s gap per
+restart, accepted for the reason older IDs never corroborate. The clear goes through one reset helper shaped like
 `reset_depth_floor_for_symbol` and `record_floor_resets` (`arbiter.rs:2103-2126`), counted by reason.
 A clear after refused IDs counts as `venue_reset`; a clear that hands the key back to an ID-less quote
 counts as `regime_timeout`. A key that was only quiet re-enters without a count, so the metric stays
@@ -165,7 +171,7 @@ an alert signal rather than a measure of idle instruments.
 
 ## State and bounding
 
-Each key adds a `u32` last ID, the last-admit instant, a refused-since-admit flag, and an optional
+Each key adds a `u32` last ID, the admitted quote's `QuoteId`, the last-admit instant, a refused-since-admit flag, and an optional
 candidate (`u32` and its `Transport`). The candidate needs no age: an admit clears it, and with
 nothing admitted the whole key expires on the regime timeout first. No new keys: the key space is today's quote floor, a
 plain `HashMap` per `(SourceKey, symbol)` with no key cap (`arbiter.rs:474-480`). If that cap is ever
@@ -177,9 +183,14 @@ Following `dz_quotes_no_source_ts_total` and `dz_depth_floor_resets_total`:
 
 - `dz_quotes_update_id_admitted_total{venue}`: quotes admitted in the ID regime.
 - `dz_quotes_update_id_dropped_total{venue, reason}`, `reason` one of `duplicate` (the same ID again,
-  the steady state of a second path), `stale` (an older ID), `regime` (an ID-less copy on an ID key),
-  `jump`. *`duplicate` is split from `stale`, which the earlier draft folded together*: a second hot
-  path makes duplicates half the traffic, and a real reordering would vanish into that.
+  the steady state of a second path), `conflict` (the same ID with a different `QuoteId`), `stale`
+  (an older ID), `regime` (an ID-less copy on an ID key), `jump`. *`duplicate` is split from `stale`,
+  which the earlier draft folded together*: a second hot path makes duplicates half the traffic, and a
+  real reordering would vanish into that. `conflict` is also dropped: one ID is one book state, so two
+  contents mean a path is not carrying a venue counter, for example an encoder from before `3.2.0`
+  that writes nonzero padding. edge-feed-spec#97 says a subscriber SHOULD then stop using the field
+  for that Source ID. That is not built: every known encoder writes `0`, and the metric shows the case
+  if it occurs.
 - `dz_quote_floor_resets_total{venue, reason}`, `reason` one of `regime_timeout`,
   `corroborated_jump`, `venue_reset`.
 
@@ -198,6 +209,8 @@ per `source_ts` tick and does not count ID-regime quotes.
 - A forged ID `2^31 - 1` ahead from one path is dropped as `jump`, and the key keeps admitting real
   quotes.
 - A jump corroborated by a different `Transport` resets the key; the same `Transport` does not.
+- The same ID with different content drops as `conflict`.
+- The timeout runs on the monotonic clock: a quote's wall-clock `recv_ts_ns` does not move it.
 - A venue counter reset: refused until the timeout, then a `venue_reset` and the new IDs admitted.
 - The zero collision on an ID key drops as `regime`.
 - A quote with zero padding, from today's encoder, decodes ID `0`; a quote that declares fewer than 60
