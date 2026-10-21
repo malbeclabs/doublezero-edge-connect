@@ -170,7 +170,9 @@ pub struct Metrics {
     /// [`crate::ingest::arbiter::UpdateIdFloor`]). Also counted in `dz_quotes_admitted_total`.
     pub quotes_update_id_admitted: IntCounterVec,
     /// Quotes dropped on the `Venue Update ID`, by `reason`: `duplicate` (the same ID again — the
-    /// steady state of a second path), `stale` (an older ID), `regime` (an ID-less copy on a key in
+    /// steady state of a second path), `conflict` (the same ID with other prices or sizes, counts left out: a path is not
+    /// carrying a venue counter, for example nonzero padding from an encoder older than the field),
+    /// `stale` (an older ID), `regime` (an ID-less copy on a key in
     /// the ID regime; above zero for long outside a rollout means a publisher of that key is not
     /// filling the field) and `jump` (a forward jump past `--arb-quote-id-max-jump`). Also counted in
     /// `dz_quotes_dropped_total`.
@@ -713,7 +715,7 @@ impl Metrics {
                 &registry,
                 "dz_quotes_update_id_dropped_total",
                 "Quotes dropped on the venue update id, by reason \
-                 (duplicate/stale/regime/jump)",
+                 (duplicate/conflict/stale/regime/jump)",
                 &["venue", "reason"],
             ),
             quote_floor_resets: counter_vec(

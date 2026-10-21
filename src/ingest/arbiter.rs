@@ -104,11 +104,13 @@ pub const QUOTE_ID_MAX_JUMP: u32 = 1_000_000;
 
 /// `dz_quotes_update_id_dropped_total{reason}` values, in [`id_drop_idx`] order.
 pub const ID_DROP_DUPLICATE: &str = "duplicate";
+pub const ID_DROP_CONFLICT: &str = "conflict";
 pub const ID_DROP_STALE: &str = "stale";
 pub const ID_DROP_REGIME: &str = "regime";
 pub const ID_DROP_JUMP: &str = "jump";
-const ID_DROP_REASONS: [&str; 4] = [
+const ID_DROP_REASONS: [&str; 5] = [
     ID_DROP_DUPLICATE,
+    ID_DROP_CONFLICT,
     ID_DROP_STALE,
     ID_DROP_REGIME,
     ID_DROP_JUMP,
@@ -374,6 +376,17 @@ impl QuoteId {
             ask_sz: canon(q.ask_size),
             bid_n: q.bid_n,
             ask_n: q.ask_n,
+        }
+    }
+
+    /// This identity without the counts: what two paths must agree on for one `Venue Update ID`. A
+    /// path may report a count as `0` (unavailable) while a peer reports it for the same venue
+    /// state, so the counts cannot make two copies of one ID a `conflict`.
+    pub fn without_counts(self) -> Self {
+        Self {
+            bid_n: 0,
+            ask_n: 0,
+            ..self
         }
     }
 }
@@ -645,10 +658,13 @@ struct JumpCandidate<P> {
 }
 
 /// One key's ID-regime state.
-#[derive(Debug, Clone, Copy)]
-struct UpdateIdState<P> {
+#[derive(Debug, Clone)]
+struct UpdateIdState<V, P> {
     /// The last admitted ID.
     last: u32,
+    /// The admitted quote's content. One ID is one book state, so a copy of it with other content
+    /// means a path is not carrying a venue counter (`conflict`).
+    content: V,
     /// When it was admitted, on the quote's receive clock.
     last_admit_ns: u64,
     /// Whether an ID quote has been refused (stale or jump) since then: a clear on the timeout is then
@@ -657,10 +673,11 @@ struct UpdateIdState<P> {
     candidate: Option<JumpCandidate<P>>,
 }
 
-impl<P> UpdateIdState<P> {
-    fn new(id: u32, now_ns: u64) -> Self {
+impl<V, P> UpdateIdState<V, P> {
+    fn new(id: u32, content: V, now_ns: u64) -> Self {
         Self {
             last: id,
+            content,
             last_admit_ns: now_ns,
             refused: false,
             candidate: None,
@@ -686,12 +703,12 @@ impl<P> UpdateIdState<P> {
 ///
 /// **Exempt from every session reset**, like the quote floor: it is the venue's counter, not the
 /// publisher's, so a publisher restart or a new `Reset Count` says nothing about it.
-pub struct UpdateIdFloor<K, P> {
-    state: HashMap<K, UpdateIdState<P>>,
+pub struct UpdateIdFloor<K, V, P> {
+    state: HashMap<K, UpdateIdState<V, P>>,
     max_jump: u32,
 }
 
-impl<K: Eq + Hash + Clone, P: Eq + Copy> UpdateIdFloor<K, P> {
+impl<K: Eq + Hash + Clone, V: Eq, P: Eq + Copy> UpdateIdFloor<K, V, P> {
     pub fn new(max_jump: u32) -> Self {
         Self {
             state: HashMap::new(),
@@ -709,15 +726,16 @@ impl<K: Eq + Hash + Clone, P: Eq + Copy> UpdateIdFloor<K, P> {
         self.state.is_empty()
     }
 
-    /// Judge one quote for `key` carrying `id` (`0` = none) from path `from`, received at `now_ns`.
-    pub fn judge(&mut self, key: &K, id: u32, from: P, now_ns: u64) -> IdVerdict {
+    /// Judge one quote for `key` carrying `id` (`0` = none) and `content` from path `from`, at
+    /// `now_ns` on a **monotonic** clock: the timeout must not move with a wall-clock step.
+    pub fn judge(&mut self, key: &K, id: u32, content: V, from: P, now_ns: u64) -> IdVerdict {
         let verdict = |decision, reset| IdVerdict { decision, reset };
         let Some(st) = self.state.get_mut(key) else {
             if id == 0 {
                 return verdict(IdDecision::Legacy, None);
             }
             self.state
-                .insert(key.clone(), UpdateIdState::new(id, now_ns));
+                .insert(key.clone(), UpdateIdState::new(id, content, now_ns));
             return verdict(IdDecision::Admit, None);
         };
         if now_ns.saturating_sub(st.last_admit_ns) >= QUOTE_ID_REGIME_TIMEOUT_NS {
@@ -735,7 +753,7 @@ impl<K: Eq + Hash + Clone, P: Eq + Copy> UpdateIdFloor<K, P> {
                 self.state.remove(key);
                 return verdict(IdDecision::Legacy, reset);
             }
-            *st = UpdateIdState::new(id, now_ns);
+            *st = UpdateIdState::new(id, content, now_ns);
             return verdict(IdDecision::Admit, reset);
         }
         if id == 0 {
@@ -745,10 +763,15 @@ impl<K: Eq + Hash + Clone, P: Eq + Copy> UpdateIdFloor<K, P> {
         }
         let advance = id.wrapping_sub(st.last);
         if advance == 0 {
-            return verdict(IdDecision::Drop(ID_DROP_DUPLICATE), None);
+            let reason = if content == st.content {
+                ID_DROP_DUPLICATE
+            } else {
+                ID_DROP_CONFLICT
+            };
+            return verdict(IdDecision::Drop(reason), None);
         }
         if update_id_newer(id, st.last) && advance <= self.max_jump {
-            *st = UpdateIdState::new(id, now_ns);
+            *st = UpdateIdState::new(id, content, now_ns);
             return verdict(IdDecision::Admit, None);
         }
         // Refused. Before classifying it, see whether it corroborates a held jump: checked for any
@@ -757,7 +780,7 @@ impl<K: Eq + Hash + Clone, P: Eq + Copy> UpdateIdFloor<K, P> {
         if let Some(c) = st.candidate {
             let near = (id.wrapping_sub(c.id) as i32).unsigned_abs() <= self.max_jump;
             if c.from != from && near {
-                *st = UpdateIdState::new(id, now_ns);
+                *st = UpdateIdState::new(id, content, now_ns);
                 return verdict(IdDecision::Admit, Some(ID_RESET_CORROBORATED_JUMP));
             }
         }
@@ -1590,7 +1613,10 @@ pub struct Arbiter {
     /// Cross-transport quote dedupe on the `Venue Update ID`, keyed like `quotes`. A key holding
     /// state here is judged by it instead of by `quotes`; see [`UpdateIdFloor`]. Exempt from the
     /// session-reset path for the reason `quotes` is: the counter is the venue's.
-    quote_ids: UpdateIdFloor<(SourceKey, Arc<str>), Transport>,
+    quote_ids: UpdateIdFloor<(SourceKey, Arc<str>), QuoteId, Transport>,
+    /// The clock the quote ID regime timeout runs on: the host's monotonic clock, so an NTP step
+    /// cannot stretch or cut it. A field only so a test can drive it.
+    quote_id_clock: Box<dyn Fn() -> u64 + Send>,
     trades: WindowedDedup<(SourceKey, Arc<str>), u64, Transport>,
     /// Cross-publisher dedup for MBO `depth`. Each publisher reconstructs its own book (per
     /// `(publisher, instrument)` in [`crate::ingest::processor::MboProcessor`]) and emits full-state
@@ -1889,7 +1915,7 @@ struct VenueMetrics {
     /// `dz_quotes_update_id_admitted_total` / `dz_quotes_update_id_dropped_total{reason}`, the
     /// latter in [`id_drop_idx`] order.
     quotes_update_id_admitted: IntCounter,
-    quotes_update_id_dropped: [IntCounter; 4],
+    quotes_update_id_dropped: [IntCounter; 5],
     /// `dz_depth_admitted_total{publisher}` / `dz_depth_dropped_total{publisher}`, `[edge, public]`.
     depth_admitted: [IntCounter; 2],
     depth_dropped: [IntCounter; 2],
@@ -2012,6 +2038,7 @@ impl Arbiter {
             tx,
             quotes: StalenessFloor::new(QUOTE_TICK_CAP),
             quote_ids: UpdateIdFloor::new(QUOTE_ID_MAX_JUMP),
+            quote_id_clock: Box::new(now_mono_ns),
             trades: WindowedDedup::new(trade_window),
             depths: StalenessFloor::new(DEPTH_TICK_CAP),
             depth_replay: None,
@@ -2058,6 +2085,12 @@ impl Arbiter {
             "quote id jump cap {max_jump} outside 1..=2^31-1"
         );
         self.quote_ids.set_max_jump(max_jump);
+    }
+
+    /// Drive the quote ID regime's clock from a test, in place of the monotonic clock.
+    #[cfg(test)]
+    fn set_quote_id_clock(&mut self, clock: impl Fn() -> u64 + Send + 'static) {
+        self.quote_id_clock = Box::new(clock);
     }
 
     /// Install the resurrection guard's venue-time tunables (`--arb-book-*`). Called once at
@@ -3495,9 +3528,14 @@ impl Arbiter {
                         return;
                     }
                     let key = (SourceKey::of(q), q.symbol.clone());
-                    let verdict = self
-                        .quote_ids
-                        .judge(&key, q.venue_update_id, publisher, now);
+                    let mono = (self.quote_id_clock)();
+                    let verdict = self.quote_ids.judge(
+                        &key,
+                        q.venue_update_id,
+                        QuoteId::of(q).without_counts(),
+                        publisher,
+                        mono,
+                    );
                     if let Some(reason) = verdict.reset {
                         self.record_quote_floor_reset(&q.venue, reason);
                     }
@@ -9531,7 +9569,7 @@ mod tests {
     // --- Venue Update ID ---------------------------------------------------------------------
 
     /// The floor alone, on `&str` keys and `u8` paths: path `A` and path `B`.
-    fn id_floor() -> UpdateIdFloor<&'static str, u8> {
+    fn id_floor() -> UpdateIdFloor<&'static str, u8, u8> {
         UpdateIdFloor::new(QUOTE_ID_MAX_JUMP)
     }
     const A: u8 = 1;
@@ -9581,33 +9619,44 @@ mod tests {
         ];
         let admitted: Vec<(u8, u32)> = arrivals
             .iter()
-            .filter(|(p, id)| f.judge(&"BTC", *id, *p, SEC).decision == IdDecision::Admit)
+            .filter(|(p, id)| f.judge(&"BTC", *id, 0, *p, SEC).decision == IdDecision::Admit)
             .copied()
             .collect();
         assert_eq!(admitted, vec![(A, 1), (B, 2), (A, 3), (B, 4)]);
+    }
+
+    /// The same ID with other content is a conflict; with the same content, a duplicate.
+    #[test]
+    fn the_same_id_with_other_content_is_a_conflict() {
+        let mut f = id_floor();
+        assert_eq!(f.judge(&"BTC", 10, 1, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 10, 1, B, SEC), drop_for(ID_DROP_DUPLICATE));
+        assert_eq!(f.judge(&"BTC", 10, 2, B, SEC), drop_for(ID_DROP_CONFLICT));
+        // A conflict refuses nothing else: the next ID is admitted.
+        assert_eq!(f.judge(&"BTC", 11, 3, B, SEC), admit());
     }
 
     /// A later path's older ID after a newer one is stale, and the same ID again is a duplicate.
     #[test]
     fn an_older_id_is_stale_and_a_repeat_is_a_duplicate() {
         let mut f = id_floor();
-        assert_eq!(f.judge(&"BTC", 10, A, SEC), admit());
-        assert_eq!(f.judge(&"BTC", 12, A, SEC), admit());
-        assert_eq!(f.judge(&"BTC", 11, B, SEC), drop_for(ID_DROP_STALE));
-        assert_eq!(f.judge(&"BTC", 12, B, SEC), drop_for(ID_DROP_DUPLICATE));
+        assert_eq!(f.judge(&"BTC", 10, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 12, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 11, 0, B, SEC), drop_for(ID_DROP_STALE));
+        assert_eq!(f.judge(&"BTC", 12, 0, B, SEC), drop_for(ID_DROP_DUPLICATE));
         // Keys are independent.
-        assert_eq!(f.judge(&"ETH", 11, B, SEC), admit());
+        assert_eq!(f.judge(&"ETH", 11, 0, B, SEC), admit());
     }
 
     #[test]
     fn ids_across_the_u32_wrap_admit_in_order() {
         let mut f = id_floor();
         for id in [0xFFFF_FFFE, 0xFFFF_FFFF, 1, 2] {
-            assert_eq!(f.judge(&"BTC", id, A, SEC), admit(), "id {id:#x}");
+            assert_eq!(f.judge(&"BTC", id, 0, A, SEC), admit(), "id {id:#x}");
         }
         // And the pre-wrap ID is now older.
         assert_eq!(
-            f.judge(&"BTC", 0xFFFF_FFFF, B, SEC),
+            f.judge(&"BTC", 0xFFFF_FFFF, 0, B, SEC),
             drop_for(ID_DROP_STALE)
         );
     }
@@ -9617,65 +9666,65 @@ mod tests {
     #[test]
     fn a_forged_far_jump_is_refused_and_real_ids_keep_flowing() {
         let mut f = id_floor();
-        assert_eq!(f.judge(&"BTC", 100, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 100, 0, A, SEC), admit());
         assert_eq!(
-            f.judge(&"BTC", 100u32.wrapping_add(i32::MAX as u32), C, SEC),
+            f.judge(&"BTC", 100u32.wrapping_add(i32::MAX as u32), 0, C, SEC),
             drop_for(ID_DROP_JUMP)
         );
-        assert_eq!(f.judge(&"BTC", 101, A, SEC), admit());
-        assert_eq!(f.judge(&"BTC", 101, B, SEC), drop_for(ID_DROP_DUPLICATE));
-        assert_eq!(f.judge(&"BTC", 102, B, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 101, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 101, 0, B, SEC), drop_for(ID_DROP_DUPLICATE));
+        assert_eq!(f.judge(&"BTC", 102, 0, B, SEC), admit());
     }
 
     /// The cap is inclusive: an advance of exactly `max_jump` is admitted, one more is a jump.
     #[test]
     fn the_jump_cap_is_inclusive() {
-        let mut f: UpdateIdFloor<&str, u8> = UpdateIdFloor::new(10);
-        assert_eq!(f.judge(&"BTC", 100, A, SEC), admit());
-        assert_eq!(f.judge(&"BTC", 110, A, SEC), admit());
-        assert_eq!(f.judge(&"BTC", 121, A, SEC), drop_for(ID_DROP_JUMP));
+        let mut f: UpdateIdFloor<&str, u8, u8> = UpdateIdFloor::new(10);
+        assert_eq!(f.judge(&"BTC", 100, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 110, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 121, 0, A, SEC), drop_for(ID_DROP_JUMP));
     }
 
     /// A jump past the cap is accepted when a *different* path delivers an ID within the cap of it,
     /// and never on the word of the path that made it.
     #[test]
     fn a_jump_is_accepted_only_when_another_path_corroborates_it() {
-        let mut f: UpdateIdFloor<&str, u8> = UpdateIdFloor::new(10);
-        assert_eq!(f.judge(&"BTC", 100, A, SEC), admit());
-        assert_eq!(f.judge(&"BTC", 5_000, A, SEC), drop_for(ID_DROP_JUMP));
+        let mut f: UpdateIdFloor<&str, u8, u8> = UpdateIdFloor::new(10);
+        assert_eq!(f.judge(&"BTC", 100, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 5_000, 0, A, SEC), drop_for(ID_DROP_JUMP));
         // The same path again, even right next to its own candidate: still refused.
-        assert_eq!(f.judge(&"BTC", 5_001, A, SEC), drop_for(ID_DROP_JUMP));
+        assert_eq!(f.judge(&"BTC", 5_001, 0, A, SEC), drop_for(ID_DROP_JUMP));
         // A different path far from the candidate does not corroborate it, and its own jump
         // becomes the candidate.
-        assert_eq!(f.judge(&"BTC", 9_000, B, SEC), drop_for(ID_DROP_JUMP));
+        assert_eq!(f.judge(&"BTC", 9_000, 0, B, SEC), drop_for(ID_DROP_JUMP));
         // So a third path near A's old candidate is refused too, and becomes the candidate ...
-        assert_eq!(f.judge(&"BTC", 5_002, C, SEC), drop_for(ID_DROP_JUMP));
+        assert_eq!(f.judge(&"BTC", 5_002, 0, C, SEC), drop_for(ID_DROP_JUMP));
         // ... which a path other than C then corroborates.
         assert_eq!(
-            f.judge(&"BTC", 5_003, B, SEC),
+            f.judge(&"BTC", 5_003, 0, B, SEC),
             IdVerdict {
                 decision: IdDecision::Admit,
                 reset: Some(ID_RESET_CORROBORATED_JUMP),
             }
         );
         // The key now orders from the corroborated ID.
-        assert_eq!(f.judge(&"BTC", 5_002, A, SEC), drop_for(ID_DROP_STALE));
-        assert_eq!(f.judge(&"BTC", 5_004, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 5_002, 0, A, SEC), drop_for(ID_DROP_STALE));
+        assert_eq!(f.judge(&"BTC", 5_004, 0, A, SEC), admit());
     }
 
     /// Corroboration reaches across the serial wrap: a candidate just under `2^31` ahead and a
     /// corroborating ID just past it, which compares as *older* than `last`.
     #[test]
     fn corroboration_reaches_a_candidate_near_half_the_id_space() {
-        let mut f: UpdateIdFloor<&str, u8> = UpdateIdFloor::new(10);
-        assert_eq!(f.judge(&"BTC", 0, A, SEC).decision, IdDecision::Legacy);
-        assert_eq!(f.judge(&"BTC", 1, A, SEC), admit());
+        let mut f: UpdateIdFloor<&str, u8, u8> = UpdateIdFloor::new(10);
+        assert_eq!(f.judge(&"BTC", 0, 0, A, SEC).decision, IdDecision::Legacy);
+        assert_eq!(f.judge(&"BTC", 1, 0, A, SEC), admit());
         let cand = 1u32.wrapping_add(i32::MAX as u32); // 2^31: newest that still compares newer
-        assert_eq!(f.judge(&"BTC", cand, A, SEC), drop_for(ID_DROP_JUMP));
+        assert_eq!(f.judge(&"BTC", cand, 0, A, SEC), drop_for(ID_DROP_JUMP));
         let past = cand.wrapping_add(5);
         assert!(!update_id_newer(past, 1));
         assert_eq!(
-            f.judge(&"BTC", past, B, SEC),
+            f.judge(&"BTC", past, 0, B, SEC),
             IdVerdict {
                 decision: IdDecision::Admit,
                 reset: Some(ID_RESET_CORROBORATED_JUMP),
@@ -9688,22 +9737,22 @@ mod tests {
     #[test]
     fn a_venue_counter_reset_heals_on_the_regime_timeout() {
         let mut f = id_floor();
-        assert_eq!(f.judge(&"BTC", 5_000_000, A, SEC), admit());
-        assert_eq!(f.judge(&"BTC", 1, A, 2 * SEC), drop_for(ID_DROP_STALE));
-        assert_eq!(f.judge(&"BTC", 2, B, 3 * SEC), drop_for(ID_DROP_STALE));
+        assert_eq!(f.judge(&"BTC", 5_000_000, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 1, 0, A, 2 * SEC), drop_for(ID_DROP_STALE));
+        assert_eq!(f.judge(&"BTC", 2, 0, B, 3 * SEC), drop_for(ID_DROP_STALE));
         assert_eq!(
-            f.judge(&"BTC", 3, A, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            f.judge(&"BTC", 3, 0, A, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
             IdVerdict {
                 decision: IdDecision::Admit,
                 reset: Some(ID_RESET_VENUE_RESET),
             }
         );
         assert_eq!(
-            f.judge(&"BTC", 3, B, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            f.judge(&"BTC", 3, 0, B, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
             drop_for(ID_DROP_DUPLICATE)
         );
         assert_eq!(
-            f.judge(&"BTC", 4, B, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            f.judge(&"BTC", 4, 0, B, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
             admit()
         );
     }
@@ -9711,12 +9760,18 @@ mod tests {
     /// One path alone that jumps past the cap cannot corroborate itself; the timeout admits it.
     #[test]
     fn a_single_path_jump_heals_on_the_regime_timeout() {
-        let mut f: UpdateIdFloor<&str, u8> = UpdateIdFloor::new(10);
-        assert_eq!(f.judge(&"BTC", 100, A, SEC), admit());
-        assert_eq!(f.judge(&"BTC", 9_000, A, 2 * SEC), drop_for(ID_DROP_JUMP));
-        assert_eq!(f.judge(&"BTC", 9_001, A, 3 * SEC), drop_for(ID_DROP_JUMP));
+        let mut f: UpdateIdFloor<&str, u8, u8> = UpdateIdFloor::new(10);
+        assert_eq!(f.judge(&"BTC", 100, 0, A, SEC), admit());
         assert_eq!(
-            f.judge(&"BTC", 9_002, A, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            f.judge(&"BTC", 9_000, 0, A, 2 * SEC),
+            drop_for(ID_DROP_JUMP)
+        );
+        assert_eq!(
+            f.judge(&"BTC", 9_001, 0, A, 3 * SEC),
+            drop_for(ID_DROP_JUMP)
+        );
+        assert_eq!(
+            f.judge(&"BTC", 9_002, 0, A, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
             IdVerdict {
                 decision: IdDecision::Admit,
                 reset: Some(ID_RESET_VENUE_RESET),
@@ -9729,9 +9784,9 @@ mod tests {
     #[test]
     fn a_quiet_key_reopens_without_a_reset() {
         let mut f = id_floor();
-        assert_eq!(f.judge(&"BTC", 500, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 500, 0, A, SEC), admit());
         assert_eq!(
-            f.judge(&"BTC", 400, A, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            f.judge(&"BTC", 400, 0, A, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
             admit()
         );
     }
@@ -9742,16 +9797,16 @@ mod tests {
     fn an_id_less_copy_is_dropped_until_the_regime_times_out() {
         let mut f = id_floor();
         assert_eq!(
-            f.judge(&"BTC", 0, A, SEC),
+            f.judge(&"BTC", 0, 0, A, SEC),
             IdVerdict {
                 decision: IdDecision::Legacy,
                 reset: None
             }
         );
-        assert_eq!(f.judge(&"BTC", 7, A, SEC), admit());
-        assert_eq!(f.judge(&"BTC", 0, B, 2 * SEC), drop_for(ID_DROP_REGIME));
+        assert_eq!(f.judge(&"BTC", 7, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 0, 0, B, 2 * SEC), drop_for(ID_DROP_REGIME));
         assert_eq!(
-            f.judge(&"BTC", 0, B, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            f.judge(&"BTC", 0, 0, B, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
             IdVerdict {
                 decision: IdDecision::Legacy,
                 reset: Some(ID_RESET_REGIME_TIMEOUT),
@@ -9760,7 +9815,7 @@ mod tests {
         // The state is gone, not just bypassed: the floor is empty again.
         assert!(f.is_empty());
         assert_eq!(
-            f.judge(&"BTC", 0, B, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            f.judge(&"BTC", 0, 0, B, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
             IdVerdict {
                 decision: IdDecision::Legacy,
                 reset: None
@@ -9841,6 +9896,18 @@ mod tests {
         assert_eq!(m.quotes_no_source_ts.with_label_values(&[venue]).get(), 0);
     }
 
+    /// Drive the arbiter's quote ID clock by hand; returns the handle to move it with.
+    fn hand_clock(a: &mut Arbiter, start: u64) -> Arc<std::sync::atomic::AtomicU64> {
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(start));
+        let read = clock.clone();
+        a.set_quote_id_clock(move || read.load(std::sync::atomic::Ordering::Relaxed));
+        clock
+    }
+
+    fn set_clock(clock: &std::sync::atomic::AtomicU64, ns: u64) {
+        clock.store(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Mixed fleet: one path fills the ID, the other does not. The ID-less copies are dropped —
     /// `source_ts == 0` ones included, since that is every quote of such a feed — until the ID path
     /// goes silent for the regime timeout; then the old path is served exactly as today.
@@ -9852,27 +9919,26 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         let t = 1_000 * SEC;
+        let clock = hand_clock(&mut a, t);
         let send = |a: &mut Arbiter, q: NormalizedQuote, p| {
             a.emit(FeedMessage::Quote(q), p, TEST_CATEGORY)
         };
-        send(&mut a, id_quote(venue, 1, 0, 100.0, t), new_path);
-        send(&mut a, id_quote(venue, 0, 0, 100.0, t), old_path);
-        send(&mut a, id_quote(venue, 2, 0, 101.0, t + 1), new_path);
-        send(&mut a, id_quote(venue, 0, 0, 101.0, t + 2), old_path);
+        let wall = now_ns();
+        send(&mut a, id_quote(venue, 1, 0, 100.0, wall), new_path);
+        send(&mut a, id_quote(venue, 0, 0, 100.0, wall), old_path);
+        send(&mut a, id_quote(venue, 2, 0, 101.0, wall), new_path);
+        send(&mut a, id_quote(venue, 0, 0, 101.0, wall), old_path);
         assert_eq!(drain_bids(&mut rx), vec![100.0, 101.0]);
         assert_eq!(id_metric(venue, ID_DROP_REGIME), 2);
 
         // The new path goes silent. Inside the timeout the old path stays muted ...
-        send(
-            &mut a,
-            id_quote(venue, 0, 0, 102.0, t + 1 + QUOTE_ID_REGIME_TIMEOUT_NS - 1),
-            old_path,
-        );
+        set_clock(&clock, t + QUOTE_ID_REGIME_TIMEOUT_NS - 1);
+        send(&mut a, id_quote(venue, 0, 0, 102.0, wall), old_path);
         assert!(drain_bids(&mut rx).is_empty());
         // ... and past it the key returns to today's bypass, counted once.
-        let at = t + 1 + QUOTE_ID_REGIME_TIMEOUT_NS;
-        send(&mut a, id_quote(venue, 0, 0, 103.0, at), old_path);
-        send(&mut a, id_quote(venue, 0, 0, 104.0, at + 1), old_path);
+        set_clock(&clock, t + QUOTE_ID_REGIME_TIMEOUT_NS);
+        send(&mut a, id_quote(venue, 0, 0, 103.0, wall), old_path);
+        send(&mut a, id_quote(venue, 0, 0, 104.0, wall), old_path);
         assert_eq!(drain_bids(&mut rx), vec![103.0, 104.0]);
         assert_eq!(reset_metric(venue, ID_RESET_REGIME_TIMEOUT), 1);
         assert_eq!(
@@ -9894,23 +9960,21 @@ mod tests {
         let old_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
+        let clock = hand_clock(&mut a, SEC);
         let t = now_ns();
         a.emit(
             FeedMessage::Quote(id_quote(venue, 9, t, 100.0, t)),
             new_path,
             TEST_CATEGORY,
         );
-        let at = t + QUOTE_ID_REGIME_TIMEOUT_NS;
-        a.emit(
-            FeedMessage::Quote(id_quote(venue, 0, at, 101.0, at)),
-            old_a,
-            TEST_CATEGORY,
-        );
-        a.emit(
-            FeedMessage::Quote(id_quote(venue, 0, at, 102.0, at)),
-            old_b,
-            TEST_CATEGORY,
-        );
+        set_clock(&clock, SEC + QUOTE_ID_REGIME_TIMEOUT_NS);
+        for (path, bid) in [(old_a, 101.0), (old_b, 102.0)] {
+            a.emit(
+                FeedMessage::Quote(id_quote(venue, 0, t + 1, bid, t + 1)),
+                path,
+                TEST_CATEGORY,
+            );
+        }
         assert_eq!(drain_bids(&mut rx), vec![100.0, 101.0]);
     }
 
@@ -9921,6 +9985,7 @@ mod tests {
         let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
+        let clock = hand_clock(&mut a, SEC);
         let t = now_ns();
         a.emit(
             FeedMessage::Quote(id_quote(venue, 5, t, 100.0, t)),
@@ -9932,9 +9997,9 @@ mod tests {
             Transport::PublicWs,
             TEST_CATEGORY,
         );
-        let at = t + QUOTE_ID_REGIME_TIMEOUT_NS;
+        set_clock(&clock, SEC + QUOTE_ID_REGIME_TIMEOUT_NS);
         a.emit(
-            FeedMessage::Quote(id_quote(venue, 0, at, 101.0, at)),
+            FeedMessage::Quote(id_quote(venue, 0, t + 2, 101.0, t + 2)),
             Transport::PublicWs,
             TEST_CATEGORY,
         );
@@ -9946,6 +10011,85 @@ mod tests {
                 .get(),
             1
         );
+    }
+
+    /// The regime timeout runs on the monotonic clock. A quote whose wall-clock `recv_ts_ns` says
+    /// a minute has passed (an NTP step forward) does not expire the key; the monotonic clock
+    /// passing the timeout does, whatever the wall clock says.
+    #[test]
+    fn arbiter_regime_timeout_ignores_the_wall_clock() {
+        let venue = "IdMonotonic";
+        let new_path = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let old_path = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let clock = hand_clock(&mut a, SEC);
+        let wall = now_ns();
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 1, 0, 100.0, wall)),
+            new_path,
+            TEST_CATEGORY,
+        );
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 0, 0, 101.0, wall + 60 * SEC)),
+            old_path,
+            TEST_CATEGORY,
+        );
+        assert_eq!(drain_bids(&mut rx), vec![100.0]);
+        // A step *back* on the wall clock with the monotonic clock past the timeout: expires.
+        set_clock(&clock, SEC + QUOTE_ID_REGIME_TIMEOUT_NS);
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 0, 0, 102.0, wall - 60 * SEC)),
+            old_path,
+            TEST_CATEGORY,
+        );
+        assert_eq!(drain_bids(&mut rx), vec![102.0]);
+    }
+
+    /// One ID carrying two contents is dropped as a `conflict`, not as a duplicate: the signal that
+    /// a path's padding is not a venue counter.
+    #[test]
+    fn arbiter_same_id_with_other_content_is_a_conflict() {
+        let venue = "IdConflict";
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let t = now_ns();
+        for (path, bid) in [(edge_a, 100.0), (edge_b, 100.0), (edge_b, 105.0)] {
+            a.emit(
+                FeedMessage::Quote(id_quote(venue, 42, 0, bid, t)),
+                path,
+                TEST_CATEGORY,
+            );
+        }
+        assert_eq!(drain_bids(&mut rx), vec![100.0]);
+        assert_eq!(id_metric(venue, ID_DROP_DUPLICATE), 1);
+        assert_eq!(id_metric(venue, ID_DROP_CONFLICT), 1);
+    }
+
+    /// A source count of `0` is "unavailable", so a path reporting `0` where its peer reports `5`
+    /// for the same ID is a duplicate, not a conflict.
+    #[test]
+    fn arbiter_counts_do_not_make_a_conflict() {
+        let venue = "IdConflictCounts";
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let t = now_ns();
+        let mut counted = id_quote(venue, 42, 0, 100.0, t);
+        counted.bid_n = 5;
+        counted.ask_n = 3;
+        a.emit(FeedMessage::Quote(counted), edge_a, TEST_CATEGORY);
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 42, 0, 100.0, t)),
+            edge_b,
+            TEST_CATEGORY,
+        );
+        assert_eq!(drain_bids(&mut rx), vec![100.0]);
+        assert_eq!(id_metric(venue, ID_DROP_DUPLICATE), 1);
+        assert_eq!(id_metric(venue, ID_DROP_CONFLICT), 0);
     }
 
     /// The future-skew guard still runs first: an ID quote stamped far ahead of the host clock is
