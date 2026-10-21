@@ -141,7 +141,7 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Option<M
             ask_qty_raw: u64le(b, body + 40)?,
             bid_n: u16le(b, body + 48)?,
             ask_n: u16le(b, body + 50)?,
-            venue_update_id: quote_venue_update_id(b, o),
+            venue_update_id: quote_venue_update_id(b, o, schema_version),
         }),
         MSG_TRADE => Message::Trade(Trade {
             instrument_id: u32le(b, body)?,
@@ -171,11 +171,17 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Option<M
     })
 }
 
-/// The quote at message offset `o`'s `Venue Update ID`, or `0` when its declared length does not
-/// cover the field. The walker hands the body decoder the whole datagram, not the message
+/// The quote at message offset `o`'s `Venue Update ID`, or `0` when the field is not there.
+///
+/// Two ways it is not. The field is defined in top-of-book `3.2.0`, so only on Schema Version `3`:
+/// under `1.x` these bytes are padding and mean nothing, whatever they hold. And the declared length
+/// must cover it: the walker hands the body decoder the whole datagram, not the message
 /// (`codec_common::decode_datagram_with`), so the bounds-checked reader alone would let a quote that
 /// under-declares its length read its ID out of the *next* message in the datagram.
-fn quote_venue_update_id(b: &[u8], o: usize) -> u32 {
+fn quote_venue_update_id(b: &[u8], o: usize, schema_version: u8) -> u32 {
+    if schema_version != SCHEMA_V3 {
+        return 0;
+    }
     let declared = b.get(o + 1).copied().map_or(0, usize::from);
     if declared < QUOTE_VENUE_UPDATE_ID_OFFSET + 4 {
         return 0;
@@ -190,6 +196,10 @@ mod tests {
 
     // Minimal encoder for a single-Quote datagram, to round-trip the decoder.
     fn encode_quote_datagram(q: &Quote) -> Vec<u8> {
+        encode_quote_datagram_at(q, SCHEMA_V3)
+    }
+
+    fn encode_quote_datagram_at(q: &Quote, schema_version: u8) -> Vec<u8> {
         let mut body = vec![MSG_QUOTE, 60u8, 0, 0]; // msg header: type, len, flags(u16)
         body.extend_from_slice(&q.instrument_id.to_le_bytes());
         body.extend_from_slice(&q.source_id.to_le_bytes());
@@ -207,7 +217,7 @@ mod tests {
         let datagram_len = (DATAGRAM_HEADER_SIZE + body.len()) as u16;
         let mut datagram = Vec::new();
         datagram.extend_from_slice(&MAGIC.to_le_bytes());
-        datagram.push(1); // schema version
+        datagram.push(schema_version);
         datagram.push(0); // channel
         datagram.extend_from_slice(&0u64.to_le_bytes()); // sequence
         datagram.extend_from_slice(&0u64.to_le_bytes()); // send ts
@@ -267,6 +277,23 @@ mod tests {
         assert_eq!(got.venue_update_id, 0x0403_0201);
         // Nothing else moved: the source counts just before it still decode.
         assert_eq!((got.bid_n, got.ask_n), (5, 3));
+    }
+
+    /// Under Schema Version `1` the bytes are padding, not a `Venue Update ID`: a nonzero value
+    /// there decodes as no ID, so a `1.x` publisher can never put a key in the ID regime.
+    #[test]
+    fn schema_1_padding_is_never_a_venue_update_id() {
+        let q = sample_quote(0xDEAD_BEEF);
+        let (_h, msgs) = decode_datagram(&encode_quote_datagram_at(&q, SCHEMA_V1)).unwrap();
+        let Message::Quote(got) = &msgs[0] else {
+            panic!("expected quote");
+        };
+        assert_eq!(got.venue_update_id, 0);
+        let (_h, msgs) = decode_datagram(&encode_quote_datagram_at(&q, SCHEMA_V3)).unwrap();
+        let Message::Quote(got) = &msgs[0] else {
+            panic!("expected quote");
+        };
+        assert_eq!(got.venue_update_id, 0xDEAD_BEEF);
     }
 
     /// Today's encoders write `dst[56..60].fill(0)` (the shared `dz-edge-tob` encoder), so every

@@ -503,7 +503,7 @@ Modules are grouped by role under `src/`:
   (venues interned via `model::venue_arc`), so building the dedup key allocates nothing in steady
   state. The quote floor lived inside `TobProcessor` under
   PR #29; it was lifted here so the WS input can race in the same floor.
-  **A quote carrying a nonzero `Venue Update ID`** (TOB `3.2.0`, the low 32 bits of a venue-assigned
+  **A quote carrying a nonzero `Venue Update ID`** (TOB `3.2.0`, read on Schema Version `3` only, the low 32 bits of a venue-assigned
   per-instrument book update counter) puts its `(source, symbol)` key in the **ID regime**
   (`UpdateIdFloor`, `docs/design/quote-update-id-dedupe.md`): the first copy of each ID wins in serial
   order with no leader latch, ID-less copies on that key are dropped (`source_ts == 0` ones included),

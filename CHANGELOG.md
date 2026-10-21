@@ -514,7 +514,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A forward jump past `--arb-quote-id-max-jump` (default 1,000,000) waits for a second path to
   corroborate it. New metrics: `dz_quotes_update_id_admitted_total`,
   `dz_quotes_update_id_dropped_total{reason}` and `dz_quote_floor_resets_total{reason}`. Every
-  publisher whose encoder zero-fills those bytes decodes to ID `0` and dedupes exactly as before. The
+  publisher whose encoder zero-fills those bytes decodes to ID `0` and dedupes exactly as before, and
+  so does every Schema Version `1` publisher, where the bytes are padding whatever they hold. The
   field is not on the WebSocket JSON. Design: `docs/design/quote-update-id-dedupe.md`.
 - Registry rows may declare `shared_batch_id` (default false, one value per venue and category, refused on a row with no book), set on `edge-phoenix-mbp` in the built-in document only: the hosted document does not declare it yet, so a host loading that one still re-baselines every handover. In a declared scope, a book failover between paths at the same committed slot holding identical levels goes out as an ordinary delta rather than a re-baseline; a mismatch counts `dz_book_path_divergence_total{venue}` and re-baselines as before.
 - **Binance feeds: USD-margined perpetuals and spot, Top-of-Book.** Two rows in the compiled-in
