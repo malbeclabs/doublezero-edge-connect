@@ -665,11 +665,8 @@ struct UpdateIdState<V, P> {
     /// The admitted quote's content. One ID is one book state, so a copy of it with other content
     /// means a path is not carrying a venue counter (`conflict`).
     content: V,
-    /// When it was admitted, on the quote's receive clock.
+    /// When it was admitted, on the monotonic clock.
     last_admit_ns: u64,
-    /// Whether an ID quote has been refused (stale or jump) since then: a clear on the timeout is then
-    /// a `venue_reset` rather than a quiet key reopening.
-    refused: bool,
     candidate: Option<JumpCandidate<P>>,
 }
 
@@ -679,7 +676,6 @@ impl<V, P> UpdateIdState<V, P> {
             last: id,
             content,
             last_admit_ns: now_ns,
-            refused: false,
             candidate: None,
         }
     }
@@ -739,15 +735,20 @@ impl<K: Eq + Hash + Clone, V: Eq, P: Eq + Copy> UpdateIdFloor<K, V, P> {
             return verdict(IdDecision::Admit, None);
         };
         if now_ns.saturating_sub(st.last_admit_ns) >= QUOTE_ID_REGIME_TIMEOUT_NS {
-            // Refused IDs kept arriving and none was admitted: the counter restarted, or a forged ID
-            // held the key. Otherwise an ID-less quote is the fallback the timeout exists for, and an
-            // ID quote after a plain silence is a quiet key reopening, which is not counted.
-            let reset = if st.refused {
-                Some(ID_RESET_VENUE_RESET)
-            } else if id == 0 {
+            // Classified by the quote that expires the key, not by what was refused before: one
+            // delayed mirror's stale copy followed by a quiet spell is not a reset. An ID-less quote
+            // is the fallback the timeout exists for. An ID the old state would still refuse — older,
+            // or a jump past the cap — means the counter restarted or a forged ID held the key. An
+            // ordinary advance (or the same ID again) is a quiet key reopening, which is not counted.
+            let advance = id.wrapping_sub(st.last);
+            let ordinary =
+                advance == 0 || (update_id_newer(id, st.last) && advance <= self.max_jump);
+            let reset = if id == 0 {
                 Some(ID_RESET_REGIME_TIMEOUT)
-            } else {
+            } else if ordinary {
                 None
+            } else {
+                Some(ID_RESET_VENUE_RESET)
             };
             if id == 0 {
                 self.state.remove(key);
@@ -784,7 +785,6 @@ impl<K: Eq + Hash + Clone, V: Eq, P: Eq + Copy> UpdateIdFloor<K, V, P> {
                 return verdict(IdDecision::Admit, Some(ID_RESET_CORROBORATED_JUMP));
             }
         }
-        st.refused = true;
         if update_id_newer(id, st.last) {
             st.candidate = Some(JumpCandidate { id, from });
             verdict(IdDecision::Drop(ID_DROP_JUMP), None)
@@ -9780,14 +9780,22 @@ mod tests {
     }
 
     /// A key that was only quiet reopens fresh on its next ID, without a reset count: the metric is
-    /// an alert signal, not a census of idle instruments. Even an ID that now compares as older.
+    /// an alert signal, not a census of idle instruments. A lone stale copy before the quiet spell
+    /// does not make it a reset; an ID after it that still compares as older does.
     #[test]
     fn a_quiet_key_reopens_without_a_reset() {
         let mut f = id_floor();
-        assert_eq!(f.judge(&"BTC", 500, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 10, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 12, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 11, 0, B, SEC), drop_for(ID_DROP_STALE));
+        let later = SEC + QUOTE_ID_REGIME_TIMEOUT_NS + SEC;
+        assert_eq!(f.judge(&"BTC", 13, 0, A, later), admit());
         assert_eq!(
-            f.judge(&"BTC", 400, 0, A, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
-            admit()
+            f.judge(&"BTC", 5, 0, A, later + QUOTE_ID_REGIME_TIMEOUT_NS),
+            IdVerdict {
+                decision: IdDecision::Admit,
+                reset: Some(ID_RESET_VENUE_RESET),
+            }
         );
     }
 

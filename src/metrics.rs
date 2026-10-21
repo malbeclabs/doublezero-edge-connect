@@ -180,8 +180,9 @@ pub struct Metrics {
     /// Quote keys whose `Venue Update ID` state was cleared, by `reason`: `regime_timeout` (no ID
     /// admitted for the regime timeout, and an ID-less quote took the key back to the `source_ts`
     /// floor), `corroborated_jump` (a second path confirmed a jump past the cap) and `venue_reset`
-    /// (IDs kept arriving refused for the whole timeout: the venue restarted its counter, or a forged
-    /// ID held the key). A key that was only quiet reopens without a count.
+    /// (the first ID after the timeout still compares as older, or as a jump past the cap: the venue
+    /// restarted its counter, or a forged ID held the key). A key that was only quiet reopens without
+    /// a count, even after a lone stale copy.
     pub quote_floor_resets: IntCounterVec,
     /// Nanoseconds between the two paths' copies of one **matched trade**, on our own receive clock —
     /// the series `--arb-transfer-margin-us` is read off. Fed only by
