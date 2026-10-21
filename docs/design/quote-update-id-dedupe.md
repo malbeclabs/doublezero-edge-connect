@@ -45,6 +45,9 @@ and the floor has to latch a leader to order them (`arbiter.rs:13-25`). The coun
 `decode_body` reads `Quote` at fixed offsets and stops at `ask_n`, message offset 54
 (`src/ingest/codec.rs:122-133`). Add one read: `u32le(b, body + 52)`, message offset 56..60.
 
+**Read it only on Schema Version `3`.** The field is defined in top-of-book `3.2.0`; under `1.x`,
+which this decoder still accepts, the bytes are padding whatever they hold, and they decode as `0`.
+
 **Read it only when the message's declared length covers those bytes** (`b[o + 1] >= 60`).
 *Changed from the earlier draft, which said the bounds-checked readers were enough.* They are not:
 the walker hands `decode_body` the whole datagram, not the message (`src/ingest/codec_common.rs:246`),
@@ -67,6 +70,13 @@ it to `0` (`src/ingest/ws_input.rs:241`).
 
 Per key `(SourceKey, symbol)`, the same key as today's floor. A key is in the **ID regime** while it
 holds ID state.
+
+The key stays the symbol, not `(channel, instrument_id)`: Instrument IDs are assigned per publisher,
+and two paths of one engine need not agree on them, so an ID-keyed state would never see the second
+path's copies. The symbol collision `PROTOCOL.md` warns of is the 16-byte market-by-price field. A
+quote that carries the ID comes from a Schema Version `3` publisher, whose `InstrumentDefinition`
+symbol is `char[64]`. Two instruments of one Source ID that still shared a symbol would already share
+today's quote floor and every consumer's quote key, so this design does not try to separate them.
 
 | Quote carries | Key state | Decision |
 |---|---|---|
@@ -213,6 +223,7 @@ per `source_ts` tick and does not count ID-regime quotes.
 - The timeout runs on the monotonic clock: a quote's wall-clock `recv_ts_ns` does not move it.
 - A venue counter reset: refused until the timeout, then a `venue_reset` and the new IDs admitted.
 - The zero collision on an ID key drops as `regime`.
+- A Schema Version `1` quote decodes ID `0` whatever its padding holds.
 - A quote with zero padding, from today's encoder, decodes ID `0`; a quote that declares fewer than 60
   bytes decodes ID `0` and does not read the next message.
 - Existing traffic: the recorded two-publisher fixtures decode to ID `0` throughout, and the floor and
