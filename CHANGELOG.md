@@ -512,8 +512,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delivered every quote twice. A key that sees a nonzero ID now admits each ID once, in serial order,
   from whichever path delivers it first, and drops ID-less copies until it has admitted no ID for 5 s.
   A forward jump past `--arb-quote-id-max-jump` (default 1,000,000) waits for a second path to
-  corroborate it. New metrics: `dz_quotes_update_id_admitted_total`,
-  `dz_quotes_update_id_dropped_total{reason}` and `dz_quote_floor_resets_total{reason}`. Every
+  corroborate it. The key includes the canonical channel, and copies of one ID are
+  compared on their raw wire integers: under other exponents they are definition skew (`skew`), and
+  under one scale with other content a `conflict`, which stops that source using the field for 60 s.
+  New metrics: `dz_quotes_update_id_admitted_total`, `dz_quotes_update_id_dropped_total{reason}`,
+  `dz_quotes_update_id_disabled_total` and `dz_quote_floor_resets_total{reason}`. Every
   publisher whose encoder zero-fills those bytes decodes to ID `0` and dedupes exactly as before, and
   so does every Schema Version `1` publisher, where the bytes are padding whatever they hold. The
   field is not on the WebSocket JSON. Design: `docs/design/quote-update-id-dedupe.md`.

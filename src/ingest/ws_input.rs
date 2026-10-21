@@ -254,6 +254,7 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         kernel_rx_ts_ns: 0, // no kernel RX timestamp for a user-space WS read (0 = sentinel)
         ws_send_ts_ns: 0,   // stamped by the WS server just before send
         venue_update_id: 0, // the public feed carries no venue update counter
+        wire: crate::model::QuoteWire::default(),
     };
     metrics()
         .ws_input_messages

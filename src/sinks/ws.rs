@@ -1368,6 +1368,7 @@ mod tests {
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
             venue_update_id: 0,
+            wire: crate::model::QuoteWire::default(),
         }
     }
 
@@ -1725,6 +1726,7 @@ mod tests {
                 kernel_rx_ts_ns: 0,
                 ws_send_ts_ns: 0,
                 venue_update_id: 0,
+                wire: crate::model::QuoteWire::default(),
             })
         };
         let status = |source_id| {

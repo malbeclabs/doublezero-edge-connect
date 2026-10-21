@@ -653,6 +653,18 @@ impl DatagramProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                         venue_update_id: q.venue_update_id,
+                        // The update id's comparison scope and exact content: the canonical
+                        // channel (a mirror's offset channel keys with its primary) and the raw
+                        // integers under the exponents they were scaled with.
+                        wire: crate::model::QuoteWire {
+                            channel: ctx.canonical_channel(header.channel_id),
+                            bid_price: q.bid_price_raw,
+                            bid_qty: q.bid_qty_raw,
+                            ask_price: q.ask_price_raw,
+                            ask_qty: q.ask_qty_raw,
+                            price_exponent,
+                            qty_exponent,
+                        },
                     };
                     // Cross-transport dedup happens downstream in the shared arbiter: the per-(venue,
                     // instrument) source_ts latch-to-leader floor races this edge publisher against
@@ -4487,6 +4499,56 @@ mod tests {
             channels.iter().all(|c| *c == 10),
             "every emitted channel must be canonical, got {channels:?}"
         );
+    }
+
+    /// The `Venue Update ID` arbiter keys on the **canonical** channel, so a mirror publisher's
+    /// quote on `N + 100` must reach it stamped `N`, with its raw integers and the exponents they
+    /// were scaled under (`NormalizedQuote::wire`).
+    #[test]
+    fn tob_mirror_quote_carries_its_canonical_channel_and_raw_values() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = TobProcessor::new(tape(false));
+        let ctx = |role| {
+            let mut c = tob_ctx(&arbiter, &instruments, role, TEST_PUB);
+            c.mirror_offset = Some(100);
+            c
+        };
+        let defs = |channel| {
+            tob_datagram_on_channel(
+                channel,
+                0,
+                &[
+                    enc_manifest_summary(1, 1),
+                    enc_instrument_def(41, "MARKET-X", 1),
+                ],
+            )
+        };
+        proc.on_datagram(&defs(10), &ctx(PortRole::Refdata));
+        proc.on_datagram(&defs(110), &ctx(PortRole::Refdata));
+        proc.on_datagram(
+            &tob_datagram_on_channel(10, 1, &[enc_tob_quote(41, 1, 1_000)]),
+            &ctx(PortRole::Mktdata),
+        );
+        proc.on_datagram(
+            &tob_datagram_on_channel(110, 2, &[enc_tob_quote(41, 1, 2_000)]),
+            &ctx(PortRole::Mktdata),
+        );
+        let mut wires = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Quote(q) = &*m {
+                wires.push(q.wire);
+            }
+        }
+        assert_eq!(wires.len(), 2, "{wires:?}");
+        for w in &wires {
+            assert_eq!(w.channel, 10, "the mirror's channel is canonical: {w:?}");
+            assert_eq!(
+                (w.bid_price, w.bid_qty, w.ask_price, w.ask_qty),
+                (100, 10, 101, 10),
+                "raw wire integers: {w:?}"
+            );
+        }
+        assert_eq!(wires[0], wires[1], "one market, one scale, one channel");
     }
 
     /// **The mirror finding, midpoint.** The same canonicalization

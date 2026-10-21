@@ -174,9 +174,13 @@ pub struct Metrics {
     /// carrying a venue counter, for example nonzero padding from an encoder older than the field),
     /// `stale` (an older ID), `regime` (an ID-less copy on a key in
     /// the ID regime; above zero for long outside a rollout means a publisher of that key is not
-    /// filling the field) and `jump` (a forward jump past `--arb-quote-id-max-jump`). Also counted in
-    /// `dz_quotes_dropped_total`.
+    /// filling the field), `jump` (a forward jump past `--arb-quote-id-max-jump`) and `skew` (the
+    /// same ID scaled under other exponents: two definitions of the instrument in flight, which
+    /// disables nothing). Also counted in `dz_quotes_dropped_total`.
     pub quotes_update_id_dropped: IntCounterVec,
+    /// `SourceKey`s that stopped using the `Venue Update ID` after a `conflict`, for
+    /// `QUOTE_ID_DISABLE_NS`; their quotes take the `source_ts` floor or bypass meanwhile.
+    pub quotes_update_id_disabled: IntCounterVec,
     /// Quote keys whose `Venue Update ID` state was cleared, by `reason`: `regime_timeout` (no ID
     /// admitted for the regime timeout, and an ID-less quote took the key back to the `source_ts`
     /// floor), `corroborated_jump` (a second path confirmed a jump past the cap) and `venue_reset`
@@ -716,8 +720,14 @@ impl Metrics {
                 &registry,
                 "dz_quotes_update_id_dropped_total",
                 "Quotes dropped on the venue update id, by reason \
-                 (duplicate/conflict/stale/regime/jump)",
+                 (duplicate/conflict/stale/regime/jump/skew)",
                 &["venue", "reason"],
+            ),
+            quotes_update_id_disabled: counter_vec(
+                &registry,
+                "dz_quotes_update_id_disabled_total",
+                "Sources that stopped using the venue update id for a while after a conflict",
+                &["venue"],
             ),
             quote_floor_resets: counter_vec(
                 &registry,
@@ -1362,6 +1372,9 @@ mod tests {
         m.quotes_update_id_dropped
             .with_label_values(&["QuoteIdNames", "duplicate"])
             .inc();
+        m.quotes_update_id_disabled
+            .with_label_values(&["QuoteIdNames"])
+            .inc();
         m.quote_floor_resets
             .with_label_values(&["QuoteIdNames", "regime_timeout"])
             .inc();
@@ -1498,6 +1511,7 @@ mod tests {
             "dz_depth_floor_resets_total",
             "dz_quotes_update_id_admitted_total",
             "dz_quotes_update_id_dropped_total",
+            "dz_quotes_update_id_disabled_total",
             "dz_quote_floor_resets_total",
             "dz_depth_lead_ns",
             "dz_quote_ticks_won_total",

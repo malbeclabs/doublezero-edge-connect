@@ -225,6 +225,27 @@ pub struct NormalizedQuote {
     /// JSON that PROTOCOL.md fixes, until that contract decides to expose it.
     #[serde(skip)]
     pub venue_update_id: u32,
+    /// The wire values the arbiter judges two copies of one `venue_update_id` on, producer-side
+    /// like it and never serialized. See [`QuoteWire`].
+    #[serde(skip)]
+    pub wire: QuoteWire,
+}
+
+/// A quote's canonical channel and its raw wire prices, quantities and exponents, carried beside
+/// the scaled `f64`s for the `Venue Update ID` arbiter. The channel is part of its key, because
+/// edge-feed-spec compares two update ids only within one Source ID and channel; it is
+/// `DatagramCtx::canonical_channel`, so a mirror publisher's offset channel keys with its primary.
+/// The raw integers let two copies of one ID be compared exactly under equal exponents, where the
+/// scaled values round; under different exponents the copies are definition skew, not a conflict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuoteWire {
+    pub channel: u8,
+    pub bid_price: i64,
+    pub bid_qty: u64,
+    pub ask_price: i64,
+    pub ask_qty: u64,
+    pub price_exponent: i8,
+    pub qty_exponent: i8,
 }
 
 /// A normalized trade print (last sale) from any venue. Like [`NormalizedQuote`] it rides the
@@ -1783,6 +1804,7 @@ mod tests {
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
             venue_update_id: 0,
+            wire: QuoteWire::default(),
         };
         let v: serde_json::Value = serde_json::to_value(&q).unwrap();
         assert_eq!(v["source_name"], "HYPERLIQUID");
@@ -1814,6 +1836,7 @@ mod tests {
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
             venue_update_id: 42,
+            wire: QuoteWire::default(),
         };
         let json = serde_json::to_string(&q).unwrap();
         assert!(!json.contains("venue_update_id"), "{json}");
