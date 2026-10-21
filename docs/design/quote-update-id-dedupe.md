@@ -111,6 +111,10 @@ the key was idle.
 The check runs when the next quote for the key arrives, against that quote's receive clock
 (`recv_ts_ns`, the clock the tape handover already uses at `arbiter.rs:3105`). Nothing sweeps.
 
+One cost of reopening fresh: a copy that arrives more than 5 s late, on a key that was quiet that
+long, is admitted even if its ID is older. Paths that far apart are not mirrors in any useful sense,
+and the next quote corrects it.
+
 The public WebSocket input carries ID `0`. On a key in the ID regime it fills in only after the
 timeout; on every other key its behavior is unchanged.
 
@@ -162,7 +166,8 @@ an alert signal rather than a measure of idle instruments.
 ## State and bounding
 
 Each key adds a `u32` last ID, the last-admit instant, a refused-since-admit flag, and an optional
-candidate (`u32`, its `Transport`, its arrival). No new keys: the key space is today's quote floor, a
+candidate (`u32` and its `Transport`). The candidate needs no age: an admit clears it, and with
+nothing admitted the whole key expires on the regime timeout first. No new keys: the key space is today's quote floor, a
 plain `HashMap` per `(SourceKey, symbol)` with no key cap (`arbiter.rs:474-480`). If that cap is ever
 added, the ID state goes with the entry.
 
