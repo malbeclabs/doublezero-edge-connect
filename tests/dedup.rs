@@ -191,6 +191,33 @@ fn raw_quotes_by_symbol(recs: &[(IpAddr, u8, Vec<u8>)]) -> HashMap<String, usize
     counts
 }
 
+/// Every quote in the recorded two-publisher captures comes from an encoder that predates the
+/// `Venue Update ID` and zero-fills those bytes, so each decodes to ID `0` and stays on the
+/// `source_ts` floor. With the exact emitted counts the tests below pin, this is the proof that
+/// existing traffic dedupes exactly as it did before the field existed.
+#[test]
+fn recorded_quotes_carry_no_venue_update_id() {
+    for path in [
+        "tests/fixtures/tob_btc_dual.combined.bin",
+        "tests/fixtures/tob_multi_dual.combined.bin",
+    ] {
+        let mut quotes = 0usize;
+        for (_ip, role, datagram) in read_combined(path) {
+            if role != 1 {
+                continue;
+            }
+            let (_h, msgs) = codec::decode_datagram(&datagram).expect("fixture datagram decodes");
+            for m in &msgs {
+                if let codec::Message::Quote(q) = m {
+                    quotes += 1;
+                    assert_eq!(q.venue_update_id, 0, "{path}: {q:?}");
+                }
+            }
+        }
+        assert!(quotes > 1000, "{path}: only {quotes} quotes");
+    }
+}
+
 /// Emitted-quote count per symbol from collected WS messages.
 fn emitted_quotes_by_symbol(msgs: &[Value]) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();

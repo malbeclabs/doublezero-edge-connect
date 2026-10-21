@@ -652,6 +652,7 @@ impl DatagramProcessor for TobProcessor {
                         recv_ts_ns: ctx.recv_ts_ns,
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
+                        venue_update_id: q.venue_update_id,
                     };
                     // Cross-transport dedup happens downstream in the shared arbiter: the per-(venue,
                     // instrument) source_ts latch-to-leader floor races this edge publisher against

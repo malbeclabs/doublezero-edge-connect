@@ -506,6 +506,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- **Quotes dedupe on the `Venue Update ID`** (edge-feed-spec top-of-book `3.2.0`, `Quote` offset 56:
+  the low 32 bits of a venue-assigned per-instrument book update counter, `0` = unavailable). A feed
+  whose quotes carry no `source_ts` used to bypass the quote floor, so two hot publishers of it
+  delivered every quote twice. A key that sees a nonzero ID now admits each ID once, in serial order,
+  from whichever path delivers it first, and drops ID-less copies until it has admitted no ID for 5 s.
+  A forward jump past `--arb-quote-id-max-jump` (default 1,000,000) waits for a second path to
+  corroborate it. New metrics: `dz_quotes_update_id_admitted_total`,
+  `dz_quotes_update_id_dropped_total{reason}` and `dz_quote_floor_resets_total{reason}`. Every
+  publisher whose encoder zero-fills those bytes decodes to ID `0` and dedupes exactly as before. The
+  field is not on the WebSocket JSON. Design: `docs/design/quote-update-id-dedupe.md`.
 - Registry rows may declare `shared_batch_id` (default false, one value per venue and category, refused on a row with no book), set on `edge-phoenix-mbp` in the built-in document only: the hosted document does not declare it yet, so a host loading that one still re-baselines every handover. In a declared scope, a book failover between paths at the same committed slot holding identical levels goes out as an ordinary delta rather than a re-baseline; a mismatch counts `dz_book_path_divergence_total{venue}` and re-baselines as before.
 - **Binance feeds: USD-margined perpetuals and spot, Top-of-Book.** Two rows in the compiled-in
   feed registry, `edge-binance-usdsm-tob` (group `233.84.178.23`, Source ID 6) and

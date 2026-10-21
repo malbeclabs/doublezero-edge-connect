@@ -166,6 +166,21 @@ pub struct Metrics {
     pub quotes_future_rejected: IntCounterVec,
     /// Quotes forwarded with the `source_ts == 0` "not available" sentinel (bypass the floor).
     pub quotes_no_source_ts: IntCounterVec,
+    /// Quotes admitted on the `Venue Update ID` (a key in the ID regime; see
+    /// [`crate::ingest::arbiter::UpdateIdFloor`]). Also counted in `dz_quotes_admitted_total`.
+    pub quotes_update_id_admitted: IntCounterVec,
+    /// Quotes dropped on the `Venue Update ID`, by `reason`: `duplicate` (the same ID again — the
+    /// steady state of a second path), `stale` (an older ID), `regime` (an ID-less copy on a key in
+    /// the ID regime; above zero for long outside a rollout means a publisher of that key is not
+    /// filling the field) and `jump` (a forward jump past `--arb-quote-id-max-jump`). Also counted in
+    /// `dz_quotes_dropped_total`.
+    pub quotes_update_id_dropped: IntCounterVec,
+    /// Quote keys whose `Venue Update ID` state was cleared, by `reason`: `regime_timeout` (no ID
+    /// admitted for the regime timeout, and an ID-less quote took the key back to the `source_ts`
+    /// floor), `corroborated_jump` (a second path confirmed a jump past the cap) and `venue_reset`
+    /// (IDs kept arriving refused for the whole timeout: the venue restarted its counter, or a forged
+    /// ID held the key). A key that was only quiet reopens without a count.
+    pub quote_floor_resets: IntCounterVec,
     /// Nanoseconds between the two paths' copies of one **matched trade**, on our own receive clock —
     /// the series `--arb-transfer-margin-us` is read off. Fed only by
     /// [`crate::ingest::path_race::PathRace`] pairs, never by a dropped copy's inter-path phase.
@@ -687,6 +702,26 @@ impl Metrics {
                 "dz_quotes_no_source_ts_total",
                 "Quotes forwarded with the source_ts==0 sentinel (floor bypassed)",
                 &["venue"],
+            ),
+            quotes_update_id_admitted: counter_vec(
+                &registry,
+                "dz_quotes_update_id_admitted_total",
+                "Quotes admitted on the venue update id (key in the id regime)",
+                &["venue"],
+            ),
+            quotes_update_id_dropped: counter_vec(
+                &registry,
+                "dz_quotes_update_id_dropped_total",
+                "Quotes dropped on the venue update id, by reason \
+                 (duplicate/stale/regime/jump)",
+                &["venue", "reason"],
+            ),
+            quote_floor_resets: counter_vec(
+                &registry,
+                "dz_quote_floor_resets_total",
+                "Quote keys whose venue update id state was cleared, by reason \
+                 (regime_timeout/corroborated_jump/venue_reset)",
+                &["venue", "reason"],
             ),
             path_lead_ns: histogram_vec(
                 &registry,
@@ -1318,6 +1353,15 @@ mod tests {
         m.depth_floor_resets
             .with_label_values(&["HYPERLIQUID", "end_of_session"])
             .inc();
+        m.quotes_update_id_admitted
+            .with_label_values(&["QuoteIdNames"])
+            .inc();
+        m.quotes_update_id_dropped
+            .with_label_values(&["QuoteIdNames", "duplicate"])
+            .inc();
+        m.quote_floor_resets
+            .with_label_values(&["QuoteIdNames", "regime_timeout"])
+            .inc();
         m.depth_lead_ns
             .with_label_values(&["HYPERLIQUID", "edge", "public"])
             .observe(123_456.0);
@@ -1449,6 +1493,9 @@ mod tests {
             "dz_depth_admitted_total",
             "dz_depth_dropped_total",
             "dz_depth_floor_resets_total",
+            "dz_quotes_update_id_admitted_total",
+            "dz_quotes_update_id_dropped_total",
+            "dz_quote_floor_resets_total",
             "dz_depth_lead_ns",
             "dz_quote_ticks_won_total",
             "dz_depth_ticks_won_total",
