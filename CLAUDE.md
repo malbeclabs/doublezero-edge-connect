@@ -503,6 +503,17 @@ Modules are grouped by role under `src/`:
   (venues interned via `model::venue_arc`), so building the dedup key allocates nothing in steady
   state. The quote floor lived inside `TobProcessor` under
   PR #29; it was lifted here so the WS input can race in the same floor.
+  **A quote carrying a nonzero `Venue Update ID`** (TOB `3.2.0`, read on Schema Version `3` only, the low 32 bits of a venue-assigned
+  per-instrument book update counter) puts its `(source, canonical channel, symbol)` key in the **ID regime**
+  (`UpdateIdFloor`, `docs/design/quote-update-id-dedupe.md`): the first copy of each ID wins in serial
+  order with no leader latch, ID-less copies on that key are dropped (`source_ts == 0` ones included),
+  a forward jump past `--arb-quote-id-max-jump` waits for a different `Transport` to corroborate it,
+  and a key that admits no ID for `QUOTE_ID_REGIME_TIMEOUT_NS` (5 s) drops its state on its next
+  quote. Copies of one ID are compared on raw wire integers: other exponents drop as `skew`, other
+  content under one scale as `conflict`, which disables the field for that source for
+  `QUOTE_ID_DISABLE_NS` (60 s). Exempt from every session reset, like the quote floor. An ID-`0` quote
+  on a key outside the regime reads no clock and builds no content, so today's traffic takes the
+  unchanged path.
   **Depth diverges from quotes in one deliberate way: it has NO `source_ts == 0` bypass** (#28). For
   quotes 0 is the "not available" sentinel and is forwarded unlatched; for depth 0 is a *real* state —
   the initial synced-but-empty book each publisher emits right after its snapshot anchor — and the two

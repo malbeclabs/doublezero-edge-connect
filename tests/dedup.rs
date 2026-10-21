@@ -191,6 +191,44 @@ fn raw_quotes_by_symbol(recs: &[(IpAddr, u8, Vec<u8>)]) -> HashMap<String, usize
     counts
 }
 
+/// Every quote in the recorded two-publisher captures comes from an encoder that predates the
+/// `Venue Update ID` and zero-fills those bytes. Checked on the raw bytes, not only through the
+/// decoder, which reads no ID from a Schema Version `1` datagram whatever the bytes hold. So each
+/// quote decodes to ID `0` and stays on the `source_ts` floor, and with the exact emitted counts the
+/// tests below pin, this is the proof that existing traffic dedupes exactly as it did before.
+#[test]
+fn recorded_quotes_carry_no_venue_update_id() {
+    for path in [
+        "tests/fixtures/tob_btc_dual.combined.bin",
+        "tests/fixtures/tob_multi_dual.combined.bin",
+    ] {
+        let mut quotes = 0usize;
+        for (_ip, role, datagram) in read_combined(path) {
+            if role != 1 {
+                continue;
+            }
+            let (_h, msgs) = codec::decode_datagram(&datagram).expect("fixture datagram decodes");
+            for m in &msgs {
+                if let codec::Message::Quote(q) = m {
+                    assert_eq!(q.venue_update_id, 0, "{path}: {q:?}");
+                }
+            }
+            // The raw walk: every quote's bytes 56..60 are zero.
+            let mut off = 24;
+            for _ in 0..datagram[20] {
+                let (kind, len) = (datagram[off], usize::from(datagram[off + 1]));
+                if kind == codec::MSG_QUOTE {
+                    assert_eq!(len, usize::from(codec::QUOTE_SIZE), "{path}");
+                    assert_eq!(&datagram[off + 56..off + 60], &[0, 0, 0, 0], "{path}");
+                    quotes += 1;
+                }
+                off += len;
+            }
+        }
+        assert!(quotes > 1000, "{path}: only {quotes} quotes");
+    }
+}
+
 /// Emitted-quote count per symbol from collected WS messages.
 fn emitted_quotes_by_symbol(msgs: &[Value]) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();

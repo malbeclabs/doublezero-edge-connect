@@ -219,6 +219,33 @@ pub struct NormalizedQuote {
     /// 0 until the WS server stamps it.
     #[serde(default)]
     pub ws_send_ts_ns: u64,
+    /// Low 32 bits of the venue-assigned per-instrument book update counter (the top-of-book
+    /// `Quote` `Venue Update ID`), `0` when unavailable. A **producer-side** dedupe key for the
+    /// arbiter, like `NormalizedTrade::category`: `#[serde(skip)]`, so it never reaches the WebSocket
+    /// JSON that PROTOCOL.md fixes, until that contract decides to expose it.
+    #[serde(skip)]
+    pub venue_update_id: u32,
+    /// The wire values the arbiter judges two copies of one `venue_update_id` on, producer-side
+    /// like it and never serialized. See [`QuoteWire`].
+    #[serde(skip)]
+    pub wire: QuoteWire,
+}
+
+/// A quote's canonical channel and its raw wire prices, quantities and exponents, carried beside
+/// the scaled `f64`s for the `Venue Update ID` arbiter. The channel is part of its key, because
+/// edge-feed-spec compares two update ids only within one Source ID and channel; it is
+/// `DatagramCtx::canonical_channel`, so a mirror publisher's offset channel keys with its primary.
+/// The raw integers let two copies of one ID be compared exactly under equal exponents, where the
+/// scaled values round; under different exponents the copies are definition skew, not a conflict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuoteWire {
+    pub channel: u8,
+    pub bid_price: i64,
+    pub bid_qty: u64,
+    pub ask_price: i64,
+    pub ask_qty: u64,
+    pub price_exponent: i8,
+    pub qty_exponent: i8,
 }
 
 /// A normalized trade print (last sale) from any venue. Like [`NormalizedQuote`] it rides the
@@ -1776,6 +1803,8 @@ mod tests {
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            venue_update_id: 0,
+            wire: QuoteWire::default(),
         };
         let v: serde_json::Value = serde_json::to_value(&q).unwrap();
         assert_eq!(v["source_name"], "HYPERLIQUID");
@@ -1785,6 +1814,35 @@ mod tests {
             v.get("source").is_none(),
             "bare `source` still emitted: {v}"
         );
+    }
+
+    /// `venue_update_id` is a producer-side dedupe key: it never reaches the WebSocket JSON that
+    /// PROTOCOL.md fixes, and a consumer payload without it still deserializes (to `0`).
+    #[test]
+    fn a_quote_keeps_its_venue_update_id_off_the_wire() {
+        let q = NormalizedQuote {
+            venue: Arc::from("V"),
+            source_name: Arc::from("V"),
+            source_id: 1,
+            symbol: Arc::from("SOL"),
+            bid: 1.0,
+            ask: 2.0,
+            bid_size: 3.0,
+            ask_size: 4.0,
+            bid_n: 0,
+            ask_n: 0,
+            source_ts_ns: 0,
+            recv_ts_ns: 0,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+            venue_update_id: 42,
+            wire: QuoteWire::default(),
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(!json.contains("venue_update_id"), "{json}");
+        assert!(!json.contains("42"), "{json}");
+        let back: NormalizedQuote = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.venue_update_id, 0);
     }
 
     /// A payload written before these fields existed must still deserialize, or every committed
