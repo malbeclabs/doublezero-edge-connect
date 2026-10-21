@@ -175,17 +175,19 @@ is admitted. A jump past the cap heals when a second path corroborates it. A cou
 lower compares as older on every path, so it heals only on the regime timeout: one 5 s gap per
 restart, accepted for the reason older IDs never corroborate. The clear goes through one reset helper shaped like
 `reset_depth_floor_for_symbol` and `record_floor_resets` (`arbiter.rs:2103-2126`), counted by reason.
-A clear after refused IDs counts as `venue_reset`; a clear that hands the key back to an ID-less quote
-counts as `regime_timeout`. A key that was only quiet re-enters without a count, so the metric stays
-an alert signal rather than a measure of idle instruments.
+The quote that expires the key decides the reason, not what was refused before it. A clear that
+hands the key to an ID-less quote counts as `regime_timeout`. A clear on an ID that the old state
+would still refuse, older or a jump past the cap, counts as `venue_reset`. A clear on an ordinary
+advance is a key that was only quiet, and is not counted, even after a lone stale copy from a delayed
+mirror. The metric stays an alert signal rather than a measure of idle instruments.
 
 ## State and bounding
 
-Each key adds a `u32` last ID, the admitted quote's `QuoteId` without its counts, the last-admit instant, a refused-since-admit flag, and an optional
-candidate (`u32` and its `Transport`). The candidate needs no age: an admit clears it, and with
-nothing admitted the whole key expires on the regime timeout first. No new keys: the key space is today's quote floor, a
-plain `HashMap` per `(SourceKey, symbol)` with no key cap (`arbiter.rs:474-480`). If that cap is ever
-added, the ID state goes with the entry.
+Each key adds a `u32` last ID, the admitted quote's `QuoteId` without its counts, the last-admit
+instant, and an optional candidate (`u32` and its `Transport`). The candidate needs no age: an admit
+clears it, and with nothing admitted the whole key expires on the regime timeout first. No new keys:
+the key space is today's quote floor, a plain `HashMap` per `(SourceKey, symbol)` with no key cap
+(`arbiter.rs:474-480`). If that cap is ever added, the ID state goes with the entry.
 
 ## Metrics
 
