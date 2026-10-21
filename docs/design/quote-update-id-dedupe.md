@@ -183,11 +183,11 @@ mirror. The metric stays an alert signal rather than a measure of idle instrumen
 
 ## State and bounding
 
-Each key adds a `u32` last ID, the admitted quote's `QuoteId` without its counts, the last-admit instant, and an optional
-candidate (`u32` and its `Transport`). The candidate needs no age: an admit clears it, and with
-nothing admitted the whole key expires on the regime timeout first. No new keys: the key space is today's quote floor, a
-plain `HashMap` per `(SourceKey, symbol)` with no key cap (`arbiter.rs:474-480`). If that cap is ever
-added, the ID state goes with the entry.
+Each key adds a `u32` last ID, the admitted quote's `QuoteId` without its counts, the last-admit
+instant, and an optional candidate (`u32` and its `Transport`). The candidate needs no age: an admit
+clears it, and with nothing admitted the whole key expires on the regime timeout first. No new keys:
+the key space is today's quote floor, a plain `HashMap` per `(SourceKey, symbol)` with no key cap
+(`arbiter.rs:474-480`). If that cap is ever added, the ID state goes with the entry.
 
 ## Metrics
 
