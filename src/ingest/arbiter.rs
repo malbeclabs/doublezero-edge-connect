@@ -56,7 +56,7 @@ use crate::{
     model::{
         self, category_arc, now_mono_ns, now_ns, BookAccumulator, BookAction, BookChange,
         BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot, NormalizedBook,
-        NormalizedDepth, NormalizedQuote, NormalizedTrade, ReplayScope, SourceKey,
+        NormalizedDepth, NormalizedQuote, NormalizedTrade, QuoteWire, ReplayScope, SourceKey,
     },
 };
 
@@ -88,6 +88,55 @@ pub const DEPTH_TICK_CAP: usize = 1024;
 /// — wedging the *primary* edge feed for that symbol. The bound caps the worst-case wedge to itself
 /// and self-heals; it is generous enough to absorb ordinary clock skew between the venue and host.
 const MAX_FUTURE_SKEW_NS: u64 = 5_000_000_000; // 5s
+
+/// How long a quote key may go without an admitted `Venue Update ID` before it drops its ID state
+/// and judges the next quote as if it had none. It is the fallback for a mixed fleet (a silent
+/// upgraded path cannot black out a key an old path still serves), the escape for a venue that
+/// restarts its counter or a forged ID that wedged the key, and what reopens a quiet key fresh after
+/// its counter may have moved more than `2^31`. The same order as [`MAX_FUTURE_SKEW_NS`].
+pub const QUOTE_ID_REGIME_TIMEOUT_NS: u64 = 5_000_000_000; // 5s
+
+/// Default for `--arb-quote-id-max-jump`: the largest forward advance of a key's `Venue Update ID`
+/// admitted without corroboration. The regime timeout already bounds any wedge, so this only has to
+/// never refuse an honest advance: 1,000,000 is 200,000 book changes per second on one instrument
+/// for the whole [`QUOTE_ID_REGIME_TIMEOUT_NS`].
+pub const QUOTE_ID_MAX_JUMP: u32 = 1_000_000;
+
+/// How long a `SourceKey` stops using the `Venue Update ID` after a `conflict`, as edge-feed-spec
+/// top-of-book `3.2.0`'s SHOULD asks: its quotes take the `source_ts` floor or bypass meanwhile.
+/// Recoverable rather than for the life of the process, because the wire is unauthenticated and one
+/// forged conflicting copy must not turn the field off for good. A publisher whose field is not a
+/// counter conflicts again on its next pair of quotes, so it stays off in practice.
+pub const QUOTE_ID_DISABLE_NS: u64 = 60_000_000_000; // 60s
+
+/// `dz_quotes_update_id_dropped_total{reason}` values, in [`id_drop_idx`] order.
+pub const ID_DROP_DUPLICATE: &str = "duplicate";
+pub const ID_DROP_CONFLICT: &str = "conflict";
+pub const ID_DROP_STALE: &str = "stale";
+pub const ID_DROP_REGIME: &str = "regime";
+pub const ID_DROP_JUMP: &str = "jump";
+pub const ID_DROP_SKEW: &str = "skew";
+const ID_DROP_REASONS: [&str; 6] = [
+    ID_DROP_DUPLICATE,
+    ID_DROP_CONFLICT,
+    ID_DROP_STALE,
+    ID_DROP_REGIME,
+    ID_DROP_JUMP,
+    ID_DROP_SKEW,
+];
+
+/// `dz_quote_floor_resets_total{reason}` values.
+pub const ID_RESET_REGIME_TIMEOUT: &str = "regime_timeout";
+pub const ID_RESET_CORROBORATED_JUMP: &str = "corroborated_jump";
+pub const ID_RESET_VENUE_RESET: &str = "venue_reset";
+
+/// Index of a drop reason into `VenueMetrics::quotes_update_id_dropped`.
+fn id_drop_idx(reason: &str) -> usize {
+    ID_DROP_REASONS
+        .iter()
+        .position(|r| *r == reason)
+        .unwrap_or(0)
+}
 
 /// Why a batch's stamp did not advance a channel's frontier. Kept apart because only one of the two
 /// is reachable by a flag: widening `--arb-book-ts-jump-secs` answers `jump` and does nothing for
@@ -203,6 +252,10 @@ const FORCED_REBASELINE_MIN_INTERVAL_NS: u64 = 250_000_000; // 250ms
 /// One order-level channel: an arbitration scope plus the wire's `channel_id`. The grain the venue
 /// clock is kept at, since a market's own stamps say nothing about how far the venue has moved.
 type ChannelKey = (SourceKey, Arc<str>, u8);
+
+/// The `Venue Update ID` arbiter's key: `(SourceKey, canonical channel, symbol)`. The channel is in
+/// it because edge-feed-spec compares two update ids only within one Source ID and channel.
+type QuoteIdKey = (SourceKey, u8, Arc<str>);
 
 /// The cross-publisher resurrection guard's venue-time tunables (`--arb-book-*`), so the values a
 /// test-built arbiter guards on and the ones `--help` advertises cannot drift apart.
@@ -336,6 +389,17 @@ impl QuoteId {
             ask_sz: canon(q.ask_size),
             bid_n: q.bid_n,
             ask_n: q.ask_n,
+        }
+    }
+
+    /// This identity without the counts: what two paths must agree on for one `Venue Update ID`. A
+    /// path may report a count as `0` (unavailable) while a peer reports it for the same venue
+    /// state, so the counts cannot make two copies of one ID a `conflict`.
+    pub fn without_counts(self) -> Self {
+        Self {
+            bid_n: 0,
+            ask_n: 0,
+            ..self
         }
     }
 }
@@ -569,6 +633,220 @@ impl<K: Eq + Hash, V: Eq + Hash + Clone, P: Eq + Copy> StalenessFloor<K, V, P> {
         let before = self.state.len();
         self.state.retain(|k, _| !pred(k));
         before - self.state.len()
+    }
+}
+
+/// Whether `Venue Update ID` `a` is newer than `b` under serial-number arithmetic (RFC 1982), as
+/// edge-feed-spec top-of-book `3.2.0` requires. Exactly `2^31` apart is newer in neither direction.
+pub fn update_id_newer(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
+
+/// The content [`UpdateIdFloor`] compares two copies of one ID on. Equality is exact; `same_scale`
+/// says whether the two were scaled under the same instrument definition, without which a
+/// difference is definition skew rather than evidence that the field is not a counter.
+pub trait IdContent: Eq {
+    fn same_scale(&self, other: &Self) -> bool;
+}
+
+impl IdContent for QuoteWire {
+    fn same_scale(&self, other: &Self) -> bool {
+        self.price_exponent == other.price_exponent && self.qty_exponent == other.qty_exponent
+    }
+}
+
+/// What [`UpdateIdFloor::judge`] decided for one quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdDecision {
+    /// The key holds no ID state and the quote carries no ID: today's `source_ts` floor or bypass.
+    Legacy,
+    /// Forward it.
+    Admit,
+    /// Drop it, for this `dz_quotes_update_id_dropped_total` reason.
+    Drop(&'static str),
+}
+
+/// What the arbiter does with a quote after the `Venue Update ID` verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdOutcome {
+    /// Today's `source_ts` floor or bypass decides it.
+    Legacy,
+    /// Admitted: send it.
+    Forward,
+    /// Dropped, counted already.
+    Decided,
+}
+
+/// [`UpdateIdFloor::judge`]'s verdict, plus the key's ID state being cleared on the way, if it was —
+/// a `dz_quote_floor_resets_total` reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdVerdict {
+    pub decision: IdDecision,
+    pub reset: Option<&'static str>,
+}
+
+/// A forward jump past the cap, held until a different path corroborates it. It needs no age of
+/// its own: an admit clears it, and with nothing admitted the whole key expires on the regime
+/// timeout, which a candidate recorded since the last admit can never outlive.
+#[derive(Debug, Clone, Copy)]
+struct JumpCandidate<P> {
+    id: u32,
+    from: P,
+}
+
+/// One key's ID-regime state.
+#[derive(Debug, Clone)]
+struct UpdateIdState<V, P> {
+    /// The last admitted ID.
+    last: u32,
+    /// The admitted quote's content. One ID is one book state, so a copy of it with other content
+    /// under the same scale means a path is not carrying a venue counter (`conflict`), and under
+    /// another scale is definition skew (`skew`).
+    content: V,
+    /// When it was admitted, on the monotonic clock.
+    last_admit_ns: u64,
+    candidate: Option<JumpCandidate<P>>,
+}
+
+impl<V, P> UpdateIdState<V, P> {
+    fn new(id: u32, content: V, now_ns: u64) -> Self {
+        Self {
+            last: id,
+            content,
+            last_admit_ns: now_ns,
+            candidate: None,
+        }
+    }
+}
+
+/// Per-key quote dedupe on the `Venue Update ID`: the low 32 bits of a venue-assigned per-instrument
+/// book update counter, the same on every path because the venue assigns it. Keyed like the quote
+/// [`StalenessFloor`], and a key holding state here is in the **ID regime**:
+///
+/// | Quote carries | Key state | Decision |
+/// |---|---|---|
+/// | ID `!= 0` | no ID state | Admit; the key enters the regime |
+/// | ID `!= 0` | ID regime | Admit iff newer and within the jump cap |
+/// | ID `0` | ID regime | Drop (`regime`), whatever its `source_ts` |
+/// | ID `0` | no ID state | [`IdDecision::Legacy`] |
+///
+/// No leader latch: the ID orders the copies, so arrival order across paths does not matter and the
+/// first copy of each ID wins. A forward jump past `max_jump` is refused and kept as a candidate, and
+/// accepted when a **different** path delivers an ID within the cap of it. A key with nothing
+/// admitted for [`QUOTE_ID_REGIME_TIMEOUT_NS`] drops its state on its next quote.
+///
+/// **Exempt from every session reset**, like the quote floor: it is the venue's counter, not the
+/// publisher's, so a publisher restart or a new `Reset Count` says nothing about it.
+pub struct UpdateIdFloor<K, V, P> {
+    state: HashMap<K, UpdateIdState<V, P>>,
+    max_jump: u32,
+}
+
+impl<K: Eq + Hash + Clone, V: IdContent, P: Eq + Copy> UpdateIdFloor<K, V, P> {
+    pub fn new(max_jump: u32) -> Self {
+        Self {
+            state: HashMap::new(),
+            max_jump,
+        }
+    }
+
+    /// Set the jump cap (`--arb-quote-id-max-jump`).
+    pub fn set_max_jump(&mut self, max_jump: u32) {
+        self.max_jump = max_jump;
+    }
+
+    /// Whether no key is in the ID regime, so an ID-less quote can skip the lookup entirely.
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty()
+    }
+
+    /// Whether `key` is in the ID regime. An ID-less quote asks this before anything else, so one
+    /// on a key outside the regime reads no clock and builds no content.
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.state.contains_key(key)
+    }
+
+    /// Drop the ID state of every key matching `pred`, returning how many were dropped.
+    pub fn reset_where(&mut self, pred: impl Fn(&K) -> bool) -> usize {
+        let before = self.state.len();
+        self.state.retain(|k, _| !pred(k));
+        before - self.state.len()
+    }
+
+    /// Judge one quote for `key` carrying `id` (`0` = none) and `content` from path `from`, at
+    /// `now_ns` on a **monotonic** clock: the timeout must not move with a wall-clock step.
+    pub fn judge(&mut self, key: &K, id: u32, content: V, from: P, now_ns: u64) -> IdVerdict {
+        let verdict = |decision, reset| IdVerdict { decision, reset };
+        let Some(st) = self.state.get_mut(key) else {
+            if id == 0 {
+                return verdict(IdDecision::Legacy, None);
+            }
+            self.state
+                .insert(key.clone(), UpdateIdState::new(id, content, now_ns));
+            return verdict(IdDecision::Admit, None);
+        };
+        if now_ns.saturating_sub(st.last_admit_ns) >= QUOTE_ID_REGIME_TIMEOUT_NS {
+            // Classified by the quote that expires the key, not by what was refused before: one
+            // delayed mirror's stale copy followed by a quiet spell is not a reset. An ID-less quote
+            // is the fallback the timeout exists for. An ID the old state would still refuse — older,
+            // or a jump past the cap — means the counter restarted or a forged ID held the key. An
+            // ordinary advance (or the same ID again) is a quiet key reopening, which is not counted.
+            let advance = id.wrapping_sub(st.last);
+            let ordinary =
+                advance == 0 || (update_id_newer(id, st.last) && advance <= self.max_jump);
+            let reset = if id == 0 {
+                Some(ID_RESET_REGIME_TIMEOUT)
+            } else if ordinary {
+                None
+            } else {
+                Some(ID_RESET_VENUE_RESET)
+            };
+            if id == 0 {
+                self.state.remove(key);
+                return verdict(IdDecision::Legacy, reset);
+            }
+            *st = UpdateIdState::new(id, content, now_ns);
+            return verdict(IdDecision::Admit, reset);
+        }
+        if id == 0 {
+            // An ID-less copy cannot be ordered against the ID-bearing ones, whatever its
+            // `source_ts`: edge-feed-spec#98 lets a subscriber that holds a value drop it, with or
+            // without a Source Timestamp. The zero collision (the counter's low 32 bits at `0`) lands
+            // here too: one quote per `2^32` updates.
+            return verdict(IdDecision::Drop(ID_DROP_REGIME), None);
+        }
+        let advance = id.wrapping_sub(st.last);
+        if advance == 0 {
+            let reason = if !content.same_scale(&st.content) {
+                // Two definitions of the instrument in flight: not evidence either way (#97).
+                ID_DROP_SKEW
+            } else if content == st.content {
+                ID_DROP_DUPLICATE
+            } else {
+                ID_DROP_CONFLICT
+            };
+            return verdict(IdDecision::Drop(reason), None);
+        }
+        if update_id_newer(id, st.last) && advance <= self.max_jump {
+            *st = UpdateIdState::new(id, content, now_ns);
+            return verdict(IdDecision::Admit, None);
+        }
+        // Refused. Before classifying it, see whether it corroborates a held jump: checked for any
+        // refused ID because one within the cap of a candidate near `2^31` ahead can wrap to compare
+        // as older than `last`.
+        if let Some(c) = st.candidate {
+            let near = (id.wrapping_sub(c.id) as i32).unsigned_abs() <= self.max_jump;
+            if c.from != from && near {
+                *st = UpdateIdState::new(id, content, now_ns);
+                return verdict(IdDecision::Admit, Some(ID_RESET_CORROBORATED_JUMP));
+            }
+        }
+        if update_id_newer(id, st.last) {
+            st.candidate = Some(JumpCandidate { id, from });
+            verdict(IdDecision::Drop(ID_DROP_JUMP), None)
+        } else {
+            verdict(IdDecision::Drop(ID_DROP_STALE), None)
+        }
     }
 }
 
@@ -1388,6 +1666,17 @@ pub struct Arbiter {
     /// a venue with a session-scoped quote clock is ever added. The key is `(SourceKey, symbol)`, both
     /// halves interned `Arc`s, so building it allocates nothing.
     quotes: StalenessFloor<(SourceKey, Arc<str>), QuoteId, Transport>,
+    /// Cross-transport quote dedupe on the `Venue Update ID`, keyed like `quotes`. A key holding
+    /// state here is judged by it instead of by `quotes`; see [`UpdateIdFloor`]. Exempt from the
+    /// session-reset path for the reason `quotes` is: the counter is the venue's.
+    quote_ids: UpdateIdFloor<QuoteIdKey, QuoteWire, Transport>,
+    /// `SourceKey`s that stopped using the `Venue Update ID` after a `conflict`, each until a
+    /// monotonic instant ([`QUOTE_ID_DISABLE_NS`] after it). Their quotes take today's floor or
+    /// bypass meanwhile; one entry per `SourceKey`, dropped when it expires.
+    quote_id_disabled: HashMap<SourceKey, u64>,
+    /// The clock the quote ID regime timeout runs on: the host's monotonic clock, so an NTP step
+    /// cannot stretch or cut it. A field only so a test can drive it.
+    quote_id_clock: Box<dyn Fn() -> u64 + Send>,
     trades: WindowedDedup<(SourceKey, Arc<str>), u64, Transport>,
     /// Cross-publisher dedup for MBO `depth`. Each publisher reconstructs its own book (per
     /// `(publisher, instrument)` in [`crate::ingest::processor::MboProcessor`]) and emits full-state
@@ -1683,6 +1972,13 @@ struct VenueMetrics {
     instruments_dropped: IntCounter,
     quotes_future_rejected: IntCounter,
     quotes_no_source_ts: IntCounter,
+    /// `dz_quotes_update_id_admitted_total` / `dz_quotes_update_id_dropped_total{reason}`, the
+    /// latter in [`id_drop_idx`] order.
+    quotes_update_id_admitted: IntCounter,
+    quotes_update_id_dropped: [IntCounter; 6],
+    /// `dz_quotes_update_id_disabled_total`: a `SourceKey` that stopped using the field after a
+    /// `conflict`.
+    quotes_update_id_disabled: IntCounter,
     /// `dz_depth_admitted_total{publisher}` / `dz_depth_dropped_total{publisher}`, `[edge, public]`.
     depth_admitted: [IntCounter; 2],
     depth_dropped: [IntCounter; 2],
@@ -1765,6 +2061,10 @@ impl VenueMetrics {
             instruments_dropped: m.instruments_dropped.with_label_values(&[venue]),
             quotes_future_rejected: m.quotes_future_rejected.with_label_values(&[venue]),
             quotes_no_source_ts: m.quotes_no_source_ts.with_label_values(&[venue]),
+            quotes_update_id_admitted: m.quotes_update_id_admitted.with_label_values(&[venue]),
+            quotes_update_id_dropped: ID_DROP_REASONS
+                .map(|r| m.quotes_update_id_dropped.with_label_values(&[venue, r])),
+            quotes_update_id_disabled: m.quotes_update_id_disabled.with_label_values(&[venue]),
             depth_admitted: by_pub(&m.depth_admitted),
             depth_dropped: by_pub(&m.depth_dropped),
             depth_future_rejected: m.depth_future_rejected.with_label_values(&[venue]),
@@ -1801,6 +2101,9 @@ impl Arbiter {
         Self {
             tx,
             quotes: StalenessFloor::new(QUOTE_TICK_CAP),
+            quote_ids: UpdateIdFloor::new(QUOTE_ID_MAX_JUMP),
+            quote_id_disabled: HashMap::new(),
+            quote_id_clock: Box::new(now_mono_ns),
             trades: WindowedDedup::new(trade_window),
             depths: StalenessFloor::new(DEPTH_TICK_CAP),
             depth_replay: None,
@@ -1836,6 +2139,23 @@ impl Arbiter {
     /// How long a delivered order event stays in the racing window (`--arb-book-dedup-window-ms`).
     pub fn set_book_dedup_window(&mut self, window_ns: u64) {
         self.book_dedup_window_ns = window_ns;
+    }
+
+    /// Set the largest forward `Venue Update ID` advance a quote key admits without corroboration
+    /// (`--arb-quote-id-max-jump`). Called once at startup; without it the cap is
+    /// [`QUOTE_ID_MAX_JUMP`].
+    pub fn set_quote_id_max_jump(&mut self, max_jump: u32) {
+        debug_assert!(
+            (1..=i32::MAX as u32).contains(&max_jump),
+            "quote id jump cap {max_jump} outside 1..=2^31-1"
+        );
+        self.quote_ids.set_max_jump(max_jump);
+    }
+
+    /// Drive the quote ID regime's clock from a test, in place of the monotonic clock.
+    #[cfg(test)]
+    fn set_quote_id_clock(&mut self, clock: impl Fn() -> u64 + Send + 'static) {
+        self.quote_id_clock = Box::new(clock);
     }
 
     /// Install the resurrection guard's venue-time tunables (`--arb-book-*`). Called once at
@@ -2113,6 +2433,87 @@ impl Arbiter {
             model::lock(replay).remove(&(source.clone(), Arc::from(symbol)));
         }
         self.record_floor_resets(source.name(), reason, cleared);
+    }
+
+    /// The `Venue Update ID` verdict for one quote on `key`, which carries an ID or is in the
+    /// regime, with its metrics counted. [`IdOutcome::Legacy`] hands it to today's `source_ts`
+    /// floor or bypass, as for a `SourceKey` disabled after a `conflict`.
+    fn judge_update_id(
+        &mut self,
+        q: &NormalizedQuote,
+        key: QuoteIdKey,
+        publisher: Transport,
+    ) -> IdOutcome {
+        let mono = (self.quote_id_clock)();
+        if let Some(&until) = self.quote_id_disabled.get(&key.0) {
+            if mono < until {
+                return IdOutcome::Legacy;
+            }
+            // The cooldown is over: the `SourceKey` re-enters the regime fresh.
+            self.quote_id_disabled.remove(&key.0);
+        }
+        let now = if q.recv_ts_ns != 0 {
+            q.recv_ts_ns
+        } else {
+            now_ns()
+        };
+        // The same future-skew check the floor applies, before the quote can touch ID state; a
+        // `source_ts` of 0 is never ahead. An ID-less quote headed for the floor gets the same
+        // verdict there.
+        if q.source_ts_ns > now.saturating_add(MAX_FUTURE_SKEW_NS) {
+            self.vm(&q.venue).quotes_future_rejected.inc();
+            return IdOutcome::Decided;
+        }
+        let verdict = self
+            .quote_ids
+            .judge(&key, q.venue_update_id, q.wire, publisher, mono);
+        if let Some(reason) = verdict.reset {
+            self.record_quote_floor_reset(&q.venue, reason);
+        }
+        match verdict.decision {
+            IdDecision::Legacy => IdOutcome::Legacy,
+            IdDecision::Admit => {
+                let vm = self.vm(&q.venue);
+                vm.emit_for(q.source_id)[EMIT_QUOTE].inc();
+                vm.quotes_admitted[pub_idx(publisher)].inc();
+                vm.quotes_update_id_admitted.inc();
+                IdOutcome::Forward
+            }
+            IdDecision::Drop(reason) => {
+                let vm = self.vm(&q.venue);
+                vm.quotes_dropped.inc();
+                vm.quotes_update_id_dropped[id_drop_idx(reason)].inc();
+                if reason == ID_DROP_CONFLICT {
+                    // One ID with two contents under one scale: this `SourceKey`'s field is not a
+                    // venue counter, so stop using it for a while (edge-feed-spec top-of-book
+                    // `3.2.0`'s SHOULD), and drop its ID state so the floor takes it from here.
+                    vm.quotes_update_id_disabled.inc();
+                    let source = key.0.clone();
+                    self.quote_ids.reset_where(|k| k.0 == source);
+                    self.quote_id_disabled
+                        .insert(source, mono.saturating_add(QUOTE_ID_DISABLE_NS));
+                    warn!(
+                        venue = %q.venue,
+                        source_id = q.source_id,
+                        symbol = %q.symbol,
+                        id = q.venue_update_id,
+                        "two contents under one venue update id: not using the field for this \
+                         source for {}s",
+                        QUOTE_ID_DISABLE_NS / 1_000_000_000
+                    );
+                }
+                IdOutcome::Decided
+            }
+        }
+    }
+
+    /// Record one quote key's ID state cleared, in `dz_quote_floor_resets_total{venue, reason}` — the
+    /// quote twin of [`Self::record_floor_resets`]. Rare by construction, so a label lookup.
+    fn record_quote_floor_reset(&self, venue: &str, reason: &'static str) {
+        metrics()
+            .quote_floor_resets
+            .with_label_values(&[venue, reason])
+            .inc();
     }
 
     /// Record cleared floor entries in `dz_depth_floor_resets_total{venue, reason}` (shared by
@@ -3247,6 +3648,22 @@ impl Arbiter {
     ) {
         match &msg {
             FeedMessage::Quote(q) => {
+                // The `Venue Update ID` regime first. An ID-less quote on a key outside the regime —
+                // every quote from an encoder that predates the field — reads no clock and builds no
+                // content, and takes today's path below unchanged.
+                if q.venue_update_id != 0 || !self.quote_ids.is_empty() {
+                    let key: QuoteIdKey = (SourceKey::of(q), q.wire.channel, q.symbol.clone());
+                    if q.venue_update_id != 0 || self.quote_ids.contains_key(&key) {
+                        match self.judge_update_id(q, key, publisher) {
+                            IdOutcome::Legacy => {}
+                            IdOutcome::Forward => {
+                                let _ = self.tx.send(Arc::new(msg));
+                                return;
+                            }
+                            IdOutcome::Decided => return,
+                        }
+                    }
+                }
                 // `source_ts == 0` is the "not available" sentinel (per CLAUDE.md, never a real
                 // time): forward it but never let it touch the floor — as a tick it would pin
                 // `high_water` at 0 and drop every later quote as stale.
@@ -3851,7 +4268,7 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr};
 
-    use crate::model::{BookReplay, NormalizedQuote, NormalizedTrade, Side};
+    use crate::model::{BookReplay, NormalizedQuote, NormalizedTrade, QuoteWire, Side};
 
     fn quote(source_ts_ns: u64, bid: f64, ask: f64) -> NormalizedQuote {
         NormalizedQuote {
@@ -3869,6 +4286,8 @@ mod tests {
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            venue_update_id: 0,
+            wire: QuoteWire::default(),
         }
     }
 
@@ -9253,5 +9672,876 @@ mod tests {
             "{held} entries held over {span}s of venue time: the crawler held the frontier below \
              the channel and nothing aged out"
         );
+    }
+
+    // --- Venue Update ID ---------------------------------------------------------------------
+
+    /// The floor alone, on `&str` keys and `u8` paths: path `A` and path `B`.
+    /// Floor-level content in these tests: one byte, always under the same scale.
+    impl IdContent for u8 {
+        fn same_scale(&self, _: &Self) -> bool {
+            true
+        }
+    }
+
+    /// Floor-level content with a scale: `(exponent, value)`.
+    impl IdContent for (i8, u8) {
+        fn same_scale(&self, other: &Self) -> bool {
+            self.0 == other.0
+        }
+    }
+
+    fn id_floor() -> UpdateIdFloor<&'static str, u8, u8> {
+        UpdateIdFloor::new(QUOTE_ID_MAX_JUMP)
+    }
+    const A: u8 = 1;
+    const B: u8 = 2;
+    const C: u8 = 3;
+
+    fn admit() -> IdVerdict {
+        IdVerdict {
+            decision: IdDecision::Admit,
+            reset: None,
+        }
+    }
+    fn drop_for(reason: &'static str) -> IdVerdict {
+        IdVerdict {
+            decision: IdDecision::Drop(reason),
+            reset: None,
+        }
+    }
+
+    #[test]
+    fn update_id_newer_is_serial_arithmetic() {
+        assert!(update_id_newer(2, 1));
+        assert!(!update_id_newer(1, 2));
+        assert!(!update_id_newer(7, 7));
+        // Across the wrap.
+        assert!(update_id_newer(1, u32::MAX));
+        assert!(update_id_newer(0x8000_0000, 1));
+        // Exactly 2^31 apart: newer in neither direction (RFC 1982's undefined pair).
+        assert!(!update_id_newer(0x8000_0001, 1));
+        assert!(!update_id_newer(1, 0x8000_0001));
+    }
+
+    /// Two paths delivering the same IDs in interleaved order: each ID goes out exactly once, and
+    /// whichever copy arrives first wins — no leader latch.
+    #[test]
+    fn two_paths_interleaved_emit_each_id_once() {
+        let mut f = id_floor();
+        let arrivals = [
+            (A, 1),
+            (B, 1),
+            (B, 2),
+            (A, 2),
+            (A, 3),
+            (B, 3),
+            (B, 4),
+            (A, 4),
+        ];
+        let admitted: Vec<(u8, u32)> = arrivals
+            .iter()
+            .filter(|(p, id)| f.judge(&"BTC", *id, 0, *p, SEC).decision == IdDecision::Admit)
+            .copied()
+            .collect();
+        assert_eq!(admitted, vec![(A, 1), (B, 2), (A, 3), (B, 4)]);
+    }
+
+    /// The same ID with other content is a conflict; with the same content, a duplicate.
+    #[test]
+    fn the_same_id_with_other_content_is_a_conflict() {
+        let mut f = id_floor();
+        assert_eq!(f.judge(&"BTC", 10, 1, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 10, 1, B, SEC), drop_for(ID_DROP_DUPLICATE));
+        assert_eq!(f.judge(&"BTC", 10, 2, B, SEC), drop_for(ID_DROP_CONFLICT));
+        // A conflict refuses nothing else: the next ID is admitted.
+        assert_eq!(f.judge(&"BTC", 11, 3, B, SEC), admit());
+    }
+
+    /// A later path's older ID after a newer one is stale, and the same ID again is a duplicate.
+    #[test]
+    fn an_older_id_is_stale_and_a_repeat_is_a_duplicate() {
+        let mut f = id_floor();
+        assert_eq!(f.judge(&"BTC", 10, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 12, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 11, 0, B, SEC), drop_for(ID_DROP_STALE));
+        assert_eq!(f.judge(&"BTC", 12, 0, B, SEC), drop_for(ID_DROP_DUPLICATE));
+        // Keys are independent.
+        assert_eq!(f.judge(&"ETH", 11, 0, B, SEC), admit());
+    }
+
+    #[test]
+    fn ids_across_the_u32_wrap_admit_in_order() {
+        let mut f = id_floor();
+        for id in [0xFFFF_FFFE, 0xFFFF_FFFF, 1, 2] {
+            assert_eq!(f.judge(&"BTC", id, 0, A, SEC), admit(), "id {id:#x}");
+        }
+        // And the pre-wrap ID is now older.
+        assert_eq!(
+            f.judge(&"BTC", 0xFFFF_FFFF, 0, B, SEC),
+            drop_for(ID_DROP_STALE)
+        );
+    }
+
+    /// One path forging an ID `2^31 - 1` ahead: refused as a jump, and the real counter keeps
+    /// being admitted from both paths.
+    #[test]
+    fn a_forged_far_jump_is_refused_and_real_ids_keep_flowing() {
+        let mut f = id_floor();
+        assert_eq!(f.judge(&"BTC", 100, 0, A, SEC), admit());
+        assert_eq!(
+            f.judge(&"BTC", 100u32.wrapping_add(i32::MAX as u32), 0, C, SEC),
+            drop_for(ID_DROP_JUMP)
+        );
+        assert_eq!(f.judge(&"BTC", 101, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 101, 0, B, SEC), drop_for(ID_DROP_DUPLICATE));
+        assert_eq!(f.judge(&"BTC", 102, 0, B, SEC), admit());
+    }
+
+    /// The cap is inclusive: an advance of exactly `max_jump` is admitted, one more is a jump.
+    #[test]
+    fn the_jump_cap_is_inclusive() {
+        let mut f: UpdateIdFloor<&str, u8, u8> = UpdateIdFloor::new(10);
+        assert_eq!(f.judge(&"BTC", 100, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 110, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 121, 0, A, SEC), drop_for(ID_DROP_JUMP));
+    }
+
+    /// A jump past the cap is accepted when a *different* path delivers an ID within the cap of it,
+    /// and never on the word of the path that made it.
+    #[test]
+    fn a_jump_is_accepted_only_when_another_path_corroborates_it() {
+        let mut f: UpdateIdFloor<&str, u8, u8> = UpdateIdFloor::new(10);
+        assert_eq!(f.judge(&"BTC", 100, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 5_000, 0, A, SEC), drop_for(ID_DROP_JUMP));
+        // The same path again, even right next to its own candidate: still refused.
+        assert_eq!(f.judge(&"BTC", 5_001, 0, A, SEC), drop_for(ID_DROP_JUMP));
+        // A different path far from the candidate does not corroborate it, and its own jump
+        // becomes the candidate.
+        assert_eq!(f.judge(&"BTC", 9_000, 0, B, SEC), drop_for(ID_DROP_JUMP));
+        // So a third path near A's old candidate is refused too, and becomes the candidate ...
+        assert_eq!(f.judge(&"BTC", 5_002, 0, C, SEC), drop_for(ID_DROP_JUMP));
+        // ... which a path other than C then corroborates.
+        assert_eq!(
+            f.judge(&"BTC", 5_003, 0, B, SEC),
+            IdVerdict {
+                decision: IdDecision::Admit,
+                reset: Some(ID_RESET_CORROBORATED_JUMP),
+            }
+        );
+        // The key now orders from the corroborated ID.
+        assert_eq!(f.judge(&"BTC", 5_002, 0, A, SEC), drop_for(ID_DROP_STALE));
+        assert_eq!(f.judge(&"BTC", 5_004, 0, A, SEC), admit());
+    }
+
+    /// Corroboration reaches across the serial wrap: a candidate just under `2^31` ahead and a
+    /// corroborating ID just past it, which compares as *older* than `last`.
+    #[test]
+    fn corroboration_reaches_a_candidate_near_half_the_id_space() {
+        let mut f: UpdateIdFloor<&str, u8, u8> = UpdateIdFloor::new(10);
+        assert_eq!(f.judge(&"BTC", 0, 0, A, SEC).decision, IdDecision::Legacy);
+        assert_eq!(f.judge(&"BTC", 1, 0, A, SEC), admit());
+        let cand = 1u32.wrapping_add(i32::MAX as u32); // 2^31: newest that still compares newer
+        assert_eq!(f.judge(&"BTC", cand, 0, A, SEC), drop_for(ID_DROP_JUMP));
+        let past = cand.wrapping_add(5);
+        assert!(!update_id_newer(past, 1));
+        assert_eq!(
+            f.judge(&"BTC", past, 0, B, SEC),
+            IdVerdict {
+                decision: IdDecision::Admit,
+                reset: Some(ID_RESET_CORROBORATED_JUMP),
+            }
+        );
+    }
+
+    /// The venue restarts its counter: every new ID compares as older, nothing is admitted, and the
+    /// regime timeout clears the key as a `venue_reset`, after which the new counter is admitted.
+    #[test]
+    fn a_venue_counter_reset_heals_on_the_regime_timeout() {
+        let mut f = id_floor();
+        assert_eq!(f.judge(&"BTC", 5_000_000, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 1, 0, A, 2 * SEC), drop_for(ID_DROP_STALE));
+        assert_eq!(f.judge(&"BTC", 2, 0, B, 3 * SEC), drop_for(ID_DROP_STALE));
+        assert_eq!(
+            f.judge(&"BTC", 3, 0, A, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            IdVerdict {
+                decision: IdDecision::Admit,
+                reset: Some(ID_RESET_VENUE_RESET),
+            }
+        );
+        assert_eq!(
+            f.judge(&"BTC", 3, 0, B, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            drop_for(ID_DROP_DUPLICATE)
+        );
+        assert_eq!(
+            f.judge(&"BTC", 4, 0, B, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            admit()
+        );
+    }
+
+    /// One path alone that jumps past the cap cannot corroborate itself; the timeout admits it.
+    #[test]
+    fn a_single_path_jump_heals_on_the_regime_timeout() {
+        let mut f: UpdateIdFloor<&str, u8, u8> = UpdateIdFloor::new(10);
+        assert_eq!(f.judge(&"BTC", 100, 0, A, SEC), admit());
+        assert_eq!(
+            f.judge(&"BTC", 9_000, 0, A, 2 * SEC),
+            drop_for(ID_DROP_JUMP)
+        );
+        assert_eq!(
+            f.judge(&"BTC", 9_001, 0, A, 3 * SEC),
+            drop_for(ID_DROP_JUMP)
+        );
+        assert_eq!(
+            f.judge(&"BTC", 9_002, 0, A, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            IdVerdict {
+                decision: IdDecision::Admit,
+                reset: Some(ID_RESET_VENUE_RESET),
+            }
+        );
+    }
+
+    /// A key that was only quiet reopens fresh on its next ID, without a reset count: the metric is
+    /// an alert signal, not a census of idle instruments. A lone stale copy before the quiet spell
+    /// does not make it a reset; an ID after it that still compares as older does.
+    #[test]
+    fn a_quiet_key_reopens_without_a_reset() {
+        let mut f = id_floor();
+        assert_eq!(f.judge(&"BTC", 10, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 12, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 11, 0, B, SEC), drop_for(ID_DROP_STALE));
+        let later = SEC + QUOTE_ID_REGIME_TIMEOUT_NS + SEC;
+        assert_eq!(f.judge(&"BTC", 13, 0, A, later), admit());
+        assert_eq!(
+            f.judge(&"BTC", 5, 0, A, later + QUOTE_ID_REGIME_TIMEOUT_NS),
+            IdVerdict {
+                decision: IdDecision::Admit,
+                reset: Some(ID_RESET_VENUE_RESET),
+            }
+        );
+    }
+
+    /// An ID-less copy on a key in the ID regime is dropped — the zero collision and the mixed
+    /// fleet alike — until the regime timeout hands the key back to the `source_ts` path.
+    #[test]
+    fn an_id_less_copy_is_dropped_until_the_regime_times_out() {
+        let mut f = id_floor();
+        assert_eq!(
+            f.judge(&"BTC", 0, 0, A, SEC),
+            IdVerdict {
+                decision: IdDecision::Legacy,
+                reset: None
+            }
+        );
+        assert_eq!(f.judge(&"BTC", 7, 0, A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 0, 0, B, 2 * SEC), drop_for(ID_DROP_REGIME));
+        assert_eq!(
+            f.judge(&"BTC", 0, 0, B, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            IdVerdict {
+                decision: IdDecision::Legacy,
+                reset: Some(ID_RESET_REGIME_TIMEOUT),
+            }
+        );
+        // The state is gone, not just bypassed: the floor is empty again.
+        assert!(f.is_empty());
+        assert_eq!(
+            f.judge(&"BTC", 0, 0, B, SEC + QUOTE_ID_REGIME_TIMEOUT_NS),
+            IdVerdict {
+                decision: IdDecision::Legacy,
+                reset: None
+            }
+        );
+    }
+
+    /// A quote carrying a `Venue Update ID`, venue-scoped so metric assertions see only this test.
+    fn id_quote(
+        venue: &str,
+        id: u32,
+        source_ts_ns: u64,
+        bid: f64,
+        recv_ts_ns: u64,
+    ) -> NormalizedQuote {
+        NormalizedQuote {
+            venue: venue.into(),
+            source_name: venue.into(),
+            venue_update_id: id,
+            wire: wire_of(bid, bid + 1.0, 0),
+            recv_ts_ns,
+            ..quote(source_ts_ns, bid, bid + 1.0)
+        }
+    }
+
+    /// Raw wire values for prices `bid`/`ask` at exponent `-2`, sizes `1.00`/`2.00`, on `channel`.
+    fn wire_of(bid: f64, ask: f64, channel: u8) -> QuoteWire {
+        QuoteWire {
+            channel,
+            bid_price: (bid * 100.0).round() as i64,
+            bid_qty: 100,
+            ask_price: (ask * 100.0).round() as i64,
+            ask_qty: 200,
+            price_exponent: -2,
+            qty_exponent: -2,
+        }
+    }
+
+    fn id_metric(venue: &str, reason: &str) -> u64 {
+        metrics()
+            .quotes_update_id_dropped
+            .with_label_values(&[venue, reason])
+            .get()
+    }
+
+    fn reset_metric(venue: &str, reason: &str) -> u64 {
+        metrics()
+            .quote_floor_resets
+            .with_label_values(&[venue, reason])
+            .get()
+    }
+
+    fn drain_bids(rx: &mut broadcast::Receiver<std::sync::Arc<FeedMessage>>) -> Vec<f64> {
+        drain_quotes(rx).into_iter().map(|(_, bid)| bid).collect()
+    }
+
+    /// The case this exists for: two edge paths of a feed whose quotes carry no `source_ts`. Today
+    /// both copies bypass the floor; with the ID each book state goes out once.
+    #[test]
+    fn arbiter_dedupes_two_untimestamped_paths_on_the_venue_update_id() {
+        let venue = "IdTwoPaths";
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let t = 1_000 * SEC;
+        for (path, id, bid) in [
+            (edge_a, 1, 100.0),
+            (edge_b, 1, 100.0),
+            (edge_b, 2, 101.0),
+            (edge_a, 2, 101.0),
+            (edge_a, 1, 100.0), // a late copy of an older state
+        ] {
+            a.emit(
+                FeedMessage::Quote(id_quote(venue, id, 0, bid, t)),
+                path,
+                TEST_CATEGORY,
+            );
+        }
+        assert_eq!(drain_bids(&mut rx), vec![100.0, 101.0]);
+        assert_eq!(id_metric(venue, ID_DROP_DUPLICATE), 2);
+        assert_eq!(id_metric(venue, ID_DROP_STALE), 1);
+        let m = metrics();
+        assert_eq!(
+            m.quotes_update_id_admitted
+                .with_label_values(&[venue])
+                .get(),
+            2
+        );
+        assert_eq!(m.quotes_dropped.with_label_values(&[venue]).get(), 3);
+        // The ID path is not the `source_ts == 0` bypass.
+        assert_eq!(m.quotes_no_source_ts.with_label_values(&[venue]).get(), 0);
+    }
+
+    /// Drive the arbiter's quote ID clock by hand; returns the handle to move it with.
+    fn hand_clock(a: &mut Arbiter, start: u64) -> Arc<std::sync::atomic::AtomicU64> {
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(start));
+        let read = clock.clone();
+        a.set_quote_id_clock(move || read.load(std::sync::atomic::Ordering::Relaxed));
+        clock
+    }
+
+    fn set_clock(clock: &std::sync::atomic::AtomicU64, ns: u64) {
+        clock.store(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Mixed fleet: one path fills the ID, the other does not. The ID-less copies are dropped —
+    /// `source_ts == 0` ones included, since that is every quote of such a feed — until the ID path
+    /// goes silent for the regime timeout; then the old path is served exactly as today.
+    #[test]
+    fn arbiter_mixed_fleet_drops_id_less_copies_until_the_timeout() {
+        let venue = "IdMixedFleet";
+        let new_path = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let old_path = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let t = 1_000 * SEC;
+        let clock = hand_clock(&mut a, t);
+        let send = |a: &mut Arbiter, q: NormalizedQuote, p| {
+            a.emit(FeedMessage::Quote(q), p, TEST_CATEGORY)
+        };
+        let wall = now_ns();
+        send(&mut a, id_quote(venue, 1, 0, 100.0, wall), new_path);
+        send(&mut a, id_quote(venue, 0, 0, 100.0, wall), old_path);
+        send(&mut a, id_quote(venue, 2, 0, 101.0, wall), new_path);
+        send(&mut a, id_quote(venue, 0, 0, 101.0, wall), old_path);
+        assert_eq!(drain_bids(&mut rx), vec![100.0, 101.0]);
+        assert_eq!(id_metric(venue, ID_DROP_REGIME), 2);
+
+        // The new path goes silent. Inside the timeout the old path stays muted ...
+        set_clock(&clock, t + QUOTE_ID_REGIME_TIMEOUT_NS - 1);
+        send(&mut a, id_quote(venue, 0, 0, 102.0, wall), old_path);
+        assert!(drain_bids(&mut rx).is_empty());
+        // ... and past it the key returns to today's bypass, counted once.
+        set_clock(&clock, t + QUOTE_ID_REGIME_TIMEOUT_NS);
+        send(&mut a, id_quote(venue, 0, 0, 103.0, wall), old_path);
+        send(&mut a, id_quote(venue, 0, 0, 104.0, wall), old_path);
+        assert_eq!(drain_bids(&mut rx), vec![103.0, 104.0]);
+        assert_eq!(reset_metric(venue, ID_RESET_REGIME_TIMEOUT), 1);
+        assert_eq!(
+            metrics()
+                .quotes_no_source_ts
+                .with_label_values(&[venue])
+                .get(),
+            2
+        );
+    }
+
+    /// Past the timeout an ID-less quote that carries a `source_ts` goes to today's floor, latch
+    /// and all: the non-leader's copy at the leader's tick is dropped.
+    #[test]
+    fn arbiter_after_the_timeout_timestamped_quotes_take_the_floor() {
+        let venue = "IdBackToFloor";
+        let new_path = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let old_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let old_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let clock = hand_clock(&mut a, SEC);
+        let t = now_ns();
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 9, t, 100.0, t)),
+            new_path,
+            TEST_CATEGORY,
+        );
+        set_clock(&clock, SEC + QUOTE_ID_REGIME_TIMEOUT_NS);
+        for (path, bid) in [(old_a, 101.0), (old_b, 102.0)] {
+            a.emit(
+                FeedMessage::Quote(id_quote(venue, 0, t + 1, bid, t + 1)),
+                path,
+                TEST_CATEGORY,
+            );
+        }
+        assert_eq!(drain_bids(&mut rx), vec![100.0, 101.0]);
+    }
+
+    /// The public input carries no ID. On a key in the ID regime it fills in only after the timeout.
+    #[test]
+    fn arbiter_public_input_backstops_an_id_key_only_after_the_timeout() {
+        let venue = "IdPublicBackstop";
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let clock = hand_clock(&mut a, SEC);
+        let t = now_ns();
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 5, t, 100.0, t)),
+            edge,
+            TEST_CATEGORY,
+        );
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 0, t + 1, 100.5, t + 1)),
+            Transport::PublicWs,
+            TEST_CATEGORY,
+        );
+        set_clock(&clock, SEC + QUOTE_ID_REGIME_TIMEOUT_NS);
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 0, t + 2, 101.0, t + 2)),
+            Transport::PublicWs,
+            TEST_CATEGORY,
+        );
+        assert_eq!(drain_bids(&mut rx), vec![100.0, 101.0]);
+        assert_eq!(
+            metrics()
+                .quotes_admitted
+                .with_label_values(&[venue, "public"])
+                .get(),
+            1
+        );
+    }
+
+    /// The regime timeout runs on the monotonic clock. A quote whose wall-clock `recv_ts_ns` says
+    /// a minute has passed (an NTP step forward) does not expire the key; the monotonic clock
+    /// passing the timeout does, whatever the wall clock says.
+    #[test]
+    fn arbiter_regime_timeout_ignores_the_wall_clock() {
+        let venue = "IdMonotonic";
+        let new_path = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let old_path = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let clock = hand_clock(&mut a, SEC);
+        let wall = now_ns();
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 1, 0, 100.0, wall)),
+            new_path,
+            TEST_CATEGORY,
+        );
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 0, 0, 101.0, wall + 60 * SEC)),
+            old_path,
+            TEST_CATEGORY,
+        );
+        assert_eq!(drain_bids(&mut rx), vec![100.0]);
+        // A step *back* on the wall clock with the monotonic clock past the timeout: expires.
+        set_clock(&clock, SEC + QUOTE_ID_REGIME_TIMEOUT_NS);
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 0, 0, 102.0, wall - 60 * SEC)),
+            old_path,
+            TEST_CATEGORY,
+        );
+        assert_eq!(drain_bids(&mut rx), vec![102.0]);
+    }
+
+    /// One ID carrying two contents is dropped as a `conflict`, not as a duplicate: the signal that
+    /// a path's padding is not a venue counter.
+    #[test]
+    fn arbiter_same_id_with_other_content_is_a_conflict() {
+        let venue = "IdConflict";
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let t = now_ns();
+        for (path, bid) in [(edge_a, 100.0), (edge_b, 100.0), (edge_b, 105.0)] {
+            a.emit(
+                FeedMessage::Quote(id_quote(venue, 42, 0, bid, t)),
+                path,
+                TEST_CATEGORY,
+            );
+        }
+        assert_eq!(drain_bids(&mut rx), vec![100.0]);
+        assert_eq!(id_metric(venue, ID_DROP_DUPLICATE), 1);
+        assert_eq!(id_metric(venue, ID_DROP_CONFLICT), 1);
+    }
+
+    /// A source count of `0` is "unavailable", so a path reporting `0` where its peer reports `5`
+    /// for the same ID is a duplicate, not a conflict.
+    #[test]
+    fn arbiter_counts_do_not_make_a_conflict() {
+        let venue = "IdConflictCounts";
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let t = now_ns();
+        let mut counted = id_quote(venue, 42, 0, 100.0, t);
+        counted.bid_n = 5;
+        counted.ask_n = 3;
+        a.emit(FeedMessage::Quote(counted), edge_a, TEST_CATEGORY);
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 42, 0, 100.0, t)),
+            edge_b,
+            TEST_CATEGORY,
+        );
+        assert_eq!(drain_bids(&mut rx), vec![100.0]);
+        assert_eq!(id_metric(venue, ID_DROP_DUPLICATE), 1);
+        assert_eq!(id_metric(venue, ID_DROP_CONFLICT), 0);
+    }
+
+    /// Two copies of one ID under one scale, scaled under another, and conflicting: the scale is
+    /// checked first, so definition skew never reads as a conflict.
+    #[test]
+    fn definition_skew_is_not_a_conflict() {
+        let mut f: UpdateIdFloor<&'static str, (i8, u8), u8> =
+            UpdateIdFloor::new(QUOTE_ID_MAX_JUMP);
+        assert_eq!(f.judge(&"BTC", 10, (-2, 1), A, SEC), admit());
+        assert_eq!(f.judge(&"BTC", 10, (-3, 9), B, SEC), drop_for(ID_DROP_SKEW));
+        assert_eq!(
+            f.judge(&"BTC", 10, (-2, 1), B, SEC),
+            drop_for(ID_DROP_DUPLICATE)
+        );
+        assert_eq!(
+            f.judge(&"BTC", 10, (-2, 2), B, SEC),
+            drop_for(ID_DROP_CONFLICT)
+        );
+    }
+
+    /// Raw sizes `1` and `2` at quantity exponent `-9` round alike to `10^-8`, which `QuoteId`
+    /// keeps; compared on the raw integers they are two contents under one ID, a `conflict`.
+    #[test]
+    fn arbiter_compares_an_id_on_raw_integers() {
+        let venue = "IdRawExact";
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let t = now_ns();
+        let sized = |raw: u64| {
+            let mut q = id_quote(venue, 42, 0, 100.0, t);
+            q.wire.qty_exponent = -9;
+            q.wire.bid_qty = raw;
+            q.bid_size = raw as f64 * 1e-9;
+            q
+        };
+        assert_eq!(
+            QuoteId::of(&sized(1)).without_counts(),
+            QuoteId::of(&sized(2)).without_counts(),
+            "the rounded identity cannot tell them apart"
+        );
+        a.emit(FeedMessage::Quote(sized(1)), edge_a, TEST_CATEGORY);
+        a.emit(FeedMessage::Quote(sized(2)), edge_b, TEST_CATEGORY);
+        assert_eq!(drain_bids(&mut rx), vec![100.0]);
+        assert_eq!(id_metric(venue, ID_DROP_CONFLICT), 1);
+        assert_eq!(id_metric(venue, ID_DROP_DUPLICATE), 0);
+    }
+
+    /// One path holds a new definition of the instrument before the other: the same ID arrives
+    /// scaled under other exponents. It drops as `skew`, and the key stays in the regime.
+    #[test]
+    fn arbiter_definition_skew_drops_and_disables_nothing() {
+        let venue = "IdDefinitionSkew";
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let t = now_ns();
+        let mut rescaled = id_quote(venue, 42, 0, 100.0, t);
+        rescaled.wire.price_exponent = -3;
+        rescaled.wire.bid_price *= 10;
+        rescaled.wire.ask_price *= 10;
+        rescaled.bid = 100.0001; // the cached definition scales it a hair apart
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 42, 0, 100.0, t)),
+            edge_a,
+            TEST_CATEGORY,
+        );
+        a.emit(FeedMessage::Quote(rescaled), edge_b, TEST_CATEGORY);
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 43, 0, 101.0, t)),
+            edge_b,
+            TEST_CATEGORY,
+        );
+        assert_eq!(drain_bids(&mut rx), vec![100.0, 101.0]);
+        assert_eq!(id_metric(venue, ID_DROP_SKEW), 1);
+        assert_eq!(id_metric(venue, ID_DROP_CONFLICT), 0);
+        let m = metrics();
+        assert_eq!(
+            m.quotes_update_id_disabled
+                .with_label_values(&[venue])
+                .get(),
+            0
+        );
+        assert_eq!(
+            m.quotes_update_id_admitted
+                .with_label_values(&[venue])
+                .get(),
+            2
+        );
+    }
+
+    /// A `conflict` stops the `SourceKey` using the field for [`QUOTE_ID_DISABLE_NS`]: its quotes
+    /// take the `source_ts == 0` bypass meanwhile, each path's copy forwarded as today. After the
+    /// cooldown it re-enters the regime fresh and dedupes again.
+    #[test]
+    fn arbiter_conflict_disables_the_source_until_the_cooldown() {
+        let venue = "IdConflictDisable";
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let clock = hand_clock(&mut a, SEC);
+        let t = now_ns();
+        let send = |a: &mut Arbiter, id, bid, path| {
+            a.emit(
+                FeedMessage::Quote(id_quote(venue, id, 0, bid, t)),
+                path,
+                TEST_CATEGORY,
+            )
+        };
+        send(&mut a, 42, 100.0, edge_a);
+        send(&mut a, 42, 105.0, edge_b);
+        let m = metrics();
+        assert_eq!(id_metric(venue, ID_DROP_CONFLICT), 1);
+        assert_eq!(
+            m.quotes_update_id_disabled
+                .with_label_values(&[venue])
+                .get(),
+            1
+        );
+        assert_eq!(drain_bids(&mut rx), vec![100.0]);
+
+        // Disabled: both paths' copies of the next ID take today's bypass.
+        set_clock(&clock, SEC + QUOTE_ID_DISABLE_NS - 1);
+        send(&mut a, 43, 101.0, edge_a);
+        send(&mut a, 43, 101.0, edge_b);
+        assert_eq!(drain_bids(&mut rx), vec![101.0, 101.0]);
+        assert_eq!(m.quotes_no_source_ts.with_label_values(&[venue]).get(), 2);
+        assert_eq!(id_metric(venue, ID_DROP_DUPLICATE), 0);
+
+        // The cooldown is over: the regime dedupes again.
+        set_clock(&clock, SEC + QUOTE_ID_DISABLE_NS);
+        send(&mut a, 44, 102.0, edge_a);
+        send(&mut a, 44, 102.0, edge_b);
+        assert_eq!(drain_bids(&mut rx), vec![102.0]);
+        assert_eq!(id_metric(venue, ID_DROP_DUPLICATE), 1);
+        assert_eq!(
+            m.quotes_update_id_disabled
+                .with_label_values(&[venue])
+                .get(),
+            1
+        );
+        assert_eq!(m.quotes_no_source_ts.with_label_values(&[venue]).get(), 2);
+    }
+
+    /// The key includes the canonical channel. Two paths on one channel dedupe; two channels of
+    /// one Source ID with independent counters do not interfere, though one counter runs far
+    /// ahead of the other.
+    #[test]
+    fn arbiter_update_id_keys_on_the_channel() {
+        let venue = "IdChannelKey";
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let t = now_ns();
+        let on = |id, bid, channel| {
+            let mut q = id_quote(venue, id, 0, bid, t);
+            q.wire.channel = channel;
+            FeedMessage::Quote(q)
+        };
+        for (id, bid, channel, path) in [
+            (500_000, 100.0, 5, edge_a),
+            (500_000, 100.0, 5, edge_b), // the other path's copy: a duplicate
+            (10, 200.0, 6, edge_a),      // channel 6's own counter, far behind
+            (500_001, 101.0, 5, edge_b),
+            (11, 201.0, 6, edge_b),
+            (11, 201.0, 6, edge_a), // a duplicate on channel 6
+        ] {
+            a.emit(on(id, bid, channel), path, TEST_CATEGORY);
+        }
+        assert_eq!(drain_bids(&mut rx), vec![100.0, 200.0, 101.0, 201.0]);
+        assert_eq!(id_metric(venue, ID_DROP_DUPLICATE), 2);
+        assert_eq!(id_metric(venue, ID_DROP_STALE), 0);
+        assert_eq!(id_metric(venue, ID_DROP_JUMP), 0);
+    }
+
+    /// An ID-less quote on a key outside the regime takes today's path even while another key is
+    /// in it, and never touches ID state: the other key's regime does not reach it.
+    #[test]
+    fn arbiter_id_less_quote_off_the_regime_key_is_untouched() {
+        let venue = "IdOffKey";
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let t = now_ns();
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 7, 0, 100.0, t)),
+            edge_a,
+            TEST_CATEGORY,
+        );
+        let mut other = id_quote(venue, 0, 0, 50.0, t);
+        other.symbol = "OTHER".into();
+        a.emit(FeedMessage::Quote(other), edge_a, TEST_CATEGORY);
+        assert_eq!(drain_bids(&mut rx), vec![100.0, 50.0]);
+        assert_eq!(id_metric(venue, ID_DROP_REGIME), 0);
+        assert_eq!(
+            metrics()
+                .quotes_no_source_ts
+                .with_label_values(&[venue])
+                .get(),
+            1
+        );
+    }
+
+    /// The future-skew guard still runs first: an ID quote stamped far ahead of the host clock is
+    /// rejected and does not enter the ID regime.
+    #[test]
+    fn arbiter_future_skew_guard_runs_before_the_id_regime() {
+        let venue = "IdFutureSkew";
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let t = now_ns();
+        a.emit(
+            FeedMessage::Quote(id_quote(venue, 5, t + 10 * MAX_FUTURE_SKEW_NS, 100.0, t)),
+            edge,
+            TEST_CATEGORY,
+        );
+        assert!(drain_bids(&mut rx).is_empty());
+        assert!(a.quote_ids.is_empty());
+        assert_eq!(
+            metrics()
+                .quotes_future_rejected
+                .with_label_values(&[venue])
+                .get(),
+            1
+        );
+    }
+
+    /// Existing traffic is unchanged. Every quote from an encoder that predates the field carries
+    /// ID `0`: the ID floor stays empty, the `source_ts` floor latches and drops exactly as before,
+    /// and the `source_ts == 0` bypass forwards both copies — with or without another key in the ID
+    /// regime at the same time.
+    #[test]
+    fn arbiter_id_less_traffic_behaves_as_before() {
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        for other_key_in_regime in [false, true] {
+            let venue = if other_key_in_regime {
+                "IdLegacyBeside"
+            } else {
+                "IdLegacyAlone"
+            };
+            let (tx, mut rx) = broadcast::channel(64);
+            let mut a = Arbiter::new(tx, 8);
+            if other_key_in_regime {
+                let mut other = id_quote(venue, 3, 0, 1.0, now_ns());
+                other.symbol = "OTHER".into();
+                a.emit(FeedMessage::Quote(other), edge_a, TEST_CATEGORY);
+                let _ = drain_bids(&mut rx);
+                assert!(!a.quote_ids.is_empty());
+            }
+            let t = now_ns();
+            for (path, ts, bid) in [
+                (edge_a, t, 100.0),
+                (edge_b, t, 100.5),     // non-leader at the open tick: dropped
+                (edge_a, t, 100.25),    // the leader's new content: kept
+                (edge_b, t + 1, 101.0), // opens the next tick
+                (edge_a, t, 99.0),      // stale tick: dropped
+                (edge_a, 0, 98.0),      // sentinel: bypass
+                (edge_b, 0, 98.0),      // sentinel: bypass, both copies
+            ] {
+                a.emit(
+                    FeedMessage::Quote(id_quote(venue, 0, ts, bid, t)),
+                    path,
+                    TEST_CATEGORY,
+                );
+            }
+            assert_eq!(
+                drain_bids(&mut rx),
+                vec![100.0, 100.25, 101.0, 98.0, 98.0],
+                "other key in the ID regime: {other_key_in_regime}"
+            );
+            let m = metrics();
+            assert_eq!(m.quotes_no_source_ts.with_label_values(&[venue]).get(), 2);
+            assert_eq!(m.quotes_dropped.with_label_values(&[venue]).get(), 2);
+            assert_eq!(
+                m.quotes_update_id_admitted
+                    .with_label_values(&[venue])
+                    .get(),
+                u64::from(other_key_in_regime)
+            );
+            for r in ID_DROP_REASONS {
+                assert_eq!(id_metric(venue, r), 0, "{r}");
+            }
+        }
+    }
+
+    /// `set_quote_id_max_jump` reaches the floor the arbiter judges with.
+    #[test]
+    fn arbiter_quote_id_max_jump_is_configurable() {
+        let venue = "IdJumpCap";
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.set_quote_id_max_jump(10);
+        let t = now_ns();
+        for (id, bid) in [(100, 1.0), (110, 2.0), (121, 3.0)] {
+            a.emit(
+                FeedMessage::Quote(id_quote(venue, id, 0, bid, t)),
+                edge,
+                TEST_CATEGORY,
+            );
+        }
+        assert_eq!(drain_bids(&mut rx), vec![1.0, 2.0]);
+        assert_eq!(id_metric(venue, ID_DROP_JUMP), 1);
     }
 }

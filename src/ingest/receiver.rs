@@ -1452,6 +1452,8 @@ mod tests {
                 recv_ts_ns: ts,
                 kernel_rx_ts_ns: 0,
                 ws_send_ts_ns: 0,
+                venue_update_id: 0,
+                wire: crate::model::QuoteWire::default(),
             })
         };
         let count = || {
@@ -1567,6 +1569,8 @@ mod tests {
             recv_ts_ns: 1,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            venue_update_id: 0,
+            wire: crate::model::QuoteWire::default(),
         };
         ctx.emit(FeedMessage::Quote(quote));
         assert_eq!(
