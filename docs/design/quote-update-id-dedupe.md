@@ -171,7 +171,7 @@ an alert signal rather than a measure of idle instruments.
 
 ## State and bounding
 
-Each key adds a `u32` last ID, the admitted quote's `QuoteId`, the last-admit instant, a refused-since-admit flag, and an optional
+Each key adds a `u32` last ID, the admitted quote's `QuoteId` without its counts, the last-admit instant, a refused-since-admit flag, and an optional
 candidate (`u32` and its `Transport`). The candidate needs no age: an admit clears it, and with
 nothing admitted the whole key expires on the regime timeout first. No new keys: the key space is today's quote floor, a
 plain `HashMap` per `(SourceKey, symbol)` with no key cap (`arbiter.rs:474-480`). If that cap is ever
@@ -183,7 +183,7 @@ Following `dz_quotes_no_source_ts_total` and `dz_depth_floor_resets_total`:
 
 - `dz_quotes_update_id_admitted_total{venue}`: quotes admitted in the ID regime.
 - `dz_quotes_update_id_dropped_total{venue, reason}`, `reason` one of `duplicate` (the same ID again,
-  the steady state of a second path), `conflict` (the same ID with a different `QuoteId`), `stale`
+  the steady state of a second path), `conflict` (the same ID with other prices or sizes; the counts are left out, since a path may report `0` for unavailable), `stale`
   (an older ID), `regime` (an ID-less copy on an ID key), `jump`. *`duplicate` is split from `stale`,
   which the earlier draft folded together*: a second hot path makes duplicates half the traffic, and a
   real reordering would vanish into that. `conflict` is also dropped: one ID is one book state, so two
