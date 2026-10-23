@@ -98,9 +98,10 @@ pub const QUOTE_ID_REGIME_TIMEOUT_NS: u64 = 5_000_000_000; // 5s
 
 /// Default for `--arb-quote-id-max-jump`: the largest forward advance of a key's `Venue Update ID`
 /// admitted without corroboration. The regime timeout already bounds any wedge, so this only has to
-/// never refuse an honest advance: 1,000,000 is 200,000 book changes per second on one instrument
-/// for the whole [`QUOTE_ID_REGIME_TIMEOUT_NS`].
-pub const QUOTE_ID_MAX_JUMP: u32 = 1_000_000;
+/// never refuse an honest advance: 65,536 is 13,107 book changes per second on one instrument for
+/// the whole [`QUOTE_ID_REGIME_TIMEOUT_NS`]. Measured over 222 M quotes from two paths of a public
+/// feed, the largest advance within the timeout was 2,335.
+pub const QUOTE_ID_MAX_JUMP: u32 = 65_536;
 
 /// How long a `SourceKey` stops using the `Venue Update ID` after a `conflict`, as edge-feed-spec
 /// top-of-book `3.2.0`'s SHOULD asks: its quotes take the `source_ts` floor or bypass meanwhile.

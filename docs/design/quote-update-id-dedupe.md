@@ -198,8 +198,10 @@ The cap trades false rejections against nothing much: the timeout bounds the wed
 decides whether one bad datagram costs a 5 s gap. So it is sized to never refuse an honest advance.
 What to measure, per feed and instrument: the largest advance of the counter between two consecutive
 quotes one path delivers, within the regime timeout. Book change rate times the timeout bounds it from
-above. The default is `1_000_000`, which allows 200,000 book changes per second on one instrument for
-the whole timeout. It is a flag, `--arb-quote-id-max-jump`, beside `--arb-book-ts-jump-secs`, which
+above. The default is `65_536`, which allows 13,107 book changes per second on one instrument for the
+whole timeout. It was `1_000_000` until it was measured: over nine hours of one public feed from two
+paths, 222 M quotes, the largest advance within the timeout was 2,335 (p99.99 123), and replaying the
+capture through the arbiter dropped no quote as `jump` at any cap from `1_000_000` down to `16_384`. It is a flag, `--arb-quote-id-max-jump`, beside `--arb-book-ts-jump-secs`, which
 answers the same question for book stamps (`src/main.rs:377`).
 
 ### Restart, era and venue resets
