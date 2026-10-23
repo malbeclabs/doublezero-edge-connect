@@ -354,6 +354,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A market-by-price `InstrumentReset` discarded its own recovery snapshot group.** A publisher withholding and then re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin` follows its own reset by ~0.1 ms on a different port — resets ride mktdata, snapshot groups the snapshot port, on independent sequence series — so which is processed first is a coin flip. When the begin won, both the book's assembly and the processor's level route were torn out, the market waited a full snapshot rotation to heal, and the group's levels were counted on `dz_mbp_snapshot_levels_dropped_total{reason="reset"}`. A group anchored at or after the reset's `New Anchor Seq` is now kept — the same test a `SnapshotBegin` is already judged by — and only one that predates the reset is dropped and tombstoned. Observed on a live Phoenix feed at roughly two flaps per hour per market; expect that `reason="reset"` series to fall substantially.
 
 ### Changed
+- **`--arb-quote-id-max-jump` defaults to 65,536, down from 1,000,000** in the `:mainnet-beta` image
+  of 2026-10-22 (`8c8c973`). Measured over nine hours of one public feed from two paths, 222 M
+  quotes: the largest advance of a key's `Venue Update ID` within the 5 s regime timeout was 2,335,
+  and a replay through the arbiter dropped no quote as `jump` at any cap down to 16,384. A tighter
+  cap narrows the advance one bad datagram can make without corroboration. A feed with a faster
+  counter sets the flag.
 - **A feed-registry row that shares its venue name with other Source IDs but declares no `source_id`
   is reported at load** (`info`, once per `(venue, category)`): its engines' health and status are
   reported together under the name. The hosted Hyperliquid rows are such rows today. Refusing them is
@@ -511,7 +517,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose quotes carry no `source_ts` used to bypass the quote floor, so two hot publishers of it
   delivered every quote twice. A key that sees a nonzero ID now admits each ID once, in serial order,
   from whichever path delivers it first, and drops ID-less copies until it has admitted no ID for 5 s.
-  A forward jump past `--arb-quote-id-max-jump` (default 1,000,000) waits for a second path to
+  A forward jump past `--arb-quote-id-max-jump` (default 65,536) waits for a second path to
   corroborate it. The key includes the canonical channel, and copies of one ID are
   compared on their raw wire integers: under other exponents they are definition skew (`skew`), and
   under one scale with other content a `conflict`, which stops that source using the field for 60 s.
