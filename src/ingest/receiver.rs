@@ -721,7 +721,9 @@ pub fn bind_multicast(
     if let Err(e) = setsockopt(&std_sock, ReceiveTimestampns, &true) {
         warn!("SO_TIMESTAMPNS unavailable on port {port}: {e}; using user-space recv ts only");
     }
-    Ok(AsyncFd::new(std_sock)?)
+    // SAFETY: `std_sock` owns its descriptor, which stays open and unchanged until the
+    // `AsyncFd` drops it; nothing takes the socket back out through `get_mut`/`into_inner`.
+    Ok(unsafe { AsyncFd::register(std_sock) }?)
 }
 
 /// Outcome of checking a datagram's header against the per-channel sequence tracker.
@@ -1927,7 +1929,8 @@ mod tests {
         rx.set_nonblocking(true).unwrap();
         setsockopt(&rx, ReceiveTimestampns, &true).unwrap();
         let to = rx.local_addr().unwrap();
-        let sock = tokio::io::unix::AsyncFd::new(rx).unwrap();
+        // SAFETY: `rx` owns its descriptor for the life of the `AsyncFd`.
+        let sock = unsafe { tokio::io::unix::AsyncFd::register(rx) }.unwrap();
         let before = crate::model::now_ns();
         let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         tx.send_to(b"x", to).unwrap();
