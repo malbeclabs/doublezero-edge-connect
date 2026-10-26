@@ -365,7 +365,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repo.** `cargo-deny`, GoReleaser and yq are installed as pinned release binaries checked against
   their SHA-256; `cargo-deny` runs the same checks as before. `actionlint.yml` is replaced by
   `actions-lint.yml` (actionlint plus zizmor), every kept checkout drops its token, and
-  `.github/CODEOWNERS` now owns the CI configuration (malbeclabs/infra#3339).
+  `.github/CODEOWNERS` now owns the CI configuration and `deny.toml` (malbeclabs/infra#3339).
 - **A feed-registry row that shares its venue name with other Source IDs but declares no `source_id`
   is reported at load** (`info`, once per `(venue, category)`): its engines' health and status are
   reported together under the name. The hosted Hyperliquid rows are such rows today. Refusing them is

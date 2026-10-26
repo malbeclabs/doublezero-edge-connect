@@ -7,3 +7,6 @@
 /.github/actionlint.yaml @armcconnell @bgm-malbeclabs @nikw9944
 /.github/actionlint.yml @armcconnell @bgm-malbeclabs @nikw9944
 /.github/CODEOWNERS @armcconnell @bgm-malbeclabs @nikw9944
+
+# Supply-chain policy: what the required cargo-deny check enforces
+/deny.toml @armcconnell @bgm-malbeclabs @nikw9944
