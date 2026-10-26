@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old way. PROTOCOL.md records the same note beside the deprecation.
 
 ### Security
+- **Seven RustSec advisories against the lockfile cleared, each at its minimum patched version.**
+  `rustls 0.23.45 -> 0.23.46` (RUSTSEC-2026-0346/0347/0348/0349), `rustls-webpki 0.103.15 ->
+  0.103.16` (0382), `webpki-roots 1.0.8 -> 1.0.10` (0381, distrusted emSign roots) and `tokio
+  1.53.1 -> 1.53.3` (0386, `AsyncFd::new` unsound). The tokio fix deprecates `AsyncFd::new`, so
+  the receiver socket is now registered with `unsafe AsyncFd::register`; the socket owns its
+  descriptor, so the behaviour is unchanged. `cargo-deny` is a required check, and it would
+  otherwise be red on the first CI run after Actions is re-enabled.
 - **`rustls` pinned forward past RUSTSEC-2026-0285, where TLS 1.3 handshake messages were accepted
   at the wrong encryption level.** `0.23.40` accepted a handshake message that followed a
   key-changing message inside the same record — a plaintext `EncryptedExtensions` packed in behind
@@ -360,6 +367,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a replay through the arbiter dropped no quote as `jump` at any cap down to 16,384. A tighter
   cap narrows the advance one bad datagram can make without corroboration. A feed with a faster
   counter sets the flag.
+- **CI uses only org-allowlisted actions, so it can run once GitHub Actions is re-enabled for this
+  repo.** `cargo-deny`, GoReleaser and yq are installed as pinned release binaries checked against
+  their SHA-256; `cargo-deny` runs the same checks as before. `actionlint.yml` is replaced by
+  `actions-lint.yml` (actionlint plus zizmor), every kept checkout drops its token, and
+  `.github/CODEOWNERS` now owns the CI configuration and `deny.toml` (malbeclabs/infra#3339).
 - **A feed-registry row that shares its venue name with other Source IDs but declares no `source_id`
   is reported at load** (`info`, once per `(venue, category)`): its engines' health and status are
   reported together under the name. The hosted Hyperliquid rows are such rows today. Refusing them is
