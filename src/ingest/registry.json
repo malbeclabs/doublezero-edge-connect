@@ -323,6 +323,75 @@
       }
     },
     {
+      "venue": "KALSHI",
+      "category": "updown",
+      "code": "edge-kalshi-updown-tob",
+      "kind": "TopOfBook",
+      "group": "233.84.178.26",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "publisher_offset": 100,
+      "notes": [
+        "Kalshi crypto up/down markets, top of book and trades: the fifteen-minute windows of each",
+        "listed series. The venue's depth is edge-kalshi-updown-mbp, on a separate group.",
+        "",
+        "STRIKES. A contract's strike is a StrikeInterval behind its definition, and is pending for",
+        "the first seconds of each window. The KXCRYPTOLEAD15M instruments carry no strike.",
+        "",
+        "ROLLS. The published set rolls every 15 minutes, with one Manifest Seq advance at each roll.",
+        "",
+        "Top-of-Book & Trades wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/spec.md",
+        "",
+        "PORTS. One block, read verbatim.",
+        "",
+        "PUBLISHERS. 2, on the same ports. The second stamps every channel id raised by 100, which publisher_offset records."
+      ],
+      "publishers": {
+        "explicit": [
+          {
+            "mktdata": 37000,
+            "refdata": 47000
+          }
+        ]
+      }
+    },
+    {
+      "venue": "KALSHI",
+      "category": "updown",
+      "code": "edge-kalshi-updown-mbp",
+      "kind": "MarketByPrice",
+      "group": "233.84.178.34",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "publisher_offset": 100,
+      "notes": [
+        "Kalshi crypto up/down markets, market-by-price depth and trades: the fifteen-minute windows",
+        "of each listed series.",
+        "",
+        "STRIKES. A contract's strike is a StrikeInterval behind its definition, and is pending for",
+        "the first seconds of each window. The KXCRYPTOLEAD15M instruments carry no strike.",
+        "",
+        "ROLLS. The published set rolls every 15 minutes, with one Manifest Seq advance at each roll.",
+        "",
+        "Market-by-Price wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/market-by-price/spec.md",
+        "",
+        "PORTS. One block, read verbatim.",
+        "",
+        "PUBLISHERS. 2, on the same ports. The second stamps every channel id raised by 100, which publisher_offset records."
+      ],
+      "publishers": {
+        "explicit": [
+          {
+            "mktdata": 38000,
+            "refdata": 48000,
+            "snapshot": 58000
+          }
+        ]
+      }
+    },
+    {
       "venue": "HYPERLIQUID",
       "category": "hl-perps",
       "code": "edge-hyper-hl-tob",
