@@ -478,6 +478,8 @@ mod tests {
                 ("KALSHI", "events", FeedKind::MarketByPrice) => "edge-kalshi-sports-mbp",
                 ("KALSHI", "elections", FeedKind::TopOfBook) => "edge-kalshi-elections-pol-tob",
                 ("KALSHI", "elections", FeedKind::MarketByPrice) => "edge-kalshi-elections-pol-mbp",
+                ("KALSHI", "updown", FeedKind::TopOfBook) => "edge-kalshi-updown-tob",
+                ("KALSHI", "updown", FeedKind::MarketByPrice) => "edge-kalshi-updown-mbp",
                 ("BINANCE", "usdsm", FeedKind::TopOfBook) => "edge-binance-usdsm-tob",
                 ("BINANCE", "spot", FeedKind::TopOfBook) => "edge-binance-spot-tob",
                 other => panic!("unexpected feed {other:?}"),

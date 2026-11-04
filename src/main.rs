@@ -1016,11 +1016,12 @@ mod tests {
         mbp.sort_unstable();
         // The categories themselves, each exactly once — not a count, which the same universe
         // selected twice would also satisfy, the opposite failure and equally wrong. Elections
-        // joined perps and events as a third market-by-price universe on this venue, which is the
-        // case the dedup has to keep getting right rather than a reason to loosen the assertion.
+        // joined perps and events as a third market-by-price universe on this venue, and up/down as
+        // a fourth, which is the case the dedup has to keep getting right rather than a reason to
+        // loosen the assertion.
         assert_eq!(
             mbp,
-            vec!["elections", "events", "perps"],
+            vec!["elections", "events", "perps", "updown"],
             "every universe must be selected, each once"
         );
     }

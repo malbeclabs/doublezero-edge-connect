@@ -524,6 +524,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- **Kalshi's crypto up/down pair in the compiled-in registry.** `edge-kalshi-updown-tob` (group
+  `233.84.178.26`, Top-of-Book, `37000`/`47000`) and `edge-kalshi-updown-mbp` (`233.84.178.34`,
+  Market-by-Price, `38000`/`48000`/`58000`), category `updown`, each one explicit block shared by two
+  publishers with the second's channel ids raised by `100`, `Sticky` and claiming the tape. Copied
+  verbatim from the publisher's fragment, as the other Kalshi rows are, so the built-in copy matches
+  the hosted aggregate once it is republished with them. The published set rolls every 15 minutes.
+  A contract's strike is a `StrikeInterval`, which the datagram walk does not decode yet and skips
+  as an unknown message, so these instruments arrive without a strike.
 - **Quotes dedupe on the `Venue Update ID`** (edge-feed-spec top-of-book `3.2.0`, `Quote` offset 56:
   the low 32 bits of a venue-assigned per-instrument book update counter, `0` = unavailable). A feed
   whose quotes carry no `source_ts` used to bypass the quote floor, so two hot publishers of it
