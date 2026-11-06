@@ -166,6 +166,28 @@ pub struct Metrics {
     pub quotes_future_rejected: IntCounterVec,
     /// Quotes forwarded with the `source_ts == 0` "not available" sentinel (bypass the floor).
     pub quotes_no_source_ts: IntCounterVec,
+    /// Quotes admitted on the `Venue Update ID` (a key in the ID regime; see
+    /// [`crate::ingest::arbiter::UpdateIdFloor`]). Also counted in `dz_quotes_admitted_total`.
+    pub quotes_update_id_admitted: IntCounterVec,
+    /// Quotes dropped on the `Venue Update ID`, by `reason`: `duplicate` (the same ID again — the
+    /// steady state of a second path), `conflict` (the same ID with other prices or sizes, counts left out: a path is not
+    /// carrying a venue counter, for example nonzero padding from an encoder older than the field),
+    /// `stale` (an older ID), `regime` (an ID-less copy on a key in
+    /// the ID regime; above zero for long outside a rollout means a publisher of that key is not
+    /// filling the field), `jump` (a forward jump past `--arb-quote-id-max-jump`) and `skew` (the
+    /// same ID scaled under other exponents: two definitions of the instrument in flight, which
+    /// disables nothing). Also counted in `dz_quotes_dropped_total`.
+    pub quotes_update_id_dropped: IntCounterVec,
+    /// `SourceKey`s that stopped using the `Venue Update ID` after a `conflict`, for
+    /// `QUOTE_ID_DISABLE_NS`; their quotes take the `source_ts` floor or bypass meanwhile.
+    pub quotes_update_id_disabled: IntCounterVec,
+    /// Quote keys whose `Venue Update ID` state was cleared, by `reason`: `regime_timeout` (no ID
+    /// admitted for the regime timeout, and an ID-less quote took the key back to the `source_ts`
+    /// floor), `corroborated_jump` (a second path confirmed a jump past the cap) and `venue_reset`
+    /// (the first ID after the timeout still compares as older, or as a jump past the cap: the venue
+    /// restarted its counter, or a forged ID held the key). A key that was only quiet reopens without
+    /// a count, even after a lone stale copy.
+    pub quote_floor_resets: IntCounterVec,
     /// Nanoseconds between the two paths' copies of one **matched trade**, on our own receive clock —
     /// the series `--arb-transfer-margin-us` is read off. Fed only by
     /// [`crate::ingest::path_race::PathRace`] pairs, never by a dropped copy's inter-path phase.
@@ -174,6 +196,12 @@ pub struct Metrics {
     /// handover `rebaselined` the consumer (`yes`/`no`). A sustained re-baselining rate means the
     /// thresholds are too loose.
     pub path_transfers: IntCounterVec,
+    /// Health overrides held against an early revert, by how the hold ended
+    /// (`natural`/`deadline`/`incomplete`).
+    pub book_revert_holds: IntCounterVec,
+    /// Handovers between paths of a `shared_batch_id` scope that found the two books different at
+    /// an equal committed slot, and so re-baselined.
+    pub book_path_divergence: IntCounterVec,
     /// Trade-tape ownership moving from one of a venue's **feed rows** to another (the reconciler's
     /// decision, on a subscription change). Each move is a window in which a print may double or
     /// drop, so a sustained rate means subscriptions are flapping.
@@ -682,6 +710,32 @@ impl Metrics {
                 "Quotes forwarded with the source_ts==0 sentinel (floor bypassed)",
                 &["venue"],
             ),
+            quotes_update_id_admitted: counter_vec(
+                &registry,
+                "dz_quotes_update_id_admitted_total",
+                "Quotes admitted on the venue update id (key in the id regime)",
+                &["venue"],
+            ),
+            quotes_update_id_dropped: counter_vec(
+                &registry,
+                "dz_quotes_update_id_dropped_total",
+                "Quotes dropped on the venue update id, by reason \
+                 (duplicate/conflict/stale/regime/jump/skew)",
+                &["venue", "reason"],
+            ),
+            quotes_update_id_disabled: counter_vec(
+                &registry,
+                "dz_quotes_update_id_disabled_total",
+                "Sources that stopped using the venue update id for a while after a conflict",
+                &["venue"],
+            ),
+            quote_floor_resets: counter_vec(
+                &registry,
+                "dz_quote_floor_resets_total",
+                "Quote keys whose venue update id state was cleared, by reason \
+                 (regime_timeout/corroborated_jump/venue_reset)",
+                &["venue", "reason"],
+            ),
             path_lead_ns: histogram_vec(
                 &registry,
                 "dz_path_lead_ns",
@@ -696,6 +750,20 @@ impl Metrics {
                 "Authority transfers by reason (initial/health/health_revert/silence/margin) and \
                  whether the handover re-baselined the consumer (rebaselined=yes/no).",
                 &["venue", "reason", "rebaselined"],
+            ),
+            book_revert_holds: counter_vec(
+                &registry,
+                "dz_book_revert_holds_total",
+                "Health overrides whose revert to the leader was held, by how the hold ended \
+                 (natural/deadline/incomplete).",
+                &["venue", "release"],
+            ),
+            book_path_divergence: counter_vec(
+                &registry,
+                "dz_book_path_divergence_total",
+                "Handovers between paths declared to share batch_id that found different books at \
+                 an equal committed slot, and re-baselined instead.",
+                &["venue"],
             ),
             path_markets_held: gauge_vec(
                 &registry,
@@ -1298,6 +1366,18 @@ mod tests {
         m.depth_floor_resets
             .with_label_values(&["HYPERLIQUID", "end_of_session"])
             .inc();
+        m.quotes_update_id_admitted
+            .with_label_values(&["QuoteIdNames"])
+            .inc();
+        m.quotes_update_id_dropped
+            .with_label_values(&["QuoteIdNames", "duplicate"])
+            .inc();
+        m.quotes_update_id_disabled
+            .with_label_values(&["QuoteIdNames"])
+            .inc();
+        m.quote_floor_resets
+            .with_label_values(&["QuoteIdNames", "regime_timeout"])
+            .inc();
         m.depth_lead_ns
             .with_label_values(&["HYPERLIQUID", "edge", "public"])
             .observe(123_456.0);
@@ -1313,6 +1393,10 @@ mod tests {
         m.path_transfers
             .with_label_values(&["KALSHI", "silence", "yes"])
             .inc();
+        m.book_revert_holds
+            .with_label_values(&["KALSHI", "natural"])
+            .inc();
+        m.book_path_divergence.with_label_values(&["KALSHI"]).inc();
         m.path_markets_held
             .with_label_values(&["KALSHI", "path0"])
             .set(1);
@@ -1425,11 +1509,17 @@ mod tests {
             "dz_depth_admitted_total",
             "dz_depth_dropped_total",
             "dz_depth_floor_resets_total",
+            "dz_quotes_update_id_admitted_total",
+            "dz_quotes_update_id_dropped_total",
+            "dz_quotes_update_id_disabled_total",
+            "dz_quote_floor_resets_total",
             "dz_depth_lead_ns",
             "dz_quote_ticks_won_total",
             "dz_depth_ticks_won_total",
             "dz_path_lead_ns",
             "dz_path_authority_transfers_total",
+            "dz_book_revert_holds_total",
+            "dz_book_path_divergence_total",
             "dz_path_markets_held",
             "dz_tape_owner_changes_total",
             "dz_tape_path_transfers_total",

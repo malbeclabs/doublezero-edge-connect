@@ -323,6 +323,75 @@
       }
     },
     {
+      "venue": "KALSHI",
+      "category": "updown",
+      "code": "edge-kalshi-updown-tob",
+      "kind": "TopOfBook",
+      "group": "233.84.178.26",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "publisher_offset": 100,
+      "notes": [
+        "Kalshi crypto up/down markets, top of book and trades: the fifteen-minute windows of each",
+        "listed series. The venue's depth is edge-kalshi-updown-mbp, on a separate group.",
+        "",
+        "STRIKES. A contract's strike is a StrikeInterval behind its definition, and is pending for",
+        "the first seconds of each window. The KXCRYPTOLEAD15M instruments carry no strike.",
+        "",
+        "ROLLS. The published set rolls every 15 minutes, with one Manifest Seq advance at each roll.",
+        "",
+        "Top-of-Book & Trades wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/top-of-book/spec.md",
+        "",
+        "PORTS. One block, read verbatim.",
+        "",
+        "PUBLISHERS. 2, on the same ports. The second stamps every channel id raised by 100, which publisher_offset records."
+      ],
+      "publishers": {
+        "explicit": [
+          {
+            "mktdata": 37000,
+            "refdata": 47000
+          }
+        ]
+      }
+    },
+    {
+      "venue": "KALSHI",
+      "category": "updown",
+      "code": "edge-kalshi-updown-mbp",
+      "kind": "MarketByPrice",
+      "group": "233.84.178.34",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "publisher_offset": 100,
+      "notes": [
+        "Kalshi crypto up/down markets, market-by-price depth and trades: the fifteen-minute windows",
+        "of each listed series.",
+        "",
+        "STRIKES. A contract's strike is a StrikeInterval behind its definition, and is pending for",
+        "the first seconds of each window. The KXCRYPTOLEAD15M instruments carry no strike.",
+        "",
+        "ROLLS. The published set rolls every 15 minutes, with one Manifest Seq advance at each roll.",
+        "",
+        "Market-by-Price wire format:",
+        "https://github.com/malbeclabs/edge-feed-spec/blob/main/market-by-price/spec.md",
+        "",
+        "PORTS. One block, read verbatim.",
+        "",
+        "PUBLISHERS. 2, on the same ports. The second stamps every channel id raised by 100, which publisher_offset records."
+      ],
+      "publishers": {
+        "explicit": [
+          {
+            "mktdata": 38000,
+            "refdata": 48000,
+            "snapshot": 58000
+          }
+        ]
+      }
+    },
+    {
       "venue": "HYPERLIQUID",
       "category": "hl-perps",
       "code": "edge-hyper-hl-tob",
@@ -477,6 +546,7 @@
       "group": "233.84.178.25",
       "emit_trades": true,
       "arbitration": "Coordinated",
+      "shared_batch_id": true,
       "notes": [
         "Phoenix perpetuals, market-by-price depth, on its own group. The same publisher process as",
         "edge-phoenix-tob, so the same manifest, the same instrument ids and the same schema v3.",
@@ -485,6 +555,10 @@
         "stated there.",
         "",
         "PUBLISHERS. Three, all on these ports and channel 1 with no mirror offset, told apart by source IP address.",
+        "",
+        "SHARED BATCH ID. Every host stamps batch_id with the venue slot, so two hosts at one committed slot",
+        "hold one venue state and a failover between them needs no re-baseline when their books agree. The",
+        "rc.4 cross-host comparison agreed on 1,114 of 1,114 boundaries.",
         "",
         "TAPE. Both rows claim it: this row's mktdata role carries Trade byte-identical to the top-of-book",
         "row's. The reconciler ranks TopOfBook above MarketByPrice when both run, and the overlap at a",

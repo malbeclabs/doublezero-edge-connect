@@ -1865,6 +1865,7 @@ mod tests {
             mirror_offset: None,
             declared_source_id: None,
             per_channel: false,
+            synthesized: false,
         };
         let mut proc = MbpProcessor::new(Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
@@ -3709,6 +3710,7 @@ mod tests {
             emit_trades: false,
             arbitration: crate::ingest::feeds::ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id: None,
         };
         let rows = [
@@ -4245,6 +4247,7 @@ mod tests {
             emit_trades: true,
             arbitration: crate::ingest::feeds::ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id,
         };
         let rows = [
@@ -4308,6 +4311,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id: None,
         };
         let enabled = vec![row];
@@ -4383,6 +4387,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id: None,
         };
         let sports_row = Feed {
@@ -4395,6 +4400,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id: None,
         };
         let enabled = vec![perps_row, sports_row];
@@ -4491,6 +4497,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id: None,
         };
         let enabled = vec![row];
@@ -4553,6 +4560,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
             source_id: None,
         };
         let enabled = vec![row];

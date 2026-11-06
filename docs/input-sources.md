@@ -31,10 +31,11 @@ the narrowing to one venue.
 > 15 with Phoenix's two rows (2 Top-of-Book + 3 Market-by-Price), 20 with Kalshi's two
 > single-block perps rows (2 + 3), 175 with Kalshi's two derived 31-channel events rows
 > (`edge-kalshi-sports-tob` and `-mbp`, 31 × 2 + 31 × 3), 205 with Kalshi's two derived six-channel
-> elections rows (`edge-kalshi-elections-pol-tob` and `-mbp`, 6 × 2 + 6 × 3), and 209 with
+> elections rows (`edge-kalshi-elections-pol-tob` and `-mbp`, 6 × 2 + 6 × 3), 210 with Kalshi's
+> two single-block up/down rows (`edge-kalshi-updown-tob` and `-mbp`, 2 + 3), and 214 with
 > Binance's two single-block Top-of-Book rows (`edge-binance-usdsm-tob` and
 > `edge-binance-spot-tob`, 2 × 2), so a fully-subscribed host's requested `SO_RCVBUF` total is
-> ~1.6 GiB where a single-publisher deployment requested ~40 MiB.
+> ~1.7 GiB where a single-publisher deployment requested ~40 MiB.
 > `net.core.rmem_max` clamps each socket individually and will not catch the aggregate — and the
 > value every installer sets (`268435456`) is a per-socket ceiling well above the 8 MiB default, so
 > it will not bound this either. Lower `DZ_RECV_BUF` or narrow `--publisher-port` if that exceeds the

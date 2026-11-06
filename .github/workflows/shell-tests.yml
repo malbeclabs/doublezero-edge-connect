@@ -9,7 +9,7 @@ name: shell-tests
 # Runs unconditionally on every PR rather than filtering on `paths:`. A
 # `paths`-filtered *required* check is skipped-not-reported on PRs that don't touch
 # the filtered paths, leaving the PR stuck on "Expected — Waiting for status to be
-# reported" (see .github/workflows/actionlint.yml for the same reasoning). bats is
+# reported" (see .github/workflows/security-audit.yml for the same reasoning). bats is
 # fast, so mirror rust.yml and always run.
 on:
   push:
@@ -25,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       # bats-core from apt; python3 is preinstalled on ubuntu-latest (the access-pass
       # heredoc tests use it — the regression suite stubs it out).
       - name: Install bats

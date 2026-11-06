@@ -36,6 +36,13 @@ pub const MSG_MANIFEST_SUMMARY: u8 = 0x07;
 #[allow(dead_code)]
 pub const TRADE_SIZE: u8 = 52;
 
+/// Total on-wire size of a `Quote` message including the 4-byte application message header.
+pub const QUOTE_SIZE: u8 = 60;
+
+/// Message offset of the `Quote` `Venue Update ID` (`u32`, edge-feed-spec top-of-book `3.2.0`).
+/// The last four bytes of the 60; padding before `3.2.0`.
+const QUOTE_VENUE_UPDATE_ID_OFFSET: usize = 56;
+
 // Several wire fields below are decoded for byte-for-byte fidelity with the reference codec
 // (so offsets stay validated) even though no consumer reads them yet; allow the dead_code.
 #[allow(dead_code)]
@@ -54,6 +61,10 @@ pub struct Quote {
     /// `0` means unavailable. Part of the canonical BBO identity.
     pub bid_n: u16,
     pub ask_n: u16,
+    /// Low 32 bits of the venue-assigned per-instrument book update counter (`Venue Update ID`,
+    /// edge-feed-spec TOB offset 56, `3.2.0`). `0` means unavailable, and is what every encoder that
+    /// predates the field writes there. Ordered by serial-number arithmetic; the arbiter dedupes on it.
+    pub venue_update_id: u32,
 }
 
 /// A trade print (last sale) from a venue. Same `instrument_id`/`source_id`/`source_ts`
@@ -130,6 +141,7 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Option<M
             ask_qty_raw: u64le(b, body + 40)?,
             bid_n: u16le(b, body + 48)?,
             ask_n: u16le(b, body + 50)?,
+            venue_update_id: quote_venue_update_id(b, o, schema_version),
         }),
         MSG_TRADE => Message::Trade(Trade {
             instrument_id: u32le(b, body)?,
@@ -159,6 +171,24 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Option<M
     })
 }
 
+/// The quote at message offset `o`'s `Venue Update ID`, or `0` when the field is not there.
+///
+/// Two ways it is not. The field is defined in top-of-book `3.2.0`, so only on Schema Version `3`:
+/// under `1.x` these bytes are padding and mean nothing, whatever they hold. And the declared length
+/// must cover it: the walker hands the body decoder the whole datagram, not the message
+/// (`codec_common::decode_datagram_with`), so the bounds-checked reader alone would let a quote that
+/// under-declares its length read its ID out of the *next* message in the datagram.
+fn quote_venue_update_id(b: &[u8], o: usize, schema_version: u8) -> u32 {
+    if schema_version != SCHEMA_V3 {
+        return 0;
+    }
+    let declared = b.get(o + 1).copied().map_or(0, usize::from);
+    if declared < QUOTE_VENUE_UPDATE_ID_OFFSET + 4 {
+        return 0;
+    }
+    u32le(b, o + QUOTE_VENUE_UPDATE_ID_OFFSET).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +196,10 @@ mod tests {
 
     // Minimal encoder for a single-Quote datagram, to round-trip the decoder.
     fn encode_quote_datagram(q: &Quote) -> Vec<u8> {
+        encode_quote_datagram_at(q, SCHEMA_V3)
+    }
+
+    fn encode_quote_datagram_at(q: &Quote, schema_version: u8) -> Vec<u8> {
         let mut body = vec![MSG_QUOTE, 60u8, 0, 0]; // msg header: type, len, flags(u16)
         body.extend_from_slice(&q.instrument_id.to_le_bytes());
         body.extend_from_slice(&q.source_id.to_le_bytes());
@@ -178,12 +212,12 @@ mod tests {
         body.extend_from_slice(&q.ask_qty_raw.to_le_bytes());
         body.extend_from_slice(&q.bid_n.to_le_bytes()); // bid source count (offset 52)
         body.extend_from_slice(&q.ask_n.to_le_bytes()); // ask source count (offset 54)
-        body.extend_from_slice(&[0u8; 4]); // reserved -> 60 bytes total
+        body.extend_from_slice(&q.venue_update_id.to_le_bytes()); // venue update id (offset 56) -> 60 bytes
 
         let datagram_len = (DATAGRAM_HEADER_SIZE + body.len()) as u16;
         let mut datagram = Vec::new();
         datagram.extend_from_slice(&MAGIC.to_le_bytes());
-        datagram.push(1); // schema version
+        datagram.push(schema_version);
         datagram.push(0); // channel
         datagram.extend_from_slice(&0u64.to_le_bytes()); // sequence
         datagram.extend_from_slice(&0u64.to_le_bytes()); // send ts
@@ -207,8 +241,10 @@ mod tests {
             ask_qty_raw: 10886,
             bid_n: 5,
             ask_n: 3,
+            venue_update_id: 0xDEAD_BEEF,
         };
         let datagram = encode_quote_datagram(&q);
+        assert_eq!(datagram.len(), DATAGRAM_HEADER_SIZE + QUOTE_SIZE as usize);
         let (hdr, msgs) = decode_datagram(&datagram).unwrap();
         assert_eq!(hdr.msg_count, 1);
         assert_eq!(msgs.len(), 1);
@@ -219,9 +255,104 @@ mod tests {
                 assert_eq!(got.ask_qty_raw, 10886);
                 assert_eq!(got.bid_n, 5);
                 assert_eq!(got.ask_n, 3);
+                assert_eq!(got.venue_update_id, 0xDEAD_BEEF);
                 assert!((apply_exponent(got.bid_price_raw, -2) - 67.88).abs() < 1e-9);
             }
             _ => panic!("expected quote"),
+        }
+    }
+
+    /// The `Venue Update ID` sits at message offset 56, little-endian: pinned against raw bytes
+    /// rather than through the test encoder, which would agree with a decoder reading the wrong
+    /// offset as long as both were wrong together.
+    #[test]
+    fn quote_venue_update_id_is_offset_56_little_endian() {
+        let mut datagram = encode_quote_datagram(&sample_quote(0));
+        let at = DATAGRAM_HEADER_SIZE + 56;
+        datagram[at..at + 4].copy_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        let (_h, msgs) = decode_datagram(&datagram).unwrap();
+        let Message::Quote(got) = &msgs[0] else {
+            panic!("expected quote");
+        };
+        assert_eq!(got.venue_update_id, 0x0403_0201);
+        // Nothing else moved: the source counts just before it still decode.
+        assert_eq!((got.bid_n, got.ask_n), (5, 3));
+    }
+
+    /// Under Schema Version `1` the bytes are padding, not a `Venue Update ID`: a nonzero value
+    /// there decodes as no ID, so a `1.x` publisher can never put a key in the ID regime.
+    #[test]
+    fn schema_1_padding_is_never_a_venue_update_id() {
+        let q = sample_quote(0xDEAD_BEEF);
+        let (_h, msgs) = decode_datagram(&encode_quote_datagram_at(&q, SCHEMA_V1)).unwrap();
+        let Message::Quote(got) = &msgs[0] else {
+            panic!("expected quote");
+        };
+        assert_eq!(got.venue_update_id, 0);
+        let (_h, msgs) = decode_datagram(&encode_quote_datagram_at(&q, SCHEMA_V3)).unwrap();
+        let Message::Quote(got) = &msgs[0] else {
+            panic!("expected quote");
+        };
+        assert_eq!(got.venue_update_id, 0xDEAD_BEEF);
+    }
+
+    /// Today's encoders write `dst[56..60].fill(0)` (the shared `dz-edge-tob` encoder), so every
+    /// existing quote decodes to ID `0` — "unavailable" — and stays on the `source_ts` floor.
+    #[test]
+    fn zero_padding_decodes_to_no_venue_update_id() {
+        let datagram = encode_quote_datagram(&sample_quote(0));
+        let at = DATAGRAM_HEADER_SIZE + 56;
+        assert_eq!(&datagram[at..at + 4], &[0, 0, 0, 0]);
+        let (_h, msgs) = decode_datagram(&datagram).unwrap();
+        let Message::Quote(got) = &msgs[0] else {
+            panic!("expected quote");
+        };
+        assert_eq!(got.venue_update_id, 0);
+    }
+
+    /// A quote that declares fewer than 60 bytes has no `Venue Update ID`, even when the datagram
+    /// carries more bytes after it. The walker hands the decoder the whole datagram, so reading at
+    /// offset 56 regardless would take the next message's header for an ID.
+    #[test]
+    fn short_quote_does_not_read_its_id_from_the_next_message() {
+        let full = encode_quote_datagram(&sample_quote(0));
+        // The quote's first 56 bytes, declared as 56, then a 16-byte heartbeat whose header bytes
+        // would read as a nonzero ID at the quote's offset 56.
+        let mut quote = full[DATAGRAM_HEADER_SIZE..DATAGRAM_HEADER_SIZE + 56].to_vec();
+        quote[1] = 56;
+        let mut heartbeat = vec![MSG_HEARTBEAT, 16, 0, 0, 0, 0, 0, 0];
+        heartbeat.extend_from_slice(&123u64.to_le_bytes());
+        let mut datagram = full[..DATAGRAM_HEADER_SIZE].to_vec();
+        datagram[20] = 2; // msg count
+        let len = (DATAGRAM_HEADER_SIZE + quote.len() + heartbeat.len()) as u16;
+        datagram[22..24].copy_from_slice(&len.to_le_bytes());
+        datagram.extend_from_slice(&quote);
+        datagram.extend_from_slice(&heartbeat);
+        assert_ne!(u32le(&datagram, DATAGRAM_HEADER_SIZE + 56), Some(0));
+
+        let (_h, msgs) = decode_datagram(&datagram).unwrap();
+        assert_eq!(msgs.len(), 2);
+        let Message::Quote(got) = &msgs[0] else {
+            panic!("expected quote, got {:?}", msgs[0]);
+        };
+        assert_eq!(got.venue_update_id, 0);
+        assert_eq!((got.bid_n, got.ask_n), (5, 3));
+        assert!(matches!(msgs[1], Message::Heartbeat));
+    }
+
+    fn sample_quote(venue_update_id: u32) -> Quote {
+        Quote {
+            instrument_id: 42,
+            source_id: 1,
+            update_flags: 0b11,
+            source_ts: 0,
+            bid_price_raw: 6788,
+            bid_qty_raw: 10657,
+            ask_price_raw: 6790,
+            ask_qty_raw: 10886,
+            bid_n: 5,
+            ask_n: 3,
+            venue_update_id,
         }
     }
 

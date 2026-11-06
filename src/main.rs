@@ -381,6 +381,19 @@ struct Args {
     )]
     arb_book_ts_jump_secs: u64,
 
+    /// Largest forward advance of a quote key's `Venue Update ID` (the venue-assigned per-instrument
+    /// book update counter) admitted without corroboration. A larger jump is refused until a second
+    /// path delivers an ID near it, or the key's 5 s regime timeout clears it, so one forged datagram
+    /// costs no gap. Set it above the counter's largest honest advance between two quotes one path
+    /// delivers within 5 s: the book change rate of the busiest instrument times 5 s bounds it.
+    #[arg(
+        long = "arb-quote-id-max-jump",
+        env = "DZ_ARB_QUOTE_ID_MAX_JUMP",
+        default_value_t = ingest::arbiter::QUOTE_ID_MAX_JUMP,
+        value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64)
+    )]
+    arb_quote_id_max_jump: u32,
+
     /// Seconds a channel's newest venue stamp may fail to **move** before it is re-seated from the
     /// batches actually arriving. A real tradeoff: below the paths' worst separation (2.77 s measured
     /// at p99.99) it fires on ordinary jitter, and above it, it bounds both how long a stuck frontier
@@ -659,6 +672,14 @@ async fn main() -> Result<()> {
         // SourceID, so a venue can reach the arbiter without its own feed being ingested.
         for f in ingest::feeds::feeds() {
             a.set_mode(f.venue, f.arbitration);
+            if f.shared_batch_id
+                && matches!(
+                    f.kind,
+                    ingest::feeds::FeedKind::MarketByPrice | ingest::feeds::FeedKind::MarketByOrder
+                )
+            {
+                a.set_shared_batch_id(f.venue, f.category);
+            }
         }
         // The arbiter updates the WS-replay depth map on each admitted (leader) depth, so a
         // reconnecting client replays the broadcast book, not a dropped non-leader's copy.
@@ -671,6 +692,7 @@ async fn main() -> Result<()> {
         );
         a.set_book_dedup_window(args.arb_book_dedup_window_ms.saturating_mul(1_000_000));
         a.set_book_guard(book_guard);
+        a.set_quote_id_max_jump(args.arb_quote_id_max_jump);
         Arc::new(Mutex::new(a))
     };
 
@@ -927,6 +949,29 @@ mod tests {
         feeds::init_built_in();
     }
 
+    /// `--arb-quote-id-max-jump` defaults to the arbiter's own constant and refuses a cap the
+    /// serial comparison cannot honour: `0` refuses every advance, and `2^31` or more reaches IDs
+    /// that compare as older.
+    #[test]
+    fn the_quote_id_jump_cap_flag_is_bounded_and_defaults_to_the_arbiter() {
+        assert_eq!(
+            Args::parse_from(["x"]).arb_quote_id_max_jump,
+            ingest::arbiter::QUOTE_ID_MAX_JUMP
+        );
+        let max = (i32::MAX as u32).to_string();
+        assert_eq!(
+            Args::parse_from(["x", "--arb-quote-id-max-jump", &max]).arb_quote_id_max_jump,
+            i32::MAX as u32
+        );
+        let over = (1u64 << 31).to_string();
+        for bad in ["0", over.as_str()] {
+            assert!(
+                Args::try_parse_from(["x", "--arb-quote-id-max-jump", bad]).is_err(),
+                "{bad} accepted"
+            );
+        }
+    }
+
     #[test]
     fn empty_selection_is_all_feeds() {
         registry();
@@ -971,11 +1016,12 @@ mod tests {
         mbp.sort_unstable();
         // The categories themselves, each exactly once — not a count, which the same universe
         // selected twice would also satisfy, the opposite failure and equally wrong. Elections
-        // joined perps and events as a third market-by-price universe on this venue, which is the
-        // case the dedup has to keep getting right rather than a reason to loosen the assertion.
+        // joined perps and events as a third market-by-price universe on this venue, and up/down as
+        // a fourth, which is the case the dedup has to keep getting right rather than a reason to
+        // loosen the assertion.
         assert_eq!(
             mbp,
-            vec!["elections", "events", "perps"],
+            vec!["elections", "events", "perps", "updown"],
             "every universe must be selected, each once"
         );
     }

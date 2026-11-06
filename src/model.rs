@@ -219,6 +219,33 @@ pub struct NormalizedQuote {
     /// 0 until the WS server stamps it.
     #[serde(default)]
     pub ws_send_ts_ns: u64,
+    /// Low 32 bits of the venue-assigned per-instrument book update counter (the top-of-book
+    /// `Quote` `Venue Update ID`), `0` when unavailable. A **producer-side** dedupe key for the
+    /// arbiter, like `NormalizedTrade::category`: `#[serde(skip)]`, so it never reaches the WebSocket
+    /// JSON that PROTOCOL.md fixes, until that contract decides to expose it.
+    #[serde(skip)]
+    pub venue_update_id: u32,
+    /// The wire values the arbiter judges two copies of one `venue_update_id` on, producer-side
+    /// like it and never serialized. See [`QuoteWire`].
+    #[serde(skip)]
+    pub wire: QuoteWire,
+}
+
+/// A quote's canonical channel and its raw wire prices, quantities and exponents, carried beside
+/// the scaled `f64`s for the `Venue Update ID` arbiter. The channel is part of its key, because
+/// edge-feed-spec compares two update ids only within one Source ID and channel; it is
+/// `DatagramCtx::canonical_channel`, so a mirror publisher's offset channel keys with its primary.
+/// The raw integers let two copies of one ID be compared exactly under equal exponents, where the
+/// scaled values round; under different exponents the copies are definition skew, not a conflict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuoteWire {
+    pub channel: u8,
+    pub bid_price: i64,
+    pub bid_qty: u64,
+    pub ask_price: i64,
+    pub ask_qty: u64,
+    pub price_exponent: i8,
+    pub qty_exponent: i8,
 }
 
 /// A normalized trade print (last sale) from any venue. Like [`NormalizedQuote`] it rides the
@@ -643,10 +670,12 @@ pub struct BookAccumulator {
     wire_ts_ns: u64,
     pending_wire_ts_ns: u64,
     pending_batch_id: Option<u32>,
-    /// The venue's committed slot the accumulated state stands at — see
+    /// The venue's committed slot the accumulated state stands at or past — see
     /// [`NormalizedBook::batch_id`]. Committed with the event clock, so it names a slot whose
     /// changes are actually folded in rather than one still waiting for its `last` batch.
     batch_id: Option<u32>,
+    /// Whether the last fold was closed by a batch naming a slot — see [`Self::exact_batch_id`].
+    batch_id_exact: bool,
     /// Whether a producer re-baseline has been folded in, i.e. whether these levels are the market's
     /// **whole** book rather than only what has changed since accumulation started. See
     /// [`BookAccumulator::baselined`].
@@ -704,6 +733,7 @@ impl BookAccumulator {
             pending_wire_ts_ns: 0,
             pending_batch_id: None,
             batch_id: None,
+            batch_id_exact: false,
             baselined: false,
         }
     }
@@ -849,6 +879,7 @@ impl BookAccumulator {
         }
         self.source_ts_ns = self.pending_ts_ns;
         self.batch_id = self.pending_batch_id;
+        self.batch_id_exact = b.batch_id.is_some();
         self.wire_ts_ns = self.pending_wire_ts_ns;
     }
 
@@ -911,9 +942,41 @@ impl BookAccumulator {
         self.source_ts_ns
     }
 
-    /// The committed slot this accumulated state stands at, or `None` if no batch has named one.
+    /// Whether `other` rests exactly the same levels and orders, sizes compared bit for bit. Says
+    /// nothing about completeness, slot or pending changes; the caller checks those.
+    pub fn same_state(&self, other: &Self) -> bool {
+        fn level_eq(a: &(f64, f64), b: &(f64, f64)) -> bool {
+            a.0.to_bits() == b.0.to_bits() && a.1.to_bits() == b.1.to_bits()
+        }
+        fn side_eq(
+            a: &std::collections::BTreeMap<i128, (f64, f64)>,
+            b: &std::collections::BTreeMap<i128, (f64, f64)>,
+        ) -> bool {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|((ka, va), (kb, vb))| ka == kb && level_eq(va, vb))
+        }
+        side_eq(&self.bids, &other.bids)
+            && side_eq(&self.asks, &other.asks)
+            && self.orders.len() == other.orders.len()
+            && self.orders.iter().all(|(id, (bid, key, price, size))| {
+                other.orders.get(id).is_some_and(|(b2, k2, p2, s2)| {
+                    bid == b2 && key == k2 && level_eq(&(*price, *size), &(*p2, *s2))
+                })
+            })
+    }
+
+    /// The committed slot most recently named by a folded batch, or `None` if none has. The state
+    /// is at least that slot's — see [`Self::exact_batch_id`].
     pub fn batch_id(&self) -> Option<u32> {
         self.batch_id
+    }
+
+    /// [`Self::batch_id`] only while the state stands exactly at it. A fold closed by a batch naming
+    /// no slot, as after a boundary lapse, keeps the old label over newer state.
+    pub fn exact_batch_id(&self) -> Option<u32> {
+        self.batch_id.filter(|_| self.batch_id_exact)
     }
 
     /// The `recv_ts_ns` of the newest batch **folded in**, or `0` if none has been. This is the
@@ -1740,6 +1803,8 @@ mod tests {
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            venue_update_id: 0,
+            wire: QuoteWire::default(),
         };
         let v: serde_json::Value = serde_json::to_value(&q).unwrap();
         assert_eq!(v["source_name"], "HYPERLIQUID");
@@ -1749,6 +1814,35 @@ mod tests {
             v.get("source").is_none(),
             "bare `source` still emitted: {v}"
         );
+    }
+
+    /// `venue_update_id` is a producer-side dedupe key: it never reaches the WebSocket JSON that
+    /// PROTOCOL.md fixes, and a consumer payload without it still deserializes (to `0`).
+    #[test]
+    fn a_quote_keeps_its_venue_update_id_off_the_wire() {
+        let q = NormalizedQuote {
+            venue: Arc::from("V"),
+            source_name: Arc::from("V"),
+            source_id: 1,
+            symbol: Arc::from("SOL"),
+            bid: 1.0,
+            ask: 2.0,
+            bid_size: 3.0,
+            ask_size: 4.0,
+            bid_n: 0,
+            ask_n: 0,
+            source_ts_ns: 0,
+            recv_ts_ns: 0,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+            venue_update_id: 42,
+            wire: QuoteWire::default(),
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(!json.contains("venue_update_id"), "{json}");
+        assert!(!json.contains("42"), "{json}");
+        let back: NormalizedQuote = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.venue_update_id, 0);
     }
 
     /// A payload written before these fields existed must still deserialize, or every committed
@@ -1828,6 +1922,50 @@ mod tests {
             size,
             order_id,
         }
+    }
+
+    /// Equal only on identical resting state: every level and order, sizes compared bit for bit.
+    #[test]
+    fn two_accumulators_compare_equal_only_on_identical_state() {
+        let level = |side, price, size| order(BookAction::Update, side, price, size, 0);
+        let base = vec![
+            level(BookSide::Bid, 100.0, 5.0),
+            level(BookSide::Ask, 101.0, 2.0),
+        ];
+        let build = |changes: Vec<BookChange>| {
+            let mut acc = BookAccumulator::new("BTC".into());
+            acc.apply(&book(changes, false, true));
+            acc
+        };
+        let a = build(base.clone());
+        assert!(a.same_state(&build(base.clone())));
+        let mut sized = base.clone();
+        sized[0].size = 5.000_000_000_1;
+        assert!(!a.same_state(&build(sized)), "a size differs");
+        let mut extra = base.clone();
+        extra.push(level(BookSide::Ask, 102.0, 1.0));
+        assert!(!a.same_state(&build(extra)), "one side has an extra level");
+        let orders = build(vec![order(
+            BookAction::Update,
+            BookSide::Bid,
+            100.0,
+            5.0,
+            7,
+        )]);
+        assert!(!orders.same_state(&build(vec![order(
+            BookAction::Update,
+            BookSide::Bid,
+            100.0,
+            5.0,
+            8
+        )])));
+        assert!(orders.same_state(&build(vec![order(
+            BookAction::Update,
+            BookSide::Bid,
+            100.0,
+            5.0,
+            7
+        )])));
     }
 
     /// The accumulator holds orders, and price levels are a fold over them — including the count per
@@ -2027,6 +2165,27 @@ mod tests {
             "the abandoned event's slot is not the state's"
         );
         assert_eq!(acc.source_ts_ns(), 100, "nor its event time");
+    }
+
+    /// A close naming no slot keeps the label but leaves the state past it, until a named close.
+    #[test]
+    fn only_a_close_naming_a_slot_stands_exactly_at_it() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        let close = |slot| {
+            let mut b = book(
+                vec![order(BookAction::Update, BookSide::Bid, 1.0, 1.0, 0)],
+                false,
+                true,
+            );
+            b.batch_id = slot;
+            b
+        };
+        acc.apply(&close(Some(900)));
+        assert_eq!(acc.exact_batch_id(), Some(900));
+        acc.apply(&close(None));
+        assert_eq!((acc.batch_id(), acc.exact_batch_id()), (Some(900), None));
+        acc.apply(&close(Some(901)));
+        assert_eq!(acc.exact_batch_id(), Some(901));
     }
 
     /// A connecting client is bootstrapped with price levels by default, so an L2 consumer never pays

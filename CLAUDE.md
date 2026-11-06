@@ -430,7 +430,11 @@ Modules are grouped by role under `src/`:
   never-binding receiver would otherwise flap `status` on every reconciler respawn) and deregisters
   on every exit path via `Drop`. The watchdog tracks the **mktdata** port only (refdata/snapshot keep
   ticking when market data is wedged). `DatagramCtx` carries the shared `arbiter` (not a raw `tx`);
-  `ctx.emit(msg)` routes through it tagged `Transport::Edge(src_ip)`.
+  `ctx.emit(msg)` routes through it tagged `Transport::Edge(src_ip)`. A receive waits at most
+  `TICK_INTERVAL` (the MBP `BOUNDARY_TIMEOUT_NS`); a timeout calls `DatagramProcessor::on_tick` (no-op
+  by default) and leaves the rejoin decision to the watchdog, so `MbpProcessor` closes the events a
+  **silent** block left open — without it a dead single-publisher channel held every consumer's
+  open event for good. The tick fires only when the whole port block is silent. Its batches carry `DatagramCtx::synthesized`, so the book authority serves them only on the path the consumer follows and never counts them as that path being alive (`StickyAuthority::admit_synthesized`): counted as an arrival, a dead leader's close would hold off its peer's silence takeover for another `leader_timeout`.
 - **`ingest/health.rs`** — `FeedHealth`: every receiver's liveness keyed `(venue, category, kind, base port)`
   (the same tuple as `reconcile::FeedKey`; `(venue, kind)` is not an identity once a venue carries two
   universes),
@@ -502,6 +506,17 @@ Modules are grouped by role under `src/`:
   (venues interned via `model::venue_arc`), so building the dedup key allocates nothing in steady
   state. The quote floor lived inside `TobProcessor` under
   PR #29; it was lifted here so the WS input can race in the same floor.
+  **A quote carrying a nonzero `Venue Update ID`** (TOB `3.2.0`, read on Schema Version `3` only, the low 32 bits of a venue-assigned
+  per-instrument book update counter) puts its `(source, canonical channel, symbol)` key in the **ID regime**
+  (`UpdateIdFloor`, `docs/design/quote-update-id-dedupe.md`): the first copy of each ID wins in serial
+  order with no leader latch, ID-less copies on that key are dropped (`source_ts == 0` ones included),
+  a forward jump past `--arb-quote-id-max-jump` waits for a different `Transport` to corroborate it,
+  and a key that admits no ID for `QUOTE_ID_REGIME_TIMEOUT_NS` (5 s) drops its state on its next
+  quote. Copies of one ID are compared on raw wire integers: other exponents drop as `skew`, other
+  content under one scale as `conflict`, which disables the field for that source for
+  `QUOTE_ID_DISABLE_NS` (60 s). Exempt from every session reset, like the quote floor. An ID-`0` quote
+  on a key outside the regime reads no clock and builds no content, so today's traffic takes the
+  unchanged path.
   **Depth diverges from quotes in one deliberate way: it has NO `source_ts == 0` bypass** (#28). For
   quotes 0 is the "not available" sentinel and is forwarded unlatched; for depth 0 is a *real* state —
   the initial synced-but-empty book each publisher emits right after its snapshot anchor — and the two
@@ -661,6 +676,25 @@ Modules are grouped by role under `src/`:
   unhealthy hands it to the peer and takes it straight back at two re-baselines a rotation. A group
   assembling over a book that was *not* being served stays unhealthy — that one is empty. Both
   directions are counted, `reason="health"` and `reason="health_revert"`, with a `rebaselined` label.
+  ⚠️ **The override is stored, not computed** (`RevertHold`): the first healthy alternate to serve a
+  market holds it until the leader has been healthy for `REVERT_HOLD_NS` (15 s) **and** has sent that
+  market a `clear`-led batch since it went unhealthy (the install precedes the health report, so
+  "since healthy" would never match), or has been healthy for `REVERT_DEADLINE_NS` (60 s) without one. Recomputed per admission,
+  two alternates traded a market on every message, each trade a re-baseline. A hold is discarded when
+  an election moves the leader, the holder goes unhealthy or silent, or the leader sends a batch while the replay entry is incomplete
+  (a quiet holder would never republish it; the holder's own batch may be that republish); `dz_book_revert_holds_total{release}` counts the endings.
+  ⚠️ **A handover skips the re-baseline only where the registry declares `shared_batch_id`** (one value
+  per `(venue, category)` over the book rows, refused at load on a row with no book, installed
+  beside the arbitration mode; true on
+  `edge-phoenix-mbp` alone, whose publishers stamp the venue slot): `Arbiter::seamless_handover` then
+  compares the **replay entry** (what reached the wire; a withheld batch can make the outgoing path's
+  own accumulator differ from the consumer's book) against the incoming path's accumulator, before
+  that path's batch is folded, and requires both complete, between events, standing exactly at one
+  equal slot no lower than `wire_slot` (`BookAccumulator::exact_batch_id`: an event closed by a batch
+  naming no slot folds in under the old label, and comparing that would count a boundary lapse as a
+  divergence), and `BookAccumulator::same_state`. Undeclared, it always re-baselines: two paths'
+  slots are otherwise unrelated counters, and a false "equal" corrupts a book silently. A mismatch at
+  an equal slot counts `dz_book_path_divergence_total` and re-baselines.
   Tunables are the `--arb-*` flags (see docs/metrics.md).
   **Anything but "the path that last reached the wire for this market" re-baselines the consumer**: a
   serving-path change (margin, silence, or that health override), a market's first admission, a market
@@ -703,13 +737,13 @@ Modules are grouped by role under `src/`:
   admission slots. `dz_path_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-path phase against an unrelated earlier message, and structurally
   non-negative). The `FEEDS` rows of that kind are `edge-kalshi-perps-mbp` and `edge-phoenix-mbp`, both live; on a
-  host subscribed to neither the matcher never engages at all. Where it does, a **single-publisher row is the
-  degenerate case and the matcher's two series diverge on it**: a pair needs two paths, so `dz_path_lead_ns`
-  populates only for Kalshi's mirrored pair and never for Phoenix, while every Phoenix print still *enters* the
-  matcher (the authority tracks its one path, so `race_eligible` holds) and expires unpaired onto
-  `dz_path_unmatched_trades_total{venue="PHOENIX"}` — permanently, at the venue's whole trade rate. That series'
-  alarm reading, "the paths are barely pairing," cannot apply to a row that has one path; docs/metrics.md carries
-  the same caveat, since a dashboard alerting on the ratio would otherwise show a standing false positive.
+  host subscribed to neither the matcher never engages at all. Where it does, **pairing is two-way while
+  Phoenix carries three paths**: a print pairs its first two copies and the third expires unpaired onto
+  `dz_path_unmatched_trades_total{venue="PHOENIX"}` — permanently, at the venue's whole trade rate — and a
+  lead reaches the election only when the leader is one of the pair, so a print the leader delivered last is
+  no evidence either way. That series' alarm reading, "the paths are barely pairing," applies only to a
+  two-path row (Kalshi's); docs/metrics.md carries the same caveat, since a dashboard alerting on the ratio
+  would otherwise show a standing false positive.
 - **`ingest/public_input.rs`** — venue-generic **public WS input** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
@@ -799,7 +833,9 @@ Modules are grouped by role under `src/`:
   computed (#163): an `InstrumentReset` purges `revealed` in the same message that reports unhealth,
   so the install that readmits the instrument has no venue to file under, and marking that report
   done would leave the path unhealthy at the gate with a `Ready` book — the market then sits on a
-  stale peer while a live path is on the wire. `send_book`'s own `Ready` gate is unchanged, so a path mid-rotation keeps the market
+  stale peer while a live path is on the wire. The memo also stores the Source ID it filed under: a
+  report under a different one after a filed `false` first withdraws that unhealth, since an
+  `InstrumentReset` purges `revealed` and nothing would ever report on the old market again. `send_book`'s own `Ready` gate is unchanged, so a path mid-rotation keeps the market
   and publishes nothing until the install's re-baseline. ⚠️ **At every event close it asks the arbiter
   whether the replay entry is owed a republish** (`Arbiter::book_rebaselines_owed`: the entry is not
   `baselined()` and this path is `last_admitted`) and, if so, closes with `emit_rebaseline` instead of
@@ -815,7 +851,11 @@ Modules are grouped by role under `src/`:
   healthy peer or re-installs at its next rotation. Asked **only at a close**, never at a mid-event
   datagram end, or the republish would go out `last: true` holding an intermediate book. It also runs
   the shared `SeqTracker` per
-  publisher on the **market-data role only** and drops a `SeqCheck::Stale` datagram whole, as
+  publisher — **bounded** here alone (`SeqTracker::bounded`: an advance past `MAX_SEQ_ADVANCE`, 1,024,
+  is processed without moving the anchor, and `SEQ_RESEAT_NS`, 5 s, of such advances, each within the bound of the one before and none in
+  bound of the anchor, re-seats to the latest, so an outlier restarts the run rather than becoming the anchor), so one far-ahead sequence cannot make every real boundary read
+  stale (⚠️ a channel quiet for 5 s is not covered: two consistent far-ahead datagrams that far apart re-seat it); top-of-book stays unbounded because its channel-0 sequence is global across groups and jumps
+  routinely — on the **market-data role only** and drops a `SeqCheck::Stale` datagram whole, as
   `TobProcessor` does: a stale datagram's deltas are refused as duplicates anyway, but a
   `BatchBoundary` carries no sequence of its own, so an old one moves `last_batch` backwards and
   closes every open event at a slot the venue has left — committing each consumer's buffer mid-event.

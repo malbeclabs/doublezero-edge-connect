@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old way. PROTOCOL.md records the same note beside the deprecation.
 
 ### Security
+- **Seven RustSec advisories against the lockfile cleared, each at its minimum patched version.**
+  `rustls 0.23.45 -> 0.23.46` (RUSTSEC-2026-0346/0347/0348/0349), `rustls-webpki 0.103.15 ->
+  0.103.16` (0382), `webpki-roots 1.0.8 -> 1.0.10` (0381, distrusted emSign roots) and `tokio
+  1.53.1 -> 1.53.3` (0386, `AsyncFd::new` unsound). The tokio fix deprecates `AsyncFd::new`, so
+  the receiver socket is now registered with `unsafe AsyncFd::register`; the socket owns its
+  descriptor, so the behaviour is unchanged. `cargo-deny` is a required check, and it would
+  otherwise be red on the first CI run after Actions is re-enabled.
 - **`rustls` pinned forward past RUSTSEC-2026-0285, where TLS 1.3 handshake messages were accepted
   at the wrong encryption level.** `0.23.40` accepted a handshake message that followed a
   key-changing message inside the same record — a plaintext `EncryptedExtensions` packed in behind
@@ -41,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- **The crate did not build on macOS.** `src/ingest/receiver.rs` used `SO_TIMESTAMPNS`, which exists only on Linux and Android, unconditionally; it is now requested only there, and elsewhere `kernel_rx_ts_ns` is `0`, its documented "unavailable". Linux behavior is unchanged. Only the build works on macOS, not multicast ingest: the default `--recv-buf` exceeds the stock macOS socket-buffer ceiling, so every receiver fails to bind, and `--iface` is resolved with `ip(8)`, which macOS does not ship. A `macos-latest` CI job now checks that the workspace compiles.
+- A market whose elected book path gapped no longer ping-pongs between the other paths. The health override now holds the market on the first healthy alternate and returns it to the leader only after 15 s of continuous leader health and the leader's own re-baseline of that market, or after 60 s of that health alone. One lost leader datagram on a three-path venue cost a consumer up to 15 re-baselines in 6 s; it now costs one each way. New counter `dz_book_revert_holds_total{venue,release}`.
+- A market-by-price channel whose publisher goes silent mid-event now closes the open event after the boundary timeout. The close used to run only when another datagram arrived, so a dead single-publisher channel left every consumer buffering. The receive loop now ticks its processor when the whole port block is silent.
+- One market-by-price datagram with a sequence far ahead of its channel's no longer makes the channel's real datagrams read as stale: an advance past 1,024 no longer moves the anchor. After a real outage the anchor re-seats once such advances have run for 5 s, each within 1,024 of the one before, so an outlier inside that run restarts it rather than becoming the anchor (`dz_seq_events_total{kind="bounded"|"reseat"}`).
+- A market-by-price instrument readmitted under a new Source ID withdraws the unhealth its path filed under the old one.
 - **`:latest` was months older than `:mainnet-beta`, though documented as the same image.** The
   mainnet-beta build added `:latest` only on a `vX.Y.Z` tag, and none had been cut since June, so a
   container pinned to `:latest` predated #169 and rejected the hosted feed registry (which repeats a
@@ -349,6 +361,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A market-by-price `InstrumentReset` discarded its own recovery snapshot group.** A publisher withholding and then re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin` follows its own reset by ~0.1 ms on a different port — resets ride mktdata, snapshot groups the snapshot port, on independent sequence series — so which is processed first is a coin flip. When the begin won, both the book's assembly and the processor's level route were torn out, the market waited a full snapshot rotation to heal, and the group's levels were counted on `dz_mbp_snapshot_levels_dropped_total{reason="reset"}`. A group anchored at or after the reset's `New Anchor Seq` is now kept — the same test a `SnapshotBegin` is already judged by — and only one that predates the reset is dropped and tombstoned. Observed on a live Phoenix feed at roughly two flaps per hour per market; expect that `reason="reset"` series to fall substantially.
 
 ### Changed
+- **`--arb-quote-id-max-jump` defaults to 65,536, down from 1,000,000** in the `:mainnet-beta` image
+  of 2026-10-22 (`8c8c973`). Measured over nine hours of one public feed from two paths, 222 M
+  quotes: the largest advance of a key's `Venue Update ID` within the 5 s regime timeout was 2,335,
+  and a replay through the arbiter dropped no quote as `jump` at any cap down to 16,384. A tighter
+  cap narrows the advance one bad datagram can make without corroboration. A feed with a faster
+  counter sets the flag.
+- **CI uses only org-allowlisted actions, so it can run once GitHub Actions is re-enabled for this
+  repo.** `cargo-deny`, GoReleaser and yq are installed as pinned release binaries checked against
+  their SHA-256; `cargo-deny` runs the same checks as before. `actionlint.yml` is replaced by
+  `actions-lint.yml` (actionlint plus zizmor), every kept checkout drops its token, and
+  `.github/CODEOWNERS` now owns the CI configuration and `deny.toml` (malbeclabs/infra#3339).
 - **The Binance rows are confirmed from a subscriber.** A capture on 2026-10-02 at a Chicago
   DoubleZero site matched both rows' group, ports, Source ID (6, 8) and channel (0, 1), and the bridge
   served 566 and 1,372 products with live quotes on both engines; the rows' `notes` drop "not yet
@@ -507,6 +530,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- **Kalshi's crypto up/down pair in the compiled-in registry.** `edge-kalshi-updown-tob` (group
+  `233.84.178.26`, Top-of-Book, `37000`/`47000`) and `edge-kalshi-updown-mbp` (`233.84.178.34`,
+  Market-by-Price, `38000`/`48000`/`58000`), category `updown`, each one explicit block shared by two
+  publishers with the second's channel ids raised by `100`, `Sticky` and claiming the tape. Copied
+  verbatim from the publisher's fragment, as the other Kalshi rows are, so the built-in copy matches
+  the hosted aggregate once it is republished with them. The published set rolls every 15 minutes.
+  A contract's strike is a `StrikeInterval`, which the datagram walk does not decode yet and skips
+  as an unknown message, so these instruments arrive without a strike.
+- **Quotes dedupe on the `Venue Update ID`** (edge-feed-spec top-of-book `3.2.0`, `Quote` offset 56:
+  the low 32 bits of a venue-assigned per-instrument book update counter, `0` = unavailable). A feed
+  whose quotes carry no `source_ts` used to bypass the quote floor, so two hot publishers of it
+  delivered every quote twice. A key that sees a nonzero ID now admits each ID once, in serial order,
+  from whichever path delivers it first, and drops ID-less copies until it has admitted no ID for 5 s.
+  A forward jump past `--arb-quote-id-max-jump` (default 65,536) waits for a second path to
+  corroborate it. The key includes the canonical channel, and copies of one ID are
+  compared on their raw wire integers: under other exponents they are definition skew (`skew`), and
+  under one scale with other content a `conflict`, which stops that source using the field for 60 s.
+  New metrics: `dz_quotes_update_id_admitted_total`, `dz_quotes_update_id_dropped_total{reason}`,
+  `dz_quotes_update_id_disabled_total` and `dz_quote_floor_resets_total{reason}`. Every
+  publisher whose encoder zero-fills those bytes decodes to ID `0` and dedupes exactly as before, and
+  so does every Schema Version `1` publisher, where the bytes are padding whatever they hold. The
+  field is not on the WebSocket JSON. Design: `docs/design/quote-update-id-dedupe.md`.
+- Registry rows may declare `shared_batch_id` (default false, one value per venue and category, refused on a row with no book), set on `edge-phoenix-mbp` in the built-in document only: the hosted document does not declare it yet, so a host loading that one still re-baselines every handover. In a declared scope, a book failover between paths at the same committed slot holding identical levels goes out as an ordinary delta rather than a re-baseline; a mismatch counts `dz_book_path_divergence_total{venue}` and re-baselines as before.
 - **Binance feeds: USD-margined perpetuals and spot, Top-of-Book.** Two rows in the compiled-in
   feed registry, `edge-binance-usdsm-tob` (group `233.84.178.23`, Source ID 6) and
   `edge-binance-spot-tob` (`233.84.178.31`, Source ID 8), both `BINANCE`, both on ports
