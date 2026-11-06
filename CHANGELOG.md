@@ -372,6 +372,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their SHA-256; `cargo-deny` runs the same checks as before. `actionlint.yml` is replaced by
   `actions-lint.yml` (actionlint plus zizmor), every kept checkout drops its token, and
   `.github/CODEOWNERS` now owns the CI configuration and `deny.toml` (malbeclabs/infra#3339).
+- **The Binance rows are confirmed from a subscriber.** A capture on 2026-10-02 at a Chicago
+  DoubleZero site matched both rows' group, ports, Source ID (6, 8) and channel (0, 1), and the bridge
+  served 566 and 1,372 products with live quotes on both engines; the rows' `notes` drop "not yet
+  confirmed". It also found the publishers' multicast TTL of 8 dying inside the fabric before
+  Chicago — fixed at the publisher (malbeclabs/binance#123) — so the notes now name a short TTL as a
+  cause of a row that binds and stays silent at one site.
 - **A feed-registry row that shares its venue name with other Source IDs but declares no `source_id`
   is reported at load** (`info`, once per `(venue, category)`): its engines' health and status are
   reported together under the name. The hosted Hyperliquid rows are such rows today. Refusing them is
