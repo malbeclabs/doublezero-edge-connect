@@ -45,8 +45,8 @@
 #                            to nothing.
 #   DZ_ADMIN_BIND=<host:port> the bridge binds GET/POST /admin/channels -- the one runtime-MUTATION
 #                            path in the bridge (lets DZ_CHANNELS be replaced without a restart) --
-#                            at 127.0.0.1:9098 by default; set this only to override that address or
-#                            to disable it (empty). It has NO authentication, and under this
+#                            at 127.0.0.1:9098 by default; set this only to override that address.
+#                            It has NO authentication, and under this
 #                            container's --network host a wildcard bind is genuinely reachable from
 #                            the network, so if you override the default, stay on loopback, e.g.
 #                            DZ_ADMIN_BIND=127.0.0.1:9099; a non-loopback value is only warned about,
