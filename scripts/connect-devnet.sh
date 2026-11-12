@@ -853,17 +853,18 @@ else
     echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # once >=1 market-data feed is subscribed"
   fi
 fi
-# The Hyperliquid-compatible sink is not subscription-gated: it listens from bridge start unless
-# its bind failed, which the bridge only warns about.
+# The Hyperliquid-compatible sink is not subscription-gated: it binds at bridge start, and a failed
+# bind only warns. Advertise the URL only on the bridge's own "listening" line; a port probe can't
+# confirm it, since the likeliest failure is another process holding that port.
 if [ "$CONNECT_STATE" = connected ] && [ -n "${HL_WS_BIND:-}" ]; then
-  hl_err="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep "Hyperliquid-compatible sink disabled" | tail -1 | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' || true)"
-  if [ -n "$hl_err" ]; then
-    warn "The Hyperliquid-compatible sink is NOT serving (HL_WS_BIND=$HL_WS_BIND): ${hl_err#*sink disabled: }"
-  else
-    hl_host="${HL_WS_BIND%:*}"
-    case "$hl_host" in ''|0.0.0.0|'[::]') hl_host="$HOST_IP" ;; esac
-    echo "  Hyperliquid : ws://${hl_host}:${HL_WS_BIND##*:}            # Hyperliquid's own schema (docs/output-sinks.md)"
-  fi
+  hl_log="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep -E "Hyperliquid-compatible (WebSocket sink listening|sink disabled)" | tail -1 | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' || true)"
+  hl_host="${HL_WS_BIND%:*}"
+  case "$hl_host" in ''|0.0.0.0|'[::]') hl_host="$HOST_IP" ;; esac
+  case "$hl_log" in
+    *"sink listening"*) echo "  Hyperliquid : ws://${hl_host}:${HL_WS_BIND##*:}            # Hyperliquid's own schema (docs/output-sinks.md)" ;;
+    *"sink disabled"*) warn "The Hyperliquid-compatible sink is NOT serving (HL_WS_BIND=$HL_WS_BIND): ${hl_log#*sink disabled: }" ;;
+    *) warn "Could not confirm the Hyperliquid-compatible sink on $HL_WS_BIND: neither its bind nor a bind failure is in the bridge log (RUST_LOG may hide them). Check: sudo docker logs $DZ_NAME | grep Hyperliquid" ;;
+  esac
 fi
 echo
 info "Manage with:"

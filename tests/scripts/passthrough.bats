@@ -52,11 +52,18 @@ value_for() {
   done
 }
 
+# hl_listening <bind>: make the stub bridge log a successful Hyperliquid bind.
+hl_listening() {
+  local extra="$BATS_TEST_TMPDIR/hl-listening.log"
+  printf 'INFO doublezero_edge_connect::sinks::hyperliquid: Hyperliquid-compatible WebSocket sink listening bind=%s\n' "$1" >"$extra"
+  export DZ_TEST_DOCKER_LOG_EXTRA="$extra"
+}
+
 @test "HL_WS_BIND set: the Done output prints the Hyperliquid sink URL (all scripts)" {
   for s in "${SCRIPTS[@]}"; do
     local out="$BATS_TEST_TMPDIR/$s.out"
     ( common_env; export DZ_INSTALL_CLI=0 HL_WS_BIND=127.0.0.1:8082 DZ_SUBSCRIPTION_REFRESH_SECS=0
-      bash "$SCRIPTS_DIR/$s.sh" ) >"$out" 2>&1 || { echo "# $s exited $?"; sed 's/^/#   /' "$out"; false; }
+      hl_listening 127.0.0.1:8082; bash "$SCRIPTS_DIR/$s.sh" ) >"$out" 2>&1 || { echo "# $s exited $?"; sed 's/^/#   /' "$out"; false; }
     grep -q 'Hyperliquid *: ws://127.0.0.1:8082' "$out" \
       || { echo "# $s never printed the Hyperliquid sink URL:"; sed 's/^/#   /' "$out"; false; }
   done
@@ -65,7 +72,7 @@ value_for() {
 @test "HL_WS_BIND on a wildcard: the URL names this host, not 0.0.0.0" {
   local out="$BATS_TEST_TMPDIR/out"
   ( common_env; export DZ_INSTALL_CLI=0 HL_WS_BIND=0.0.0.0:8082 DZ_SUBSCRIPTION_REFRESH_SECS=0
-    bash "$SCRIPTS_DIR/connect.sh" ) >"$out" 2>&1 || { echo "# exited $?"; sed 's/^/#   /' "$out"; false; }
+    hl_listening 0.0.0.0:8082; bash "$SCRIPTS_DIR/connect.sh" ) >"$out" 2>&1 || { echo "# exited $?"; sed 's/^/#   /' "$out"; false; }
   grep -q 'Hyperliquid *: ws://.*:8082' "$out" || { sed 's/^/#   /' "$out"; false; }
   ! grep -q 'ws://0.0.0.0:8082' "$out"
 }
@@ -76,6 +83,14 @@ value_for() {
   ( common_env; export DZ_INSTALL_CLI=0 HL_WS_BIND=127.0.0.1:8082 DZ_SUBSCRIPTION_REFRESH_SECS=0 DZ_TEST_DOCKER_LOG_EXTRA="$extra"
     bash "$SCRIPTS_DIR/connect.sh" ) >"$out" 2>&1 || { echo "# exited $?"; sed 's/^/#   /' "$out"; false; }
   grep -q 'Address already in use' "$out" || { sed 's/^/#   /' "$out"; false; }
+  ! grep -q 'Hyperliquid *: ws://' "$out"
+}
+
+@test "HL bind outcome not in the log (e.g. RUST_LOG=error): warns unconfirmed instead of printing a URL" {
+  local out="$BATS_TEST_TMPDIR/out"
+  ( common_env; export DZ_INSTALL_CLI=0 HL_WS_BIND=127.0.0.1:8082 DZ_SUBSCRIPTION_REFRESH_SECS=0
+    bash "$SCRIPTS_DIR/connect.sh" ) >"$out" 2>&1 || { echo "# exited $?"; sed 's/^/#   /' "$out"; false; }
+  grep -q 'Could not confirm the Hyperliquid-compatible sink' "$out" || { sed 's/^/#   /' "$out"; false; }
   ! grep -q 'Hyperliquid *: ws://' "$out"
 }
 
