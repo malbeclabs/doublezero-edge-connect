@@ -64,19 +64,19 @@ DZ_SECRET=DZ_… DZ_FEEDS=Hyperliquid curl -fsSL https://get.doublezero.xyz/conn
 
 ### Bridge variables (relayed to the container)
 
-The installer relays **any** of the bridge's own env vars that are set straight through to
+The installer relays every one of the bridge's own env vars that is set straight through to
 `docker run`, so this is all the wiring needed to tune the bridge from the one-liner — no
-per-feature flags in the script.
+per-feature flags in the script. `tests/scripts/passthrough.bats` fails when a new bridge env var is
+missing from the scripts' `PASSTHROUGH` allowlist.
 
-Common ones: `DZ_IFACE`, `DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `RUST_LOG`, and the shred
+Common ones: `DZ_IFACE`, `DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `HL_WS_BIND` (the
+Hyperliquid-compatible sink, whose URL the installer prints when set), `RUST_LOG`, and the shred
 forwarder's `DZ_SHRED_*` (notably `DZ_SHRED_DEDUP_MODE` — `dedup` by default, `sigverify` / `none`
 to change — and `DZ_SHRED_RPC_URL` for sigverify mode). See the bridge's `Args` in
 [`../src/main.rs`](../src/main.rs) and the sink/shred/input tables in the
 [`docs/`](../docs/) reference for the full list and defaults.
 
-> **Limitation:** only **non-empty** values are forwarded, so you can't pass an *empty* override
-> (e.g. `WS_BIND=""` to disable the WebSocket sink) through the installer. For that edge case, run
-> a hand-written `docker run` instead.
+Only **non-empty** values are forwarded, except `WS_BIND`: `WS_BIND=""` disables the WebSocket sink.
 
 ## Examples
 

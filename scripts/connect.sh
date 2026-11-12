@@ -35,7 +35,7 @@
 #   DZ_LEDGER_RPC_URL=<url>              override the DoubleZero ledger RPC used by the pre-check
 #
 # Any other bridge env var set in the environment is relayed straight to the container
-# (WS_*, DZ_IFACE, DZ_SHRED_*, METRICS_BIND, DZ_CHANNELS, DZ_ADMIN_BIND, DZ_FEED_REGISTRY[_URL],
+# (WS_*, HL_WS_BIND, DZ_IFACE, DZ_SHRED_*, METRICS_BIND, DZ_CHANNELS, DZ_ADMIN_BIND, DZ_FEED_REGISTRY[_URL],
 # RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
 #   WS_BIND=0.0.0.0:9000 curl -fsSL https://get.doublezero.xyz/connect | bash
 #
@@ -715,12 +715,18 @@ mount_args+=("${REGISTRY_MOUNT[@]}")
 # This is an allowlist, not a wildcard: a bridge env var absent from it is silently NOT relayed,
 # and the bridge falls back to its compiled default. Add new ones here.
 PASSTHROUGH=(
-  DZ_FEEDS DZ_IFACE DZ_RECV_BUF
+  DZ_FEEDS DZ_PUBLISHER_PORTS DZ_IFACE DZ_RECV_BUF
+  DZ_SUBSCRIPTION_REFRESH_SECS DZ_SUBSCRIPTION_GATING_DISABLE
   WS_HEARTBEAT_SECS WS_IDLE_TIMEOUT_SECS WS_MAX_CLIENTS
   WS_MAX_SUBS WS_MAX_INBOUND_PER_MIN WS_BROADCAST_CAPACITY
-  DZ_API_BIND METRICS_BIND
+  HL_WS_BIND DZ_API_BIND METRICS_BIND
   DZ_CHANNELS DZ_ADMIN_BIND DZ_FEED_REGISTRY DZ_FEED_REGISTRY_URL
-  DZ_SHRED_DEDUP_MODE DZ_SHRED_RPC_URL DZ_SHRED_FORWARD DZ_SHRED_SOURCES
+  WS_INPUT_URL WS_INPUT_COINS PHOENIX_WS_INPUT_URL PHOENIX_WS_INPUT_MARKETS
+  DZ_ARB_LEADER_TIMEOUT_SECS DZ_ARB_TRANSFER_MARGIN_US DZ_ARB_TRANSFER_WIN_RATE
+  DZ_ARB_MATCH_WINDOW_SECS DZ_ARB_SAMPLE_INTERVAL_SECS DZ_ARB_MIN_WINDOW_SAMPLES
+  DZ_ARB_BOOK_DEDUP_WINDOW_MS DZ_ARB_BOOK_RETENTION_SECS DZ_ARB_BOOK_TS_JUMP_SECS
+  DZ_ARB_BOOK_RESEAT_SECS DZ_ARB_QUOTE_ID_MAX_JUMP
+  DZ_SHRED_DISABLE DZ_SHRED_DEDUP_MODE DZ_SHRED_RPC_URL DZ_SHRED_FORWARD DZ_SHRED_SOURCES
   DZ_SHRED_CODE_PREFIX DZ_SHRED_PORT DZ_SHRED_DEDUP_WINDOW_SLOTS
   RUST_LOG
 )
@@ -954,6 +960,18 @@ else
     echo
     echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # once >=1 market-data feed is subscribed"
     echo "  Logs      : sudo docker logs $DZ_NAME"
+  fi
+fi
+# The Hyperliquid-compatible sink is not subscription-gated: it listens from bridge start unless
+# its bind failed, which the bridge only warns about.
+if [ "$CONNECT_STATE" = connected ] && [ -n "${HL_WS_BIND:-}" ]; then
+  hl_err="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep "Hyperliquid-compatible sink disabled" | tail -1 | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' || true)"
+  if [ -n "$hl_err" ]; then
+    warn "The Hyperliquid-compatible sink is NOT serving (HL_WS_BIND=$HL_WS_BIND): ${hl_err#*sink disabled: }"
+  else
+    hl_host="${HL_WS_BIND%:*}"
+    case "$hl_host" in ''|0.0.0.0|'[::]') hl_host="$HOST_IP" ;; esac
+    echo "  Hyperliquid : ws://${hl_host}:${HL_WS_BIND##*:}            # Hyperliquid's own schema (docs/output-sinks.md)"
   fi
 fi
 echo

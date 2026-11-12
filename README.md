@@ -110,9 +110,10 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 | `DZ_GHCR_TOKEN` | — | **devnet only**, required: a GHCR token with `read:packages` (the devnet image is private). |
 | `DZ_GHCR_USER` | `malbeclabs` | **devnet only**, optional: the GHCR username for the login. |
 
-**Bridge variables.** The installer relays **any** non-empty bridge env var straight through to
+**Bridge variables.** The installer relays every non-empty bridge env var straight through to
 the container, so the bridge is tuned entirely from the one-liner. Common ones: `DZ_IFACE`,
-`DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `METRICS_BIND` (turn on the Prometheus `/metrics`
+`DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `HL_WS_BIND` (the Hyperliquid-compatible sink — see
+below), `METRICS_BIND` (turn on the Prometheus `/metrics`
 endpoint — off by default), `DZ_API_BIND` (the read-only `/v1` query API), `DZ_ADMIN_BIND` and
 `DZ_CHANNELS` (the runtime-mutable channel filter — see [Admin
 surface](#admin-surface)), `DZ_FEED_REGISTRY`/`DZ_FEED_REGISTRY_URL` (the
