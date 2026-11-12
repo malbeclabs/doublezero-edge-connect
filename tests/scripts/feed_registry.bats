@@ -14,8 +14,7 @@
 #      silently shadowed by the image's default -- so the installer clears the URL on the
 #      container in that case, and leaves it alone whenever the operator set it explicitly.
 #
-# Only connect.sh is driven here (as install_cli.bats does for Task 5): connect-testnet.sh /
-# connect-devnet.sh are untouched by either change.
+# The log-line surfacing is connect.sh-only; the bind-mount and URL clear run in all three scripts.
 
 load _helpers
 
@@ -54,16 +53,19 @@ run_args() {
   grep -qi "feed registry" "$out" || { echo "# never mentioned the feed registry at all:"; sed 's/^/#   /' "$out"; false; }
 }
 
-@test "DZ_FEED_REGISTRY set, no explicit URL: the image's default URL is cleared" {
-  local out="$BATS_TEST_TMPDIR/out"
-  ( common_env; export DZ_FEED_REGISTRY="$REGISTRY_FILE" DZ_INSTALL_CLI=0
-    bash "$SCRIPTS_DIR/connect.sh" ) >"$out" 2>&1
-  status=$?
-  [ "$status" -eq 0 ] || { echo "# exited $status"; sed 's/^/#   /' "$out"; false; }
-  run_args | grep -q -- "-e DZ_FEED_REGISTRY_URL=" \
-    || { echo "# never cleared DZ_FEED_REGISTRY_URL on the container:"; sed 's/^/#   /' "$DOCKER_LOG"; false; }
-  run_args | grep -q -- "-e DZ_FEED_REGISTRY=$REGISTRY_FILE" \
-    || { echo "# never forwarded DZ_FEED_REGISTRY:"; sed 's/^/#   /' "$DOCKER_LOG"; false; }
+@test "DZ_FEED_REGISTRY set, no explicit URL: mounted read-only and the image's default URL is cleared (all scripts)" {
+  for s in "${SCRIPTS[@]}"; do
+    : >"$DOCKER_LOG"
+    local out="$BATS_TEST_TMPDIR/$s.out"
+    ( common_env; export DZ_FEED_REGISTRY="$REGISTRY_FILE" DZ_INSTALL_CLI=0
+      bash "$SCRIPTS_DIR/$s.sh" ) >"$out" 2>&1 || { echo "# $s exited $?"; sed 's/^/#   /' "$out"; false; }
+    run_args | grep -q -- "-e DZ_FEED_REGISTRY_URL=" \
+      || { echo "# $s never cleared DZ_FEED_REGISTRY_URL on the container:"; sed 's/^/#   /' "$DOCKER_LOG"; false; }
+    run_args | grep -q -- "-e DZ_FEED_REGISTRY=$REGISTRY_FILE" \
+      || { echo "# $s never forwarded DZ_FEED_REGISTRY:"; sed 's/^/#   /' "$DOCKER_LOG"; false; }
+    run_args | grep -q -- "-v $REGISTRY_FILE:$REGISTRY_FILE:ro" \
+      || { echo "# $s never bind-mounted the registry file:"; sed 's/^/#   /' "$DOCKER_LOG"; false; }
+  done
 }
 
 @test "DZ_FEED_REGISTRY and an explicit DZ_FEED_REGISTRY_URL both set: the explicit URL is left alone" {
