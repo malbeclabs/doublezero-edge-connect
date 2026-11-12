@@ -30,8 +30,24 @@
 #   DZ_LEDGER_RPC_URL=<url>              override the DoubleZero ledger RPC used by the pre-check
 #
 # Any other bridge env var set in the environment is relayed straight to the container
-# (WS_*, DZ_IFACE, DZ_SHRED_*, RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
+# (WS_*, HL_WS_BIND, DZ_IFACE, DZ_SHRED_*, METRICS_BIND, DZ_CHANNELS, DZ_ADMIN_BIND, DZ_FEED_REGISTRY[_URL],
+# RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
 #   WS_BIND=0.0.0.0:9000 curl -fsSL https://get.doublezero.xyz/connect-testnet | bash
+#
+# Two of those need a second look before you set them:
+#   DZ_FEED_REGISTRY=<path>  is read INSIDE the container. This script requires an absolute path
+#                            that also exists on THIS host, and bind-mounts it read-only at that
+#                            identical container-side path -- an unreadable path aborts before any
+#                            container starts, rather than being passed through to silently resolve
+#                            to nothing.
+#   DZ_ADMIN_BIND=<host:port> the bridge binds GET/POST /admin/channels -- the one runtime-MUTATION
+#                            path in the bridge (lets DZ_CHANNELS be replaced without a restart) --
+#                            at 127.0.0.1:9098 by default; set this only to override that address.
+#                            It has NO authentication, and under this
+#                            container's --network host a wildcard bind is genuinely reachable from
+#                            the network, so if you override the default, stay on loopback, e.g.
+#                            DZ_ADMIN_BIND=127.0.0.1:9099; a non-loopback value is only warned about,
+#                            never blocked.
 #
 # A DZ_-token-derived keypair is injected straight into the container and is never
 # written to the host disk; a keypair supplied as a file path is bind-mounted
@@ -518,6 +534,55 @@ preflight_ws_port() {
 preflight_ws_port
 
 # ----------------------------------------------------------------------------
+# 4c. feed registry bind-mount (host-side)
+# ----------------------------------------------------------------------------
+# DZ_FEED_REGISTRY names a path the BRIDGE reads *inside the container* (--feed-registry). Passing
+# the env var through with no matching mount would have the bridge look for a file that was never
+# copied in -- it resolves to nothing, and the bridge treats a missing/unreadable File origin as
+# FATAL (an operator's explicit instruction about this one container), so the container would just
+# crash-loop. Wire the mount here instead: require an absolute path (the only kind `docker -v` can
+# bind at an identical container-side path) and bind-mount it read-only at that exact path, so the
+# value the bridge sees is always backed by a real file. Fail fast, before any Docker pull.
+REGISTRY_MOUNT=()
+if [ -n "${DZ_FEED_REGISTRY:-}" ]; then
+  case "$DZ_FEED_REGISTRY" in
+    /*) : ;;
+    *) die "DZ_FEED_REGISTRY must be an absolute path (it is read INSIDE the container at this exact path, bind-mounted from the same path on this host). Got: $DZ_FEED_REGISTRY" ;;
+  esac
+  [ -f "$DZ_FEED_REGISTRY" ] || die "DZ_FEED_REGISTRY=$DZ_FEED_REGISTRY does not exist on this host. It names a path read *inside* the container; without a matching file here to bind-mount, the bridge would start looking for a file that was never copied in and refuse to start (a File registry origin is fatal on failure). Fix the path, or unset DZ_FEED_REGISTRY to use the built-in registry."
+  REGISTRY_MOUNT=(-v "$DZ_FEED_REGISTRY":"$DZ_FEED_REGISTRY":"$MNT_OPT")
+  info "Bind-mounting feed registry: $DZ_FEED_REGISTRY (read-only)"
+fi
+
+# The image bakes in a default DZ_FEED_REGISTRY_URL (the hosted document — see the Dockerfile),
+# and the bridge tries that URL before ever looking at DZ_FEED_REGISTRY (ingest/registry.rs:
+# Origin::from_flags takes the URL whenever it is non-empty). An operator who set DZ_FEED_REGISTRY
+# almost certainly wants the file to win — that's the whole point of the air-gapped/locked-down
+# path — so if they didn't also set DZ_FEED_REGISTRY_URL themselves, clear it explicitly on the
+# container; otherwise the bind-mounted file would be silently ignored in favor of the image's
+# baked-in URL.
+CLEAR_REGISTRY_URL=0
+if [ -n "${DZ_FEED_REGISTRY:-}" ] && [ -z "${DZ_FEED_REGISTRY_URL:-}" ]; then
+  CLEAR_REGISTRY_URL=1
+  info "DZ_FEED_REGISTRY is set; clearing the image's default DZ_FEED_REGISTRY_URL so the bind-mounted file is what actually loads."
+fi
+
+# ----------------------------------------------------------------------------
+# 4d. admin surface warning (host-side)
+# ----------------------------------------------------------------------------
+# GET/POST /admin/channels (DZ_ADMIN_BIND) is the one runtime-MUTATION path in the bridge, and it
+# carries NO authentication. The bridge itself defaults this to 127.0.0.1:9098 (loopback), so this
+# check only fires when DZ_ADMIN_BIND is explicitly overridden on the host -- under this container's
+# --network host, a wildcard bind is genuinely reachable from the network -- warn loudly (the script
+# can't enforce a bind choice, only flag one).
+if [ -n "${DZ_ADMIN_BIND:-}" ]; then
+  case "$DZ_ADMIN_BIND" in
+    127.*|localhost:*) : ;;
+    *) warn "DZ_ADMIN_BIND=$DZ_ADMIN_BIND is not a loopback address. The admin surface has NO authentication -- under --network host this bind is reachable from the network. POST /admin/channels can change what this process ingests, and GET /admin/diagnostics reports this host's device/metro, subscribed group codes and their multicast IPs, every configured bind and the feed-registry URL. Recommended: DZ_ADMIN_BIND=127.0.0.1:9098 (or another loopback port), unless you have your own network-level access control in front of it." ;;
+  esac
+fi
+
+# ----------------------------------------------------------------------------
 # 5. cloud detection -> warn about provider-level firewall (script can't fix)
 # ----------------------------------------------------------------------------
 detect_cloud() {
@@ -549,14 +614,27 @@ $SUDO docker rm -f "$DZ_NAME" >/dev/null 2>&1 || true
 # injected into the container after it starts (so it never touches the host disk).
 mount_args=()
 [ "$KEY_SRC" = file ] && mount_args=(-v "$KEYFILE":"$KEYPAIR_DEST":"$MNT_OPT")
+# Feed registry, if DZ_FEED_REGISTRY was set (see 4c above): bind-mounted read-only at the
+# identical container-side path the bridge was told to read.
+mount_args+=("${REGISTRY_MOUNT[@]}")
 # Relay bridge env vars to the container. The bridge reads every flag from an env var, so this is
 # the only wiring needed to tune the WS sink, narrow feeds, or raise log level — no per-feature
 # logic here. Only non-empty values are forwarded, with one exception (WS_BIND, below).
+# This is an allowlist, not a wildcard: a bridge env var absent from it is silently NOT relayed,
+# and the bridge falls back to its compiled default. Add new ones here.
 PASSTHROUGH=(
-  DZ_FEEDS DZ_IFACE DZ_RECV_BUF
+  DZ_FEEDS DZ_PUBLISHER_PORTS DZ_IFACE DZ_RECV_BUF
+  DZ_SUBSCRIPTION_REFRESH_SECS DZ_SUBSCRIPTION_GATING_DISABLE
   WS_HEARTBEAT_SECS WS_IDLE_TIMEOUT_SECS WS_MAX_CLIENTS
   WS_MAX_SUBS WS_MAX_INBOUND_PER_MIN WS_BROADCAST_CAPACITY
-  DZ_SHRED_DEDUP_MODE DZ_SHRED_RPC_URL DZ_SHRED_FORWARD DZ_SHRED_SOURCES
+  HL_WS_BIND DZ_API_BIND METRICS_BIND
+  DZ_CHANNELS DZ_ADMIN_BIND DZ_FEED_REGISTRY DZ_FEED_REGISTRY_URL
+  WS_INPUT_URL WS_INPUT_COINS PHOENIX_WS_INPUT_URL PHOENIX_WS_INPUT_MARKETS
+  DZ_ARB_LEADER_TIMEOUT_SECS DZ_ARB_TRANSFER_MARGIN_US DZ_ARB_TRANSFER_WIN_RATE
+  DZ_ARB_MATCH_WINDOW_SECS DZ_ARB_SAMPLE_INTERVAL_SECS DZ_ARB_MIN_WINDOW_SAMPLES
+  DZ_ARB_BOOK_DEDUP_WINDOW_MS DZ_ARB_BOOK_RETENTION_SECS DZ_ARB_BOOK_TS_JUMP_SECS
+  DZ_ARB_BOOK_RESEAT_SECS DZ_ARB_QUOTE_ID_MAX_JUMP
+  DZ_SHRED_DISABLE DZ_SHRED_DEDUP_MODE DZ_SHRED_RPC_URL DZ_SHRED_FORWARD DZ_SHRED_SOURCES
   DZ_SHRED_CODE_PREFIX DZ_SHRED_PORT DZ_SHRED_DEDUP_WINDOW_SLOTS
   RUST_LOG
 )
@@ -564,6 +642,9 @@ env_args=()
 for v in "${PASSTHROUGH[@]}"; do
   [ -n "${!v:-}" ] && env_args+=(-e "$v=${!v}")
 done
+# See 4c above: force DZ_FEED_REGISTRY_URL empty on the container so the bind-mounted file wins
+# over the image's baked-in default, rather than being silently shadowed by it.
+[ "$CLEAR_REGISTRY_URL" = 1 ] && env_args+=(-e "DZ_FEED_REGISTRY_URL=")
 # WS_BIND is the one var forwarded whenever it is *set* — including set-but-empty (WS_BIND="") —
 # so the WS sink can be disabled straight from the one-liner (an empty --ws-bind turns the sink
 # off in the bridge). The preflight above may also have set/cleared it in response to a conflict.
@@ -758,6 +839,19 @@ else
     info "Done. Connected. The WebSocket sink and shred forwarder each activate automatically once this host is subscribed to a group (a market-data feed for WS; an edge-solana-* group for shreds) -- allow up to one refresh interval (DZ_SUBSCRIPTION_REFRESH_SECS, default 30s). Check: sudo docker logs $DZ_NAME"
     echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # once >=1 market-data feed is subscribed"
   fi
+fi
+# The Hyperliquid-compatible sink is not subscription-gated: it binds at bridge start, and a failed
+# bind only warns. Advertise the URL only on the bridge's own "listening" line; a port probe can't
+# confirm it, since the likeliest failure is another process holding that port.
+if [ "$CONNECT_STATE" = connected ] && [ -n "${HL_WS_BIND:-}" ]; then
+  hl_log="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep -E "Hyperliquid-compatible (WebSocket sink listening|sink disabled)" | tail -1 | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' || true)"
+  hl_host="${HL_WS_BIND%:*}"
+  case "$hl_host" in ''|0.0.0.0|'[::]') hl_host="$HOST_IP" ;; esac
+  case "$hl_log" in
+    *"sink listening"*) echo "  Hyperliquid : ws://${hl_host}:${HL_WS_BIND##*:}            # Hyperliquid's own schema (docs/output-sinks.md)" ;;
+    *"sink disabled"*) warn "The Hyperliquid-compatible sink is NOT serving (HL_WS_BIND=$HL_WS_BIND): ${hl_log#*sink disabled: }" ;;
+    *) warn "Could not confirm the Hyperliquid-compatible sink on $HL_WS_BIND: neither its bind nor a bind failure is in the bridge log (RUST_LOG may hide them). Check: sudo docker logs $DZ_NAME | grep Hyperliquid" ;;
+  esac
 fi
 echo
 info "Manage with:"
