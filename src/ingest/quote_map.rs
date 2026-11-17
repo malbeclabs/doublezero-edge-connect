@@ -119,7 +119,7 @@ pub fn trade_key(t: &NormalizedTrade) -> Option<BookKey> {
 // ---------------------------------------------------------------------------------------------
 // Candidates: what each source would answer for one instrument, and the order between them.
 //
-// These are for the free-tier snapshot builder only. It reads each store (this map, the book
+// These are for a periodic snapshot builder only. It reads each store (this map, the book
 // replay, the depth replay) in its own pass, taking that store's lock once and never two at a
 // time, and hands each instrument's values here. None of these functions takes a lock except
 // `copy_quote_map`. A request handler must never call them: the stores' locks are the ones the
@@ -146,11 +146,17 @@ pub struct Bbo {
     pub as_of_ns: u64,
 }
 
-/// The top-of-book candidate: the quote half of an entry, if it holds one.
+/// The top-of-book candidate: the quote half of an entry, if it holds one. A side with no size is
+/// no level — the decoder turns a side the publisher left out into zeros — so it answers `None`,
+/// as the book candidates do for an empty side, rather than a `0.0` price that would win over a
+/// whole book. A quote with neither side is no candidate.
 pub fn tob_candidate(v: &LatestValues) -> Option<Bbo> {
-    v.quote.map(|q| Bbo {
-        bid: Some((q.bid, q.bid_size)),
-        ask: Some((q.ask, q.ask_size)),
+    let q = v.quote?;
+    let side = |price: f64, size: f64| (size > 0.0).then_some((price, size));
+    let (bid, ask) = (side(q.bid, q.bid_size), side(q.ask, q.ask_size));
+    (bid.is_some() || ask.is_some()).then_some(Bbo {
+        bid,
+        ask,
         source: QuoteSource::Tob,
         as_of_ns: q.as_of_ns,
     })
@@ -426,6 +432,33 @@ mod tests {
             ..Candidates::default()
         };
         assert_eq!(c.best(true).unwrap().source, QuoteSource::Mbo);
+    }
+
+    /// The top-of-book decoder turns a side the publisher left out into price and size `0`. A side
+    /// with no size is no level: reported as a `0.0` price it would read as a real quote and win
+    /// over a whole book.
+    #[test]
+    fn a_side_with_no_size_is_not_a_level() {
+        let one_sided = LatestValues {
+            quote: Some(QuoteEntry {
+                bid: 0.0,
+                bid_size: 0.0,
+                ..quote_entry(100.0, 101.0)
+            }),
+            trade: None,
+        };
+        let c = tob_candidate(&one_sided).expect("the ask still answers");
+        assert_eq!((c.bid, c.ask), (None, Some((101.0, 2.0))));
+
+        let empty = LatestValues {
+            quote: Some(QuoteEntry {
+                bid_size: 0.0,
+                ask_size: 0.0,
+                ..quote_entry(0.0, 0.0)
+            }),
+            trade: None,
+        };
+        assert!(tob_candidate(&empty).is_none(), "no level on either side");
     }
 
     #[test]

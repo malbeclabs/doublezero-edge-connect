@@ -350,6 +350,8 @@ pub struct TobProcessor {
     /// `Trade` for the key (both carry one). See the module-level deferral note on
     /// [`MboProcessor::revealed`] for the full design; this is TOB's instance of the same pattern.
     revealed: HashMap<(IpAddr, u32), u16>,
+    /// The receiver's category, interned once (see [`Self::category_for`]).
+    category: Option<(&'static str, Arc<str>)>,
     /// The channel `InstrumentDefinition` most recently arrived on for `(publisher, instrument)` —
     /// remembered because the deferred `NormalizedInstrument`, emitted once a price message
     /// reveals the instrument, is built outside that definition's own datagram and so no longer has
@@ -380,6 +382,22 @@ impl TobProcessor {
             seq_events: SeqEvents::default(),
             revealed: HashMap::new(),
             pending_channel: HashMap::new(),
+            category: None,
+        }
+    }
+
+    /// This receiver's category as the interned `Arc` a quote carries, resolved once rather than per
+    /// quote: `category_arc` takes a process-wide read lock and a hash lookup, which every quote
+    /// would otherwise pay whether or not anything files it. Keyed on the string so a context that
+    /// names another category still gets its own.
+    fn category_for(&mut self, category: &'static str) -> Arc<str> {
+        match &self.category {
+            Some((c, arc)) if std::ptr::eq(*c, category) => arc.clone(),
+            _ => {
+                let arc = category_arc(category);
+                self.category = Some((category, arc.clone()));
+                arc
+            }
         }
     }
 
@@ -697,7 +715,7 @@ impl DatagramProcessor for TobProcessor {
                         venue_update_id: q.venue_update_id,
                         channel,
                         instrument_id: q.instrument_id,
-                        category: category_arc(ctx.category),
+                        category: self.category_for(ctx.category),
                         // The update id's comparison scope and exact content: the canonical
                         // channel (a mirror's offset channel keys with its primary) and the raw
                         // integers under the exponents they were scaled with.
