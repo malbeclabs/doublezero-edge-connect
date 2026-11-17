@@ -1700,6 +1700,10 @@ pub struct Arbiter {
     /// (the session-reset escape hatch), so a client connecting across a session boundary is not
     /// replayed the ended session's final book — see those methods' docs.
     depth_replay: Option<DepthSnapshot>,
+    /// The latest admitted quote and trade per instrument (`--quote-map`), written by
+    /// [`Self::send_admitted`] at every point a quote or trade reaches the broadcast, so it holds
+    /// only what went out. `None` (the default) writes nothing and costs nothing.
+    quote_map: Option<crate::model::QuoteMap>,
     /// The shared instrument catalog, so a Source ID purge drops the old ID's definition together
     /// with its depth and book, never before them (see [`Self::release_source_market`]).
     instrument_catalog: Option<InstrumentSnapshot>,
@@ -2108,6 +2112,7 @@ impl Arbiter {
             trades: WindowedDedup::new(trade_window),
             depths: StalenessFloor::new(DEPTH_TICK_CAP),
             depth_replay: None,
+            quote_map: None,
             instrument_catalog: None,
             instrument_defs: HashMap::new(),
             venue_metrics: HashMap::new(),
@@ -2385,6 +2390,37 @@ impl Arbiter {
     /// broadcast but maintains no replay snapshot.
     pub fn set_depth_replay(&mut self, depth: DepthSnapshot) {
         self.depth_replay = Some(depth);
+    }
+
+    /// Wire the latest-values map (`--quote-map`) so every quote and trade the arbiter sends is
+    /// recorded in it. Never called when the flag is off.
+    pub fn set_quote_map(&mut self, map: crate::model::QuoteMap) {
+        self.quote_map = Some(map);
+    }
+
+    /// Broadcast an admitted quote or trade, recording it in the latest-values map first when one
+    /// is wired. The single send path for both, so no send point can skip the map. Takes the map's
+    /// lock while the arbiter's is held (arbiter, then map); nothing takes them the other way.
+    fn send_admitted(&mut self, msg: FeedMessage) {
+        if let Some(map) = &self.quote_map {
+            use crate::ingest::quote_map::{quote_key, trade_key, QuoteEntry, TradeEntry};
+            match &msg {
+                FeedMessage::Quote(q) => {
+                    if let Some(key) = quote_key(q) {
+                        crate::model::lock(map).entry(key).or_default().quote =
+                            Some(QuoteEntry::of(q));
+                    }
+                }
+                FeedMessage::Trade(t) => {
+                    if let Some(key) = trade_key(t) {
+                        crate::model::lock(map).entry(key).or_default().trade =
+                            Some(TradeEntry::of(t));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let _ = self.tx.send(Arc::new(msg));
     }
 
     /// Wire the shared instrument catalog, which a Source ID purge also clears.
@@ -3658,7 +3694,7 @@ impl Arbiter {
                         match self.judge_update_id(q, key, publisher) {
                             IdOutcome::Legacy => {}
                             IdOutcome::Forward => {
-                                let _ = self.tx.send(Arc::new(msg));
+                                self.send_admitted(msg);
                                 return;
                             }
                             IdOutcome::Decided => return,
@@ -3672,7 +3708,7 @@ impl Arbiter {
                     let vm = self.vm(&q.venue);
                     vm.quotes_no_source_ts.inc();
                     vm.emit_for(q.source_id)[EMIT_QUOTE].inc();
-                    let _ = self.tx.send(Arc::new(msg));
+                    self.send_admitted(msg);
                     return;
                 }
                 // Reject an implausibly-far-future `source_ts` before it can advance the floor.
@@ -3712,7 +3748,7 @@ impl Arbiter {
                         if opened_tick {
                             vm.quote_ticks_won[pub_idx(publisher)].inc();
                         }
-                        let _ = self.tx.send(Arc::new(msg));
+                        self.send_admitted(msg);
                     }
                     // A cross-publisher follower lost this tick: record how far the winner led, on top
                     // of the plain drop count. The losing copy is `publisher` (the non-leader at
@@ -3778,7 +3814,7 @@ impl Arbiter {
                              bypass's precondition)"
                         );
                     }
-                    let _ = self.tx.send(Arc::new(msg));
+                    self.send_admitted(msg);
                     return;
                 }
                 let key = (SourceKey::of(t), t.symbol.clone());
@@ -3788,7 +3824,7 @@ impl Arbiter {
                     Admit::Emitted { .. } => {
                         vm.emit_for(t.source_id)[EMIT_TRADE].inc();
                         vm.trades_admitted[pub_idx(publisher)].inc();
-                        let _ = self.tx.send(Arc::new(msg));
+                        self.send_admitted(msg);
                     }
                     Admit::Contest { winner, lead_ns } => {
                         vm.trades_dropped.inc();
@@ -9968,9 +10004,6 @@ mod tests {
         NormalizedQuote {
             venue: venue.into(),
             source_name: venue.into(),
-            channel: 0,
-            instrument_id: 0,
-            category: crate::model::empty_category(),
             venue_update_id: id,
             wire: wire_of(bid, bid + 1.0, 0),
             recv_ts_ns,
@@ -10550,5 +10583,203 @@ mod tests {
         }
         assert_eq!(drain_bids(&mut rx), vec![1.0, 2.0]);
         assert_eq!(id_metric(venue, ID_DROP_JUMP), 1);
+    }
+
+    // ---- the latest-values map (`set_quote_map`) ----
+
+    use crate::ingest::quote_map::{quote_key, trade_key};
+
+    /// `quote` with an instrument identity, so the map files it.
+    fn ident_quote(source_ts_ns: u64, bid: f64, instrument_id: u32) -> NormalizedQuote {
+        NormalizedQuote {
+            channel: 1,
+            instrument_id,
+            category: "perps".into(),
+            recv_ts_ns: source_ts_ns + 5,
+            ..quote(source_ts_ns, bid, bid + 1.0)
+        }
+    }
+
+    /// An arbiter with the map wired, and the map.
+    fn mapped() -> (
+        Arbiter,
+        broadcast::Receiver<std::sync::Arc<FeedMessage>>,
+        crate::model::QuoteMap,
+    ) {
+        let (tx, rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        let map: crate::model::QuoteMap = Arc::new(Mutex::new(HashMap::new()));
+        a.set_quote_map(map.clone());
+        (a, rx, map)
+    }
+
+    fn held_quote(
+        map: &crate::model::QuoteMap,
+        q: &NormalizedQuote,
+    ) -> Option<crate::ingest::quote_map::QuoteEntry> {
+        crate::model::lock(map)
+            .get(&quote_key(q).unwrap())
+            .and_then(|v| v.quote)
+    }
+
+    fn held_trade(
+        map: &crate::model::QuoteMap,
+        t: &NormalizedTrade,
+    ) -> Option<crate::ingest::quote_map::TradeEntry> {
+        crate::model::lock(map)
+            .get(&trade_key(t).unwrap())
+            .and_then(|v| v.trade)
+    }
+
+    #[test]
+    fn quote_map_records_the_emitted_quote() {
+        let (mut a, _rx, map) = mapped();
+        let mut q = ident_quote(1_000, 100.0, 7);
+        q.venue_update_id = 0;
+        a.emit(FeedMessage::Quote(q.clone()), edge(1), TEST_CATEGORY);
+        let e = held_quote(&map, &q).expect("written");
+        assert_eq!((e.bid, e.ask), (100.0, 101.0));
+        assert_eq!((e.bid_size, e.ask_size), (1.0, 2.0));
+        assert_eq!(e.source_ts_ns, 1_000);
+        assert_eq!(e.venue_update_id, 0);
+        assert_eq!(e.as_of_ns, q.recv_ts_ns);
+    }
+
+    /// The map holds what reached the wire: a mirror's copy the floor drops must not overwrite it.
+    #[test]
+    fn quote_map_ignores_a_dropped_mirror_copy() {
+        let (mut a, mut rx, map) = mapped();
+        let first = ident_quote(1_000, 100.0, 7);
+        a.emit(FeedMessage::Quote(first.clone()), edge(1), TEST_CATEGORY);
+        let mut late = ident_quote(1_000, 100.5, 7);
+        late.recv_ts_ns = 9_999;
+        a.emit(FeedMessage::Quote(late), edge(2), TEST_CATEGORY);
+        assert_eq!(drain_quotes(&mut rx), vec![(1_000, 100.0)], "fixture: B dropped");
+        let e = held_quote(&map, &first).unwrap();
+        assert_eq!((e.bid, e.as_of_ns), (100.0, first.recv_ts_ns));
+    }
+
+    #[test]
+    fn quote_map_records_the_update_id_forward() {
+        let (mut a, _rx, map) = mapped();
+        let q = NormalizedQuote {
+            channel: 1,
+            instrument_id: 7,
+            category: "perps".into(),
+            ..id_quote("QMAP_FWD", 5, 1_000, 100.0, 1_005)
+        };
+        a.emit(FeedMessage::Quote(q.clone()), edge(1), TEST_CATEGORY);
+        let e = held_quote(&map, &q).expect("written");
+        assert_eq!((e.venue_update_id, e.bid, e.as_of_ns), (5, 100.0, 1_005));
+    }
+
+    #[test]
+    fn quote_map_ignores_a_decided_update_id_copy() {
+        let (mut a, mut rx, map) = mapped();
+        let q = |recv| NormalizedQuote {
+            channel: 1,
+            instrument_id: 7,
+            category: "perps".into(),
+            ..id_quote("QMAP_DEC", 5, 1_000, 100.0, recv)
+        };
+        a.emit(FeedMessage::Quote(q(1_005)), edge(1), TEST_CATEGORY);
+        a.emit(FeedMessage::Quote(q(2_005)), edge(2), TEST_CATEGORY);
+        assert_eq!(drain_quotes(&mut rx).len(), 1, "fixture: the copy was decided");
+        assert_eq!(held_quote(&map, &q(0)).unwrap().as_of_ns, 1_005);
+    }
+
+    #[test]
+    fn quote_map_records_a_quote_with_no_source_ts() {
+        let (mut a, _rx, map) = mapped();
+        let mut q = ident_quote(0, 100.0, 7);
+        q.recv_ts_ns = 42;
+        a.emit(FeedMessage::Quote(q.clone()), edge(1), TEST_CATEGORY);
+        let e = held_quote(&map, &q).expect("written");
+        assert_eq!((e.source_ts_ns, e.as_of_ns), (0, 42));
+    }
+
+    #[test]
+    fn quote_map_records_trades_on_both_send_points() {
+        let (mut a, _rx, map) = mapped();
+        let mut with_id = trade(77);
+        with_id.instrument_id = 1;
+        let mut no_id = trade(0);
+        no_id.instrument_id = 2;
+        a.emit(FeedMessage::Trade(with_id.clone()), edge(1), TEST_CATEGORY);
+        a.emit(FeedMessage::Trade(no_id.clone()), edge(1), TEST_CATEGORY);
+        let e = held_trade(&map, &with_id).expect("windowed send written");
+        assert_eq!((e.price, e.size, e.trade_id), (0.62, 100.0, 77));
+        assert_eq!((e.source_ts_ns, e.as_of_ns), (1_000, 2_000));
+        assert!(held_trade(&map, &no_id).is_some(), "id-less send written");
+
+        let mut dup = with_id.clone();
+        dup.recv_ts_ns = 9_000;
+        a.emit(FeedMessage::Trade(dup), edge(2), TEST_CATEGORY);
+        assert_eq!(held_trade(&map, &with_id).unwrap().as_of_ns, 2_000);
+    }
+
+    /// A quote and a trade for one instrument share one entry, each half kept by its own writer.
+    #[test]
+    fn quote_map_keeps_quote_and_trade_halves_apart() {
+        let (mut a, _rx, map) = mapped();
+        let q = ident_quote(1_000, 100.0, 7);
+        let mut t = trade(77);
+        (t.venue, t.source_name, t.source_id) = (q.venue.clone(), q.venue.clone(), q.source_id);
+        (t.category, t.channel, t.instrument_id) = (q.category.clone(), 1, 7);
+        a.emit(FeedMessage::Quote(q.clone()), edge(1), TEST_CATEGORY);
+        a.emit(FeedMessage::Trade(t), edge(1), TEST_CATEGORY);
+        let v = crate::model::lock(&map)
+            .get(&quote_key(&q).unwrap())
+            .cloned()
+            .unwrap();
+        assert!(v.quote.is_some() && v.trade.is_some());
+    }
+
+    #[test]
+    fn quote_map_skips_a_quote_without_identity() {
+        let (mut a, mut rx, map) = mapped();
+        a.emit(
+            FeedMessage::Quote(quote(1_000, 100.0, 101.0)),
+            edge(1),
+            TEST_CATEGORY,
+        );
+        assert_eq!(drain_quotes(&mut rx).len(), 1, "still broadcast");
+        assert!(crate::model::lock(&map).is_empty());
+    }
+
+    /// Two instruments whose truncated symbols collide keep their own entries.
+    #[test]
+    fn two_instruments_sharing_a_symbol_keep_separate_entries() {
+        let (mut a, _rx, map) = mapped();
+        let one = ident_quote(1_000, 100.0, 1);
+        let two = ident_quote(1_001, 200.0, 2);
+        assert_eq!(one.symbol, two.symbol);
+        a.emit(FeedMessage::Quote(one.clone()), edge(1), TEST_CATEGORY);
+        a.emit(FeedMessage::Quote(two.clone()), edge(1), TEST_CATEGORY);
+        assert_eq!(crate::model::lock(&map).len(), 2);
+        assert_eq!(held_quote(&map, &one).unwrap().bid, 100.0);
+        assert_eq!(held_quote(&map, &two).unwrap().bid, 200.0);
+    }
+
+    /// Off is the default: nothing is set, and every send still reaches the broadcast.
+    #[test]
+    fn quote_map_unset_writes_nothing() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.emit(
+            FeedMessage::Quote(ident_quote(1_000, 100.0, 7)),
+            edge(1),
+            TEST_CATEGORY,
+        );
+        a.emit(FeedMessage::Trade(trade(77)), edge(1), TEST_CATEGORY);
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 2);
+    }
+
+    fn edge(last_octet: u8) -> Transport {
+        Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last_octet)))
     }
 }

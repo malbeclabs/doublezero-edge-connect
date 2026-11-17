@@ -659,6 +659,11 @@ pub type InstrumentSnapshot =
 /// instead of making it wait for the next periodic one). Updated by the MBO receiver.
 pub type DepthSnapshot = Arc<Mutex<HashMap<(SourceKey, Arc<str>), NormalizedDepth>>>;
 
+/// The latest admitted top-of-book quote and trade per instrument, keyed like the book replay
+/// ([`BookKey`]). Written only by the arbiter's send points, and only when `--quote-map` is on;
+/// see `ingest::quote_map`.
+pub type QuoteMap = Arc<Mutex<HashMap<BookKey, crate::ingest::quote_map::LatestValues>>>;
+
 /// Accumulated book state for one market, so a connecting or newly-subscribing client can be
 /// bootstrapped immediately instead of waiting a full snapshot cycle.
 ///

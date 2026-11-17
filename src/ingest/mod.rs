@@ -22,6 +22,7 @@ pub mod phoenix_input;
 pub mod pricebook;
 pub mod processor;
 pub mod public_input;
+pub mod quote_map;
 pub mod receiver;
 pub mod reconcile;
 pub mod registry;
