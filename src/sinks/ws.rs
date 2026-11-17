@@ -538,7 +538,7 @@ fn withheld_bootstrap(
         FeedMessage::Book(book)
     };
     Withheld::Ready {
-        msg,
+        msg: Box::new(msg),
         wire_ts: acc.wire_ts_ns(),
         release,
     }
@@ -557,8 +557,9 @@ enum Withheld {
     /// Outside this client's subscription scope, so nothing is owed. Stop tracking it; a widening
     /// re-accounts for it through [`replay_scoped`].
     OutOfScope,
+    /// Boxed so the common `Waiting` result stays small; this is built once per released market.
     Ready {
-        msg: FeedMessage,
+        msg: Box<FeedMessage>,
         wire_ts: u64,
         release: &'static str,
     },
