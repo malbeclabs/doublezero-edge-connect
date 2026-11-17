@@ -2782,6 +2782,7 @@ impl Arbiter {
             self.reset_depth_floor_for_symbol(&market.0, symbol, "source_id_changed");
         }
         self.reset_books_for_markets(std::slice::from_ref(market));
+        self.forget_values(market);
     }
 
     /// The single expression of the **three-way drop**: the per-path accumulators (`book_markets`),
@@ -3354,6 +3355,87 @@ impl Arbiter {
         self.source_paths
             .retain(|k, _| !(k.0.name() == venue && k.1.as_ref() == category && k.2 == channel));
         dropped
+    }
+
+    /// Drop the latest-values map's quote half (`drop_quotes`), trade half (`drop_trades`) or both
+    /// for every instrument of `venue`'s `category` on `channel` — the grain
+    /// [`Self::forget_channel_books`] purges on. An entry left with neither half is removed.
+    /// Returns how many entries changed. A no-op when no map is wired.
+    pub fn forget_channel_values(
+        &mut self,
+        venue: &str,
+        category: &str,
+        channel: u8,
+        drop_quotes: bool,
+        drop_trades: bool,
+    ) -> usize {
+        self.forget_values_where(
+            |s| s.name() == venue,
+            category,
+            channel,
+            drop_quotes,
+            drop_trades,
+        )
+    }
+
+    /// [`Self::forget_channel_values`] for the instruments filed under any of `source_ids`, the
+    /// wire Source IDs a publisher revealed — which can name a source other than its row's venue.
+    pub fn forget_source_channel_values(
+        &mut self,
+        source_ids: &HashSet<u16>,
+        category: &str,
+        channel: u8,
+        drop_quotes: bool,
+        drop_trades: bool,
+    ) -> usize {
+        self.forget_values_where(
+            |s| source_ids.contains(&s.id()),
+            category,
+            channel,
+            drop_quotes,
+            drop_trades,
+        )
+    }
+
+    fn forget_values_where(
+        &mut self,
+        source: impl Fn(&SourceKey) -> bool,
+        category: &str,
+        channel: u8,
+        drop_quotes: bool,
+        drop_trades: bool,
+    ) -> usize {
+        let Some(map) = &self.quote_map else {
+            return 0;
+        };
+        if !drop_quotes && !drop_trades {
+            return 0;
+        }
+        let mut changed = 0;
+        model::lock(map).retain(|k, v| {
+            if !(k.2 == channel && k.1.as_ref() == category && source(&k.0)) {
+                return true;
+            }
+            let before = (v.quote.is_some(), v.trade.is_some());
+            if drop_quotes {
+                v.quote = None;
+            }
+            if drop_trades {
+                v.trade = None;
+            }
+            if (v.quote.is_some(), v.trade.is_some()) != before {
+                changed += 1;
+            }
+            v.quote.is_some() || v.trade.is_some()
+        });
+        changed
+    }
+
+    /// Drop one instrument's latest values outright: its identity is gone (a Source ID change).
+    pub(crate) fn forget_values(&mut self, key: &MarketKey) {
+        if let Some(map) = &self.quote_map {
+            model::lock(map).remove(key);
+        }
     }
 
     /// Advance the shared replay accumulator with an admitted batch, keeping it in step with the
@@ -10777,6 +10859,71 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 2);
+    }
+
+    /// An instrument that moves to another Source ID takes its old identity's value with the
+    /// catalog entry and book, or the old identity would keep answering with a dead quote.
+    #[test]
+    fn source_id_purge_drops_the_quote_map_entry() {
+        let (mut a, _rx, map) = mapped();
+        let q = ident_quote(1_000, 100.0, 7);
+        a.emit(FeedMessage::Quote(q.clone()), edge(1), TEST_CATEGORY);
+        let key = quote_key(&q).unwrap();
+        assert!(crate::model::lock(&map).contains_key(&key), "fixture");
+        a.release_source_market(&key, None, edge(1));
+        assert!(!crate::model::lock(&map).contains_key(&key));
+    }
+
+    /// The channel purge is category- and channel-precise, and drops only the halves it is asked
+    /// to: an entry left with neither half is removed rather than kept empty.
+    #[test]
+    fn forget_channel_values_spares_another_category_and_channel() {
+        let (mut a, _rx, map) = mapped();
+        let key = |category: &str, channel: u8| -> crate::model::BookKey {
+            (
+                SourceKey::new(1, "HYPERLIQUID".into()),
+                category.into(),
+                channel,
+                9,
+            )
+        };
+        let full = || crate::ingest::quote_map::LatestValues {
+            quote: Some(crate::ingest::quote_map::QuoteEntry::of(&ident_quote(
+                1_000, 100.0, 9,
+            ))),
+            trade: Some(crate::ingest::quote_map::TradeEntry::of(&trade(1))),
+        };
+        for k in [key("perps", 1), key("perps", 2), key("spot", 1)] {
+            crate::model::lock(&map).insert(k, full());
+        }
+        assert_eq!(
+            a.forget_channel_values("HYPERLIQUID", "perps", 1, true, false),
+            1
+        );
+        let held = |k| {
+            crate::model::lock(&map)
+                .get(&k)
+                .map(|v| (v.quote.is_some(), v.trade.is_some()))
+        };
+        assert_eq!(held(key("perps", 1)), Some((false, true)), "quote half only");
+        assert_eq!(
+            a.forget_channel_values("HYPERLIQUID", "perps", 1, false, true),
+            1
+        );
+        assert_eq!(held(key("perps", 1)), None, "an empty entry is removed");
+        assert_eq!(held(key("perps", 2)), Some((true, true)));
+        assert_eq!(held(key("spot", 1)), Some((true, true)));
+    }
+
+    /// With no map wired the purge is a no-op that reports nothing.
+    #[test]
+    fn forget_channel_values_without_a_map_is_a_no_op() {
+        let (tx, _rx) = broadcast::channel(4);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        assert_eq!(
+            a.forget_channel_values("HYPERLIQUID", "perps", 1, true, true),
+            0
+        );
     }
 
     fn edge(last_octet: u8) -> Transport {

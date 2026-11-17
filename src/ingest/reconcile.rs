@@ -981,13 +981,26 @@ impl Reconciler {
             )
         };
 
-        if history_dropped > 0 || books_dropped > 0 {
+        // The latest-values map (`--quote-map`). Quotes stay only while a top-of-book sibling keeps
+        // writing them: a market-by-price sibling writes none, so a kept quote would go on winning
+        // over its live book. Trades follow the catalog's rule, since every kind prints them.
+        let keep_quotes = siblings.iter().any(|k| matches!(k, FeedKind::TopOfBook));
+        let values_dropped = crate::ingest::arbiter::lock(&self.cfg.arbiter).forget_channel_values(
+            feed.venue,
+            feed.category,
+            channel,
+            !keep_quotes,
+            !keep_catalog_and_history,
+        );
+
+        if history_dropped > 0 || books_dropped > 0 || values_dropped > 0 {
             info!(
                 venue = feed.venue,
                 category = feed.category,
                 channel,
                 history_dropped,
                 books_dropped,
+                values_dropped,
                 "channel left the channel filter's admitted set; dropped its catalog/book/history \
                  state"
             );
@@ -2158,6 +2171,92 @@ mod tests {
             "a departed channel's product must vanish from the query surface, not read as \
              alive-but-quiet"
         );
+    }
+
+    /// The Kalshi elections pair with the latest-values map wired and one entry, holding a quote
+    /// and a trade, on channel 50. Returns the reconciler, the map and the entry's key.
+    async fn elections_pair_with_values() -> (Reconciler, crate::model::QuoteMap, crate::model::BookKey)
+    {
+        let rows: Vec<Feed> = crate::ingest::feeds::feeds()
+            .iter()
+            .filter(|f| f.category == "elections")
+            .copied()
+            .collect();
+        assert_eq!(rows.len(), 2, "fixture: the elections tob and mbp rows");
+        let both = "edge-kalshi-elections-pol-tob=50,51;edge-kalshi-elections-pol-mbp=50,51";
+        let mut r = test_reconciler_with_filter(rows, ChannelFilter::parse(both).unwrap());
+        let map: crate::model::QuoteMap = Arc::new(Mutex::new(HashMap::new()));
+        crate::ingest::arbiter::lock(&r.cfg.arbiter).set_quote_map(map.clone());
+        r.tick().await;
+        let key: crate::model::BookKey = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            "elections".into(),
+            50,
+            1,
+        );
+        let entry = crate::ingest::quote_map::LatestValues {
+            quote: Some(crate::ingest::quote_map::QuoteEntry {
+                bid: 0.4,
+                ask: 0.6,
+                bid_size: 1.0,
+                ask_size: 1.0,
+                bid_n: 0,
+                ask_n: 0,
+                source_ts_ns: 0,
+                venue_update_id: 0,
+                as_of_ns: 1,
+            }),
+            trade: Some(crate::ingest::quote_map::TradeEntry {
+                price: 0.5,
+                size: 1.0,
+                side: crate::model::Side::Buy,
+                trade_id: 1,
+                source_ts_ns: 0,
+                as_of_ns: 1,
+            }),
+        };
+        crate::model::lock(&map).insert(key.clone(), entry);
+        (r, map, key)
+    }
+
+    async fn narrow_to(r: &mut Reconciler, spec: &str) {
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse(spec).unwrap();
+        for _ in 0..=MAX_DRAIN_TICKS {
+            r.tick().await;
+        }
+    }
+
+    fn halves(map: &crate::model::QuoteMap, key: &crate::model::BookKey) -> Option<(bool, bool)> {
+        crate::model::lock(map)
+            .get(key)
+            .map(|v| (v.quote.is_some(), v.trade.is_some()))
+    }
+
+    /// A market-by-price sibling writes no quotes, so a top-of-book row leaving the channel takes
+    /// its quotes with it even while that sibling stays: kept, the old quote would keep winning
+    /// over the live book. The trade half follows the catalog's rule and stays.
+    #[tokio::test]
+    async fn departing_tob_row_drops_its_quotes_even_with_an_mbp_sibling() {
+        let (mut r, map, key) = elections_pair_with_values().await;
+        assert_eq!(halves(&map, &key), Some((true, true)), "fixture");
+        narrow_to(
+            &mut r,
+            "edge-kalshi-elections-pol-tob=51;edge-kalshi-elections-pol-mbp=50,51",
+        )
+        .await;
+        assert_eq!(halves(&map, &key), Some((false, true)));
+    }
+
+    /// A top-of-book sibling that stays keeps writing the quotes, so they stay.
+    #[tokio::test]
+    async fn departing_row_keeps_quotes_while_a_tob_sibling_stays() {
+        let (mut r, map, key) = elections_pair_with_values().await;
+        narrow_to(
+            &mut r,
+            "edge-kalshi-elections-pol-tob=50,51;edge-kalshi-elections-pol-mbp=51",
+        )
+        .await;
+        assert_eq!(halves(&map, &key), Some((true, true)));
     }
 
     /// A row narrowed off a channel its **sibling** still admits leaves the sibling's state alone.
