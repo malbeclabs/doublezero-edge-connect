@@ -3378,18 +3378,20 @@ impl Arbiter {
         )
     }
 
-    /// [`Self::forget_channel_values`] for the instruments filed under any of `source_ids`, the
-    /// wire Source IDs a publisher revealed — which can name a source other than its row's venue.
+    /// [`Self::forget_channel_values`] for the instruments filed under any of `sources`, the keys
+    /// of the wire Source IDs a publisher revealed — which can name a source other than its row's
+    /// venue. Keys, never raw IDs: past the unregistered-label cap every further ID shares one key,
+    /// stored under id `0`, so a raw ID would miss it.
     pub fn forget_source_channel_values(
         &mut self,
-        source_ids: &HashSet<u16>,
+        sources: &HashSet<SourceKey>,
         category: &str,
         channel: u8,
         drop_quotes: bool,
         drop_trades: bool,
     ) -> usize {
         self.forget_values_where(
-            |s| source_ids.contains(&s.id()),
+            |s| sources.contains(s),
             category,
             channel,
             drop_quotes,
@@ -10925,6 +10927,30 @@ mod tests {
         assert_eq!(held(key("perps", 1)), None, "an empty entry is removed");
         assert_eq!(held(key("perps", 2)), Some((true, true)));
         assert_eq!(held(key("spot", 1)), Some((true, true)));
+    }
+
+    /// Past the unregistered-label cap every further wire ID shares one `SourceKey`, stored under id
+    /// `0`. The purge matches the key a quote was filed under, so an ID past the cap still reaches
+    /// its entry; matching the raw wire ID (`59_999` against a stored `0`) would leave the quote
+    /// standing after a reset. Built with `SourceKey::new` rather than by filling the process-wide
+    /// label cap, which other tests rely on staying open.
+    #[test]
+    fn source_purge_reaches_an_id_past_the_unregistered_cap() {
+        let capped = || SourceKey::new(59_999, crate::ingest::sources::UNREGISTERED.into());
+        assert_eq!(capped().id(), 0, "fixture: the cap collapses the id");
+        let (mut a, _rx, map) = mapped();
+        let key: crate::model::BookKey = (capped(), "perps".into(), 1, 9);
+        crate::model::lock(&map).insert(
+            key.clone(),
+            crate::ingest::quote_map::LatestValues {
+                quote: Some(crate::ingest::quote_map::QuoteEntry::of(&ident_quote(
+                    1_000, 100.0, 9,
+                ))),
+                trade: None,
+            },
+        );
+        a.forget_source_channel_values(&HashSet::from([capped()]), "perps", 1, true, false);
+        assert!(!crate::model::lock(&map).contains_key(&key));
     }
 
     /// With no map wired the purge is a no-op that reports nothing.

@@ -352,6 +352,14 @@ pub struct TobProcessor {
     revealed: HashMap<(IpAddr, u32), u16>,
     /// The receiver's category, interned once (see [`Self::category_for`]).
     category: Option<(&'static str, Arc<str>)>,
+    /// Every wire Source ID this publisher's instruments have been filed under, per canonical
+    /// channel: what a reset of that channel drops quotes by. Kept apart from `revealed` because a
+    /// `ChannelReset` clears `revealed` for every channel of the publisher while dropping quotes on
+    /// its own channel only, and a later reset of another channel must still find its IDs.
+    /// Written on the refdata path (a reveal, or a definition moving an already revealed
+    /// instrument), never per quote. Bounded like `revealed`: dropped when the publisher is
+    /// evicted.
+    channel_sources: HashMap<(IpAddr, u8), HashSet<SourceKey>>,
     /// The channel `InstrumentDefinition` most recently arrived on for `(publisher, instrument)` —
     /// remembered because the deferred `NormalizedInstrument`, emitted once a price message
     /// reveals the instrument, is built outside that definition's own datagram and so no longer has
@@ -383,6 +391,7 @@ impl TobProcessor {
             revealed: HashMap::new(),
             pending_channel: HashMap::new(),
             category: None,
+            channel_sources: HashMap::new(),
         }
     }
 
@@ -452,6 +461,10 @@ impl TobProcessor {
             ));
         }
         self.revealed.insert(key, source_id);
+        self.channel_sources
+            .entry((ctx.publisher, channel))
+            .or_default()
+            .insert(SourceKey::from_id(source_id));
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
             venue: source.clone(),
@@ -485,23 +498,18 @@ impl TobProcessor {
 
     /// The channel's quotes in the latest-values map end with its session or reset: one kept would
     /// stand in for a live quote on a channel that is still up. Matched on the Source IDs this
-    /// publisher revealed, never on the row's venue — the wire ID is authoritative and can name
-    /// another source — so it must run before [`Self::forget_publisher`] clears them. The last
-    /// trade stays; it is still the last trade.
+    /// publisher's instruments were filed under on that channel (`channel_sources`), never on the
+    /// row's venue — the wire ID is authoritative and can name another source. The last trade
+    /// stays; it is still the last trade.
     fn forget_channel_quotes(&self, ctx: &DatagramCtx, wire_channel: u8) {
-        let source_ids: HashSet<u16> = self
-            .revealed
-            .iter()
-            .filter(|((p, _), _)| *p == ctx.publisher)
-            .map(|(_, &id)| id)
-            .collect();
-        if source_ids.is_empty() {
+        let channel = ctx.canonical_channel(wire_channel);
+        let Some(source_ids) = self.channel_sources.get(&(ctx.publisher, channel)) else {
             return;
-        }
+        };
         lock(ctx.arbiter).forget_source_channel_values(
-            &source_ids,
+            source_ids,
             ctx.category,
-            ctx.canonical_channel(wire_channel),
+            channel,
             true,
             false,
         );
@@ -533,6 +541,9 @@ impl DatagramProcessor for TobProcessor {
             // `pending_channel` entries in the same pass, or they outlive `state` forever.
             if let Some(evicted) = self.state.take_evicted() {
                 self.forget_publisher(evicted);
+                // Not part of `forget_publisher`, which a `ChannelReset` also runs: those IDs must
+                // outlive a reset (see `channel_sources`), but not the publisher.
+                self.channel_sources.retain(|(p, _), _| *p != evicted);
             }
         }
 
@@ -568,6 +579,10 @@ impl DatagramProcessor for TobProcessor {
                         sequence = header.sequence,
                         "quote channel reset; sequence restarted"
                     );
+                    // A new publisher era, whether or not its `ChannelReset` reached us: quotes
+                    // from the old one must not stand in for live ones. This datagram's own quotes
+                    // are processed below, after the drop.
+                    self.forget_channel_quotes(ctx, header.channel_id);
                     true
                 }
                 SeqCheck::First | SeqCheck::Ok | SeqCheck::Bounded | SeqCheck::Reseat => true,
@@ -619,6 +634,11 @@ impl DatagramProcessor for TobProcessor {
                     let channel = ctx.canonical_channel(header.channel_id);
                     self.pending_channel.insert(key, channel);
                     if let Some(&source_id) = self.revealed.get(&key) {
+                        // Quotes for this instrument now file under this channel.
+                        self.channel_sources
+                            .entry((ctx.publisher, channel))
+                            .or_default()
+                            .insert(SourceKey::from_id(source_id));
                         if d.source_id.is_none() || d.source_id == Some(source_id) {
                             let source = venue_arc(source_label(source_id));
                             let inst = NormalizedInstrument {
@@ -4790,6 +4810,50 @@ mod tests {
         );
         assert_eq!(values_at(&map, &values_key(1, 1, 41)), Some((false, true)));
         assert_eq!(values_at(&map, &other), Some((true, false)));
+    }
+
+    /// A `ChannelReset` discards the publisher's reveals on every channel, but drops quotes only on
+    /// its own. A second reset, on another channel and before anything is revealed again, must
+    /// still find the Source IDs that channel's quotes were filed under.
+    #[test]
+    fn consecutive_channel_resets_each_drop_their_quotes() {
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let (mut proc, map, seq) = tob_with_values_on_two_channels(&arbiter, &instruments, 1);
+        tob_refdata_on(
+            &mut proc,
+            &arbiter,
+            &instruments,
+            1,
+            seq,
+            enc_tob_channel_reset(9),
+        );
+        tob_refdata_on(
+            &mut proc,
+            &arbiter,
+            &instruments,
+            2,
+            seq + 1,
+            enc_tob_channel_reset(10),
+        );
+        assert_eq!(values_at(&map, &values_key(1, 1, 41)), Some((false, true)));
+        assert_eq!(values_at(&map, &values_key(1, 2, 42)), Some((false, true)));
+    }
+
+    /// A publisher restart shows as a new `Reset Count` on the market-data header even when its
+    /// explicit `ChannelReset` is lost. An instrument not quoted again since must not keep its
+    /// pre-restart quote on a channel that reads as live. Its trade stays.
+    #[test]
+    fn a_header_reset_count_change_drops_the_channels_quotes() {
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let (mut proc, map, seq) = tob_with_values_on_two_channels(&arbiter, &instruments, 1);
+        let mut restarted = tob_datagram_on_channel(1, seq, &[]);
+        restarted[21] = 1; // Reset Count: a new publisher era on channel 1
+        proc.on_datagram(
+            &restarted,
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        assert_eq!(values_at(&map, &values_key(1, 1, 41)), Some((false, true)));
+        assert_eq!(values_at(&map, &values_key(1, 2, 42)), Some((true, true)));
     }
 
     /// A top-of-book instrument that moves to another Source ID leaves no quote behind under the old
