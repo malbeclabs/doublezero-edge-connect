@@ -637,6 +637,14 @@ impl DatagramProcessor for TobProcessor {
                     // other).
                     let venue: &'static str = source_label(q.source_id);
                     let source = venue_arc(venue);
+                    // The channel this instrument was announced under, read after the reveal call
+                    // above exactly as the trade branch does, so the quote names the catalog's
+                    // identity and lands at the same key as the instrument's book.
+                    let channel = self
+                        .pending_channel
+                        .get(&(ctx.publisher, q.instrument_id))
+                        .copied()
+                        .unwrap_or(0);
                     let quote = NormalizedQuote {
                         venue: source.clone(),
                         source_name: source.clone(),
@@ -653,6 +661,9 @@ impl DatagramProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                         venue_update_id: q.venue_update_id,
+                        channel,
+                        instrument_id: q.instrument_id,
+                        category: category_arc(ctx.category),
                         // The update id's comparison scope and exact content: the canonical
                         // channel (a mirror's offset channel keys with its primary) and the raw
                         // integers under the exponents they were scaled with.
@@ -4549,6 +4560,110 @@ mod tests {
             );
         }
         assert_eq!(wires[0], wires[1], "one market, one scale, one channel");
+    }
+
+    /// Drain every quote off `rx`.
+    fn drain_quotes(
+        rx: &mut broadcast::Receiver<std::sync::Arc<FeedMessage>>,
+    ) -> Vec<crate::model::NormalizedQuote> {
+        let mut quotes = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Quote(q) = &*m {
+                quotes.push(q.clone());
+            }
+        }
+        quotes
+    }
+
+    /// A top-of-book quote carries the identity its instrument was announced under — the wire id,
+    /// the channel the `instrument` message names, and the row's category — so it can be filed
+    /// under the same key as the instrument's catalog entry and book.
+    #[test]
+    fn tob_quote_carries_its_instrument_identity() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = TobProcessor::new(tape(false));
+        let ctx = |role| make_ctx(&arbiter, &instruments, role);
+        proc.on_datagram(
+            &tob_datagram_on_channel(
+                5,
+                0,
+                &[
+                    enc_manifest_summary(1, 1),
+                    enc_instrument_def(41, "MARKET-X", 1),
+                ],
+            ),
+            &ctx(PortRole::Refdata),
+        );
+        proc.on_datagram(
+            &tob_datagram_on_channel(5, 1, &[enc_tob_quote(41, 1, 1_000)]),
+            &ctx(PortRole::Mktdata),
+        );
+        let mut announced = None;
+        let mut quotes = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            match &*m {
+                FeedMessage::Instrument(i) => announced = Some(i.channel),
+                FeedMessage::Quote(q) => quotes.push(q.clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(quotes.len(), 1, "{quotes:?}");
+        let q = &quotes[0];
+        assert_eq!(q.instrument_id, 41);
+        assert_eq!(Some(q.channel), announced, "the announced channel");
+        assert_eq!(q.channel, 5);
+        assert_eq!(&*q.category, "testcategory");
+    }
+
+    /// One instrument served by a top-of-book row and a market-by-price row on one channel lands at
+    /// ONE key: the quote's identity and the book's key agree, or the two would split the
+    /// instrument and no lookup could ever compare them. Covers a mirror publisher on the
+    /// top-of-book side too, whose offset channel must fold back to the book's.
+    #[test]
+    fn tob_quote_and_mbp_book_share_one_key() {
+        for mirror in [None, Some(100u8)] {
+            let (arbiter, mut rx, instruments) = mbp_harness();
+            let books: crate::model::BookSnapshot = Arc::new(Mutex::new(Default::default()));
+            lock(&arbiter).set_book_replay(books.clone());
+            let book_pub = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 9));
+            let _mbp = mbp_revealed_under(&arbiter, &instruments, book_pub, 1);
+
+            let mut tob = TobProcessor::new(tape(false));
+            let wire_channel = mirror.unwrap_or(0);
+            let ctx = |role| {
+                let mut c = make_ctx(&arbiter, &instruments, role);
+                c.mirror_offset = mirror;
+                c
+            };
+            tob.on_datagram(
+                &tob_datagram_on_channel(
+                    wire_channel,
+                    0,
+                    &[
+                        enc_manifest_summary(1, 1),
+                        enc_instrument_def(41, "MARKET-X", 1),
+                    ],
+                ),
+                &ctx(PortRole::Refdata),
+            );
+            tob.on_datagram(
+                &tob_datagram_on_channel(wire_channel, 1, &[enc_tob_quote(41, 1, 1_000)]),
+                &ctx(PortRole::Mktdata),
+            );
+            let quotes = drain_quotes(&mut rx);
+            assert_eq!(quotes.len(), 1, "mirror {mirror:?}: {quotes:?}");
+            let q = &quotes[0];
+            let key = (
+                crate::model::SourceKey::of(q),
+                q.category.clone(),
+                q.channel,
+                q.instrument_id,
+            );
+            assert!(
+                crate::model::lock(&books).get(&key).is_some(),
+                "mirror {mirror:?}: quote key {key:?} has no book"
+            );
+        }
     }
 
     /// **The mirror finding, midpoint.** The same canonicalization

@@ -254,6 +254,9 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         recv_ts_ns: now_ns(),
         kernel_rx_ts_ns: 0, // no kernel RX timestamp for a user-space WS read (0 = sentinel)
         ws_send_ts_ns: 0,   // stamped by the WS server just before send
+        channel: 0,
+        instrument_id: 0,
+        category: crate::model::empty_category(),
         venue_update_id: 0, // the public feed carries no venue update counter
         // The catalog's (canonical) channel, so this copy lands on the edge quote's `Venue Update
         // ID` key: on a key in the ID regime it is suppressed like any ID-less copy, instead of
@@ -478,6 +481,9 @@ mod tests {
             recv_ts_ns: now_ns(),
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            channel: 0,
+            instrument_id: 0,
+            category: crate::model::empty_category(),
             venue_update_id: 9,
             wire: crate::model::QuoteWire {
                 channel: 7,

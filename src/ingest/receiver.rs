@@ -1454,6 +1454,9 @@ mod tests {
                 recv_ts_ns: ts,
                 kernel_rx_ts_ns: 0,
                 ws_send_ts_ns: 0,
+                channel: 0,
+                instrument_id: 0,
+                category: crate::model::empty_category(),
                 venue_update_id: 0,
                 wire: crate::model::QuoteWire::default(),
             })
@@ -1571,6 +1574,9 @@ mod tests {
             recv_ts_ns: 1,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            channel: 0,
+            instrument_id: 0,
+            category: crate::model::empty_category(),
             venue_update_id: 0,
             wire: crate::model::QuoteWire::default(),
         };

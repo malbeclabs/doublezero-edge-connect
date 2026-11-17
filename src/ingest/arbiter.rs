@@ -4287,6 +4287,9 @@ mod tests {
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            channel: 0,
+            instrument_id: 0,
+            category: crate::model::empty_category(),
             venue_update_id: 0,
             wire: QuoteWire::default(),
         }
@@ -9965,6 +9968,9 @@ mod tests {
         NormalizedQuote {
             venue: venue.into(),
             source_name: venue.into(),
+            channel: 0,
+            instrument_id: 0,
+            category: crate::model::empty_category(),
             venue_update_id: id,
             wire: wire_of(bid, bid + 1.0, 0),
             recv_ts_ns,

@@ -229,6 +229,23 @@ pub struct NormalizedQuote {
     /// like it and never serialized. See [`QuoteWire`].
     #[serde(skip)]
     pub wire: QuoteWire,
+    /// The channel this quote's instrument was announced under — its catalog channel, which is
+    /// the canonical one (a mirror's offset channel folds onto its primary's), the same value
+    /// `NormalizedInstrument::channel` and `NormalizedTrade::channel` carry. Together with
+    /// `instrument_id` and `category` it is the identity `model::BookKey` files a market under, so
+    /// a quote can be kept beside its instrument's book. `wire.channel` is the update-id
+    /// comparison scope and stays separate. Producer-side, like `category` on a trade:
+    /// `#[serde(skip)]`, so PROTOCOL.md's quote is unchanged.
+    #[serde(skip)]
+    pub channel: u8,
+    /// Instrument id, unique within `channel`. Producer-side, see `channel`.
+    #[serde(skip)]
+    pub instrument_id: u32,
+    /// The instrument universe of this quote's row (`ingest::feeds::Feed::category`). Empty means
+    /// the producer has no instrument identity to give (the public WebSocket input), and such a
+    /// quote is never filed by identity. Producer-side, see `channel`.
+    #[serde(skip, default = "empty_category")]
+    pub category: Arc<str>,
 }
 
 /// A quote's canonical channel and its raw wire prices, quantities and exponents, carried beside
@@ -1803,6 +1820,9 @@ mod tests {
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            channel: 0,
+            instrument_id: 0,
+            category: crate::model::empty_category(),
             venue_update_id: 0,
             wire: QuoteWire::default(),
         };
@@ -1835,6 +1855,9 @@ mod tests {
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            channel: 0,
+            instrument_id: 0,
+            category: crate::model::empty_category(),
             venue_update_id: 42,
             wire: QuoteWire::default(),
         };
@@ -1843,6 +1866,40 @@ mod tests {
         assert!(!json.contains("42"), "{json}");
         let back: NormalizedQuote = serde_json::from_str(&json).unwrap();
         assert_eq!(back.venue_update_id, 0);
+    }
+
+    /// A quote's instrument identity is producer-side, like a trade's `category`: PROTOCOL.md fixes
+    /// the quote's fields and names none of these, so they must never reach the WebSocket.
+    #[test]
+    fn a_quote_keeps_its_identity_off_the_wire() {
+        let q = NormalizedQuote {
+            venue: Arc::from("V"),
+            source_name: Arc::from("V"),
+            source_id: 1,
+            symbol: Arc::from("SOL"),
+            bid: 1.0,
+            ask: 2.0,
+            bid_size: 3.0,
+            ask_size: 4.0,
+            bid_n: 0,
+            ask_n: 0,
+            source_ts_ns: 0,
+            recv_ts_ns: 0,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+            venue_update_id: 0,
+            wire: QuoteWire::default(),
+            channel: 3,
+            instrument_id: 42,
+            category: Arc::from("perps"),
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        for field in ["\"channel\"", "\"instrument_id\"", "\"category\"", "perps"] {
+            assert!(!json.contains(field), "{field} leaked: {json}");
+        }
+        let back: NormalizedQuote = serde_json::from_str(&json).unwrap();
+        assert_eq!((back.channel, back.instrument_id), (0, 0));
+        assert!(back.category.is_empty());
     }
 
     /// A payload written before these fields existed must still deserialize, or every committed
