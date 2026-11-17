@@ -525,6 +525,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- **The bridge can keep the latest top-of-book quote and last trade per instrument**, behind
+  `--quote-map` / `DZ_QUOTE_MAP`, off by default. Entries are keyed by the instrument's full
+  identity, never its symbol, and nothing reads them yet, so turning it on changes no output.
 - **Kalshi's crypto up/down pair in the compiled-in registry.** `edge-kalshi-updown-tob` (group
   `233.84.178.26`, Top-of-Book, `37000`/`47000`) and `edge-kalshi-updown-mbp` (`233.84.178.34`,
   Market-by-Price, `38000`/`48000`/`58000`), category `updown`, each one explicit block shared by two

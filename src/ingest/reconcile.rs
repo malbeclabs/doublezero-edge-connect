@@ -2175,8 +2175,8 @@ mod tests {
 
     /// The Kalshi elections pair with the latest-values map wired and one entry, holding a quote
     /// and a trade, on channel 50. Returns the reconciler, the map and the entry's key.
-    async fn elections_pair_with_values() -> (Reconciler, crate::model::QuoteMap, crate::model::BookKey)
-    {
+    async fn elections_pair_with_values(
+    ) -> (Reconciler, crate::model::QuoteMap, crate::model::BookKey) {
         let rows: Vec<Feed> = crate::ingest::feeds::feeds()
             .iter()
             .filter(|f| f.category == "elections")

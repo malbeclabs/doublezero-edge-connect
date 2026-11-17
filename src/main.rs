@@ -283,6 +283,12 @@ struct Args {
     )]
     subscription_gating_disable: bool,
 
+    /// Keep the latest top-of-book quote and last trade per instrument, keyed by its full identity,
+    /// beside the books (`ingest::quote_map`). Off by default; turning it on changes no output, since
+    /// nothing reads the map yet.
+    #[arg(long = "quote-map", env = "DZ_QUOTE_MAP", default_value_t = false)]
+    quote_map: bool,
+
     /// Seconds between path re-election samples for `Sticky` venues. Longer holds a slower path
     /// longer; shorter risks flapping authority, which re-baselines every consumer's book.
     #[arg(
@@ -641,6 +647,11 @@ async fn main() -> Result<()> {
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let books: model::BookSnapshot = Arc::new(Mutex::new(model::BookReplay::default()));
+    // The latest top-of-book quote and trade per instrument (`--quote-map`). Only created when the
+    // flag is on, so the arbiter's send path does no extra work by default. Nothing reads it yet;
+    // the handle stays here for the reader that will.
+    let quote_map: Option<model::QuoteMap> =
+        args.quote_map.then(|| Arc::new(Mutex::new(HashMap::new())));
     // Rolling one-hour trade history behind the `/v1` query API. Built once here (like the three
     // snapshot maps above) so it survives the API sink's own activate/deactivate cycles - a
     // subscription blip that briefly takes the sink down must not reset the window it comes back up
@@ -686,6 +697,9 @@ async fn main() -> Result<()> {
         a.set_depth_replay(depth.clone());
         a.set_book_replay(books.clone());
         a.set_instrument_catalog(instruments.clone());
+        if let Some(map) = &quote_map {
+            a.set_quote_map(map.clone());
+        }
         a.set_authority(
             authority_cfg,
             args.arb_match_window_secs.saturating_mul(1_000_000_000),

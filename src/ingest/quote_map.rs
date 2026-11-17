@@ -250,7 +250,13 @@ mod tests {
         }
     }
 
-    fn change(action: BookAction, side: BookSide, price: f64, size: f64, order_id: u64) -> BookChange {
+    fn change(
+        action: BookAction,
+        side: BookSide,
+        price: f64,
+        size: f64,
+        order_id: u64,
+    ) -> BookChange {
         BookChange {
             action,
             side,

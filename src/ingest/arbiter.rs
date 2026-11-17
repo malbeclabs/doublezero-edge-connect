@@ -10736,7 +10736,11 @@ mod tests {
         let mut late = ident_quote(1_000, 100.5, 7);
         late.recv_ts_ns = 9_999;
         a.emit(FeedMessage::Quote(late), edge(2), TEST_CATEGORY);
-        assert_eq!(drain_quotes(&mut rx), vec![(1_000, 100.0)], "fixture: B dropped");
+        assert_eq!(
+            drain_quotes(&mut rx),
+            vec![(1_000, 100.0)],
+            "fixture: B dropped"
+        );
         let e = held_quote(&map, &first).unwrap();
         assert_eq!((e.bid, e.as_of_ns), (100.0, first.recv_ts_ns));
     }
@@ -10766,7 +10770,11 @@ mod tests {
         };
         a.emit(FeedMessage::Quote(q(1_005)), edge(1), TEST_CATEGORY);
         a.emit(FeedMessage::Quote(q(2_005)), edge(2), TEST_CATEGORY);
-        assert_eq!(drain_quotes(&mut rx).len(), 1, "fixture: the copy was decided");
+        assert_eq!(
+            drain_quotes(&mut rx).len(),
+            1,
+            "fixture: the copy was decided"
+        );
         assert_eq!(held_quote(&map, &q(0)).unwrap().as_of_ns, 1_005);
     }
 
@@ -10905,7 +10913,11 @@ mod tests {
                 .get(&k)
                 .map(|v| (v.quote.is_some(), v.trade.is_some()))
         };
-        assert_eq!(held(key("perps", 1)), Some((false, true)), "quote half only");
+        assert_eq!(
+            held(key("perps", 1)),
+            Some((false, true)),
+            "quote half only"
+        );
         assert_eq!(
             a.forget_channel_values("HYPERLIQUID", "perps", 1, false, true),
             1
