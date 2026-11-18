@@ -4183,6 +4183,7 @@ mod tests {
     /// fabricate a placeholder — and it must do so with no `--metrics-bind` involved at all (this
     /// test never touches `sinks::metrics`), which is the entire reason it reads the registry
     /// directly rather than scraping `/metrics`.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn status_process_block_reports_resident_memory_and_cpu() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
