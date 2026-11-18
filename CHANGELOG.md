@@ -18,9 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Seven RustSec advisories against the lockfile cleared, each at its minimum patched version.**
   `rustls 0.23.45 -> 0.23.46` (RUSTSEC-2026-0346/0347/0348/0349), `rustls-webpki 0.103.15 ->
   0.103.16` (0382), `webpki-roots 1.0.8 -> 1.0.10` (0381, distrusted emSign roots) and `tokio
-  1.53.1 -> 1.53.3` (0386, `AsyncFd::new` unsound). The tokio fix deprecates `AsyncFd::new`, so
-  the receiver socket is now registered with `unsafe AsyncFd::register`; the socket owns its
-  descriptor, so the behaviour is unchanged. `cargo-deny` is a required check, and it would
+  1.53.1 -> 1.53.3` (0386, `AsyncFd::new` unsound). `cargo-deny` is a required check, and it would
   otherwise be red on the first CI run after Actions is re-enabled.
 - **`rustls` pinned forward past RUSTSEC-2026-0285, where TLS 1.3 handshake messages were accepted
   at the wrong encryption level.** `0.23.40` accepted a handshake message that followed a
@@ -48,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- **The crate did not build on Windows** (malbeclabs/infra#3871): its receive path and monotonic clock used Unix-only APIs. The read that carries the kernel timestamp now runs only on Linux and Android, other platforms read with `recv_from`, and Windows takes the monotonic clock from `QueryPerformanceCounter`. Linux keeps its kernel timestamps. Windows gets the build and the non-multicast tests only: multicast ingest and shred forwarding are unsupported there, and `kernel_rx_ts_ns` is always `0`. A `windows-latest` CI job runs the workspace tests.
 - **The installers silently dropped bridge env vars missing from their allowlist, `HL_WS_BIND` among them**, so the Hyperliquid-compatible sink could not be turned on from the one-liner (malbeclabs/infra#3751). All three now relay every bridge env var, and testnet/devnet gained `connect.sh`'s feed-registry bind-mount and admin-bind warning. A test fails when a new `Args` env var is not relayed, and the closing output prints the Hyperliquid sink's URL, or the bridge's reason when its bind failed.
 - **The crate did not build on macOS.** `src/ingest/receiver.rs` used `SO_TIMESTAMPNS`, which exists only on Linux and Android, unconditionally; it is now requested only there, and elsewhere `kernel_rx_ts_ns` is `0`, its documented "unavailable". Linux behavior is unchanged. Only the build works on macOS, not multicast ingest: the default `--recv-buf` exceeds the stock macOS socket-buffer ceiling, so every receiver fails to bind, and `--iface` is resolved with `ip(8)`, which macOS does not ship. A `macos-latest` CI job now checks that the workspace compiles.
 - A market whose elected book path gapped no longer ping-pongs between the other paths. The health override now holds the market on the first healthy alternate and returns it to the leader only after 15 s of continuous leader health and the leader's own re-baseline of that market, or after 60 s of that health alone. One lost leader datagram on a three-path venue cost a consumer up to 15 re-baselines in 6 s; it now costs one each way. New counter `dz_book_revert_holds_total{venue,release}`.

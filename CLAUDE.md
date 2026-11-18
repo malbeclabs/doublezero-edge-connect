@@ -1289,6 +1289,7 @@ Modules are grouped by role under `src/`:
 - No TLS on the **service surface** — the WebSocket output and multicast input target a trusted/local
   network; terminate TLS at a reverse proxy if exposed. The **one** exception is the outbound
   `wss://` client in `ingest/ws_input.rs` (public HL feed), which uses rustls + bundled webpki roots.
+- **The crate builds on Windows**, because a downstream bridge links this library there, and `rust-test-windows` runs the workspace tests to keep it so: a Unix-only API (`nix`, `std::os::fd`, `tokio::io::unix`) stays behind `cfg` with a portable fallback, and `nix` is a `cfg(unix)` dependency. The kernel-timestamp read (`receiver::recv_with_ts`) is Linux/Android only; elsewhere it is `recv_from` and `kernel_rx_ts_ns` is `0`. `now_mono_ns` reads `QueryPerformanceCounter` on Windows rather than a process-relative `Instant`, because the arbiter reads a never-written `0` as "long ago" and a clock starting near `0` would break that on every cold start. Multicast ingest and shred forwarding are unsupported there, so the multicast loopback tests are `cfg(unix)`.
 
 ## Packaging and release (the `doublezero-edge` CLI)
 
