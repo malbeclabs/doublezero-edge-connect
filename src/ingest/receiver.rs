@@ -11,21 +11,24 @@
 //! resolve the interface name (e.g. `doublezero1`) to its IPv4 for `join_multicast_v4`,
 //! set `SO_REUSEADDR`/`SO_REUSEPORT`, and a large `SO_RCVBUF`.
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::fd::AsRawFd;
 use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
-    os::fd::AsRawFd,
     sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
-use nix::sys::socket::{recvmsg, MsgFlags, RecvMsg, SockaddrStorage};
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use nix::sys::socket::{setsockopt, sockopt::ReceiveTimestampns, ControlMessageOwned};
+use nix::sys::socket::{
+    recvmsg, setsockopt, sockopt::ReceiveTimestampns, ControlMessageOwned, MsgFlags, RecvMsg,
+    SockaddrStorage,
+};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::{io::unix::AsyncFd, time::timeout};
+use tokio::{net::UdpSocket, time::timeout};
 use tracing::{info, warn};
 
 /// Re-join the multicast group(s) if no datagram arrives for this long. Guards against a join
@@ -66,9 +69,10 @@ use crate::{
     model::{now_ns, DepthSnapshot, FeedMessage, FeedStatus, InstrumentSnapshot},
 };
 
-/// A multicast socket with kernel RX software timestamps enabled. `pub` so the shred forwarder
-/// (`crate::shred`) can reuse [`bind_multicast`] without re-deriving the socket plumbing.
-pub type TsSocket = AsyncFd<std::net::UdpSocket>;
+/// A multicast socket, with kernel RX software timestamps enabled on Linux and Android. `pub` so the
+/// shred forwarder (`crate::shred`) can reuse [`bind_multicast`] without re-deriving the socket
+/// plumbing.
+pub type TsSocket = UdpSocket;
 
 /// The role a feed's port plays. The market-data feed is what the liveness watchdog tracks
 /// (reference/snapshot ports keep ticking even when market data is wedged); a processor uses the
@@ -575,11 +579,12 @@ fn emit_status(arbiter: &SharedArbiter, status: StatusKey, up: bool, stale_ms: u
 /// taken in the driver softirq before user-space), or 0 if the kernel did not attach one.
 /// `user_recv_ns` is the wall clock sampled right after the syscall returns - the
 /// user-space arrival, kept so the kernel-vs-userspace jitter can be quantified.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 async fn recv_with_ts(sock: &TsSocket, buf: &mut [u8]) -> Result<(usize, u64, u64, IpAddr)> {
     loop {
-        let mut guard = sock.readable().await?;
-        let res = guard.try_io(|inner| {
-            let fd = inner.get_ref().as_raw_fd();
+        sock.readable().await?;
+        let res = sock.try_io(tokio::io::Interest::READABLE, || {
+            let fd = sock.as_raw_fd();
             let mut iov = [std::io::IoSliceMut::new(buf)];
             let mut cmsg = nix::cmsg_space!(nix::sys::time::TimeSpec);
             let r = recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsg), MsgFlags::empty())
@@ -589,11 +594,18 @@ async fn recv_with_ts(sock: &TsSocket, buf: &mut [u8]) -> Result<(usize, u64, u6
             Ok((r.bytes, kernel_ns, src))
         });
         match res {
-            Ok(Ok((n, kernel_ns, src))) => return Ok((n, kernel_ns, now_ns(), src)),
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_would_block) => continue,
+            Ok((n, kernel_ns, src)) => return Ok((n, kernel_ns, now_ns(), src)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// Without `SO_TIMESTAMPNS` (Linux and Android only) there is never a kernel timestamp.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+async fn recv_with_ts(sock: &TsSocket, buf: &mut [u8]) -> Result<(usize, u64, u64, IpAddr)> {
+    let (n, src) = sock.recv_from(buf).await?;
+    Ok((n, 0, now_ns(), src.ip()))
 }
 
 /// The `SCM_TIMESTAMPNS` timestamp `recvmsg` attached, or 0 if none.
@@ -610,15 +622,10 @@ fn kernel_rx_ns(r: &RecvMsg<'_, '_, SockaddrStorage>) -> u64 {
     kernel_ns
 }
 
-/// Without `SO_TIMESTAMPNS` (Linux and Android only) there is never a kernel timestamp.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn kernel_rx_ns(_: &RecvMsg<'_, '_, SockaddrStorage>) -> u64 {
-    0
-}
-
 /// The source IP address of a received datagram (its `recvmsg` source address), used to demultiplex
 /// independent publishers that mirror one feed onto the same multicast group. Falls back to
 /// `0.0.0.0` if the kernel attached no source address.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn datagram_src_ip(addr: Option<SockaddrStorage>) -> IpAddr {
     addr.and_then(|a| a.as_sockaddr_in().map(|s| IpAddr::V4(s.ip())))
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
@@ -721,9 +728,7 @@ pub fn bind_multicast(
     if let Err(e) = setsockopt(&std_sock, ReceiveTimestampns, &true) {
         warn!("SO_TIMESTAMPNS unavailable on port {port}: {e}; using user-space recv ts only");
     }
-    // SAFETY: `std_sock` owns its descriptor, which stays open and unchanged until the
-    // `AsyncFd` drops it; nothing takes the socket back out through `get_mut`/`into_inner`.
-    Ok(unsafe { AsyncFd::register(std_sock) }?)
+    Ok(UdpSocket::from_std(std_sock)?)
 }
 
 /// Outcome of checking a datagram's header against the per-channel sequence tracker.
@@ -1210,13 +1215,13 @@ pub async fn run_feed(
 mod tests {
     use std::{
         collections::BTreeSet,
-        net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+        net::{IpAddr, Ipv4Addr},
     };
 
     use super::{
-        datagram_src_ip, emit_status, init_feed_health, record_revealed, revealed_ids_for,
-        status_targets, DatagramCtx, FeedMessage, PortRole, ReceiverRegistration, SeqCheck,
-        SeqTracker, SharedArbiter, SockaddrStorage,
+        emit_status, init_feed_health, record_revealed, revealed_ids_for, status_targets,
+        DatagramCtx, FeedMessage, PortRole, ReceiverRegistration, SeqCheck, SeqTracker,
+        SharedArbiter,
     };
     use crate::metrics::metrics;
 
@@ -1909,8 +1914,13 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn datagram_src_ip_extracts_v4() {
+        use std::net::{SocketAddr, SocketAddrV4};
+
+        use super::{datagram_src_ip, SockaddrStorage};
+
         let sa = SockaddrStorage::from(SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::new(10, 0, 0, 5),
             1234,
@@ -1921,8 +1931,10 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn datagram_src_ip_defaults_when_absent() {
+        use super::datagram_src_ip;
         assert_eq!(datagram_src_ip(None), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
 
@@ -1935,8 +1947,7 @@ mod tests {
         rx.set_nonblocking(true).unwrap();
         setsockopt(&rx, ReceiveTimestampns, &true).unwrap();
         let to = rx.local_addr().unwrap();
-        // SAFETY: `rx` owns its descriptor for the life of the `AsyncFd`.
-        let sock = unsafe { tokio::io::unix::AsyncFd::register(rx) }.unwrap();
+        let sock = tokio::net::UdpSocket::from_std(rx).unwrap();
         let before = crate::model::now_ns();
         let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         tx.send_to(b"x", to).unwrap();
@@ -1946,6 +1957,16 @@ mod tests {
             (before..=user_ns).contains(&kernel_ns),
             "kernel {kernel_ns} outside [{before}, {user_ns}]"
         );
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[tokio::test]
+    async fn recv_with_ts_has_no_kernel_rx_timestamp_elsewhere() {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.send_to(b"x", sock.local_addr().unwrap()).unwrap();
+        let (n, kernel_ns, _, src) = super::recv_with_ts(&sock, &mut [0u8; 8]).await.unwrap();
+        assert_eq!((n, kernel_ns, src), (1, 0, tx.local_addr().unwrap().ip()));
     }
 
     #[test]

@@ -18,6 +18,7 @@
 //! the clean source_id=2 slice of the 2026-06-30 capture; see `fixtures/PROVENANCE.md`). They are
 //! the live-data half of verification item #1 (public `tradeSequenceNumber` == edge `trade_id`):
 //! the codec golden pins the edge ids, and these prove the input keys dedup on the same identity.
+#![cfg(unix)] // Multicast ingest is unsupported on Windows.
 
 mod common;
 

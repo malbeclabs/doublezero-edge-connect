@@ -40,7 +40,6 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 socket2 = { version = "0.6", features = ["all"] }
-nix = { version = "0.31", features = ["time", "socket", "net", "uio"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
@@ -56,6 +55,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # handler (no HTTP framework — see `sinks::metrics`). `default-features = false` drops the unused
 # protobuf encoder; `process` adds the Linux process collector (CPU/RSS/fds) for free.
 prometheus = { version = "0.14", default-features = false, features = ["process"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["time", "socket", "net", "uio"] }
+
+[target.'cfg(windows)'.dependencies]
+# `now_mono_ns` needs the raw `QueryPerformanceCounter` value, which std's `Instant` hides.
+windows-sys = { version = "0.61", features = ["Win32_System_Performance"] }
 
 [dev-dependencies]
 serial_test = "4"

@@ -309,8 +309,8 @@ async fn receiver_task(
         info!(%group, port, %iface, %iface_ip, recv_buf, "shred multicast receiver bound");
 
         loop {
-            let mut guard = match timeout(IDLE_REJOIN, sock.readable()).await {
-                Ok(Ok(g)) => g,
+            match timeout(IDLE_REJOIN, sock.readable()).await {
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     warn!(%group, %e, "shred recv readiness error; rejoining");
                     continue 'rejoin;
@@ -320,10 +320,10 @@ async fn receiver_task(
                           "no shreds; re-resolving interface and rejoining");
                     continue 'rejoin;
                 }
-            };
-            match guard.try_io(|s| s.get_ref().recv(&mut buf)) {
-                Ok(Ok(0)) => {} // empty datagram: nothing to forward
-                Ok(Ok(n)) => {
+            }
+            match sock.try_recv(&mut buf) {
+                Ok(0) => {} // empty datagram: nothing to forward
+                Ok(n) => {
                     // A datagram that exactly fills the buffer was truncated by `recv` (no
                     // MSG_TRUNC requested, so the tail is silently lost). Solana shreds are well
                     // under 2048B, so this is mis-bound / unexpected traffic rather than a real
@@ -363,7 +363,7 @@ async fn receiver_task(
                         }
                     }
                 }
-                Ok(Err(e)) => {
+                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
                     warn!(%group, %e, "shred recv error; rejoining");
                     continue 'rejoin;
                 }
@@ -705,7 +705,9 @@ mod tests {
     // harness: multicast-loopback on, TTL 1, no pinned interface — locally-sent datagrams reach a
     // `--iface 0.0.0.0` receiver without `lo` needing the MULTICAST flag.
     // (`UdpSocket`/`timeout` come from the module-scope `use` via `use super::*`.)
+    // The ones that join a group are compiled out on Windows, where multicast ingest is unsupported.
 
+    #[cfg(unix)]
     async fn loopback_sender() -> UdpSocket {
         let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
         sock.set_multicast_loop_v4(true).unwrap();
@@ -716,6 +718,7 @@ mod tests {
     /// Spawn `run` with the given config, then send probe datagrams to `dst` until `probe_listener`
     /// receives one — proving the receiver has joined the group — and drain the probes. Returns the
     /// sender so the caller can send the real batch.
+    #[cfg(unix)]
     async fn warmup(sender: &UdpSocket, dst: SocketAddrV4, probe_listener: &UdpSocket) {
         let mut buf = [0u8; 2048];
         for _ in 0..100 {
@@ -750,6 +753,7 @@ mod tests {
         n
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn fan_out_delivers_to_all_destinations() {
         let l1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -795,6 +799,7 @@ mod tests {
         handle.abort();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn dead_destination_does_not_block_live_one() {
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();

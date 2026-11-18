@@ -1260,11 +1260,30 @@ pub fn now_ns() -> u64 {
 /// NTP steps/slew. Pair with `now_ns()` (wall clock) only to correlate with `source_ts`.
 /// Also the arrival clock the shred forwarder stamps per datagram for its cross-group lead-time
 /// metric (single process, so monotonic ns are directly comparable and immune to NTP steps).
+#[cfg(unix)]
 pub fn now_mono_ns() -> u64 {
     use nix::time::{clock_gettime, ClockId};
     clock_gettime(ClockId::CLOCK_MONOTONIC)
         .map(|ts| (ts.tv_sec() as u64) * 1_000_000_000 + ts.tv_nsec() as u64)
         .unwrap_or(0)
+}
+
+/// Windows' `CLOCK_MONOTONIC`. `QueryPerformanceCounter` counts from boot, so like the Unix clock
+/// it is already large when a process starts: callers read 0 as "long ago".
+#[cfg(windows)]
+pub fn now_mono_ns() -> u64 {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+    let (mut ticks, mut freq) = (0i64, 0i64);
+    // SAFETY: each call writes only the `i64` it is handed.
+    let ok = unsafe {
+        QueryPerformanceCounter(&mut ticks) != 0 && QueryPerformanceFrequency(&mut freq) != 0
+    };
+    if !ok || freq <= 0 {
+        return 0;
+    }
+    (ticks as u128 * 1_000_000_000 / freq as u128) as u64
 }
 
 #[cfg(test)]
@@ -2287,6 +2306,21 @@ mod tests {
             orders.iter().map(|c| c.order_id).collect::<Vec<_>>(),
             vec![1, 2],
             "every resting order, deterministically ordered"
+        );
+    }
+
+    /// Pins the tick-to-nanosecond conversion against an `Instant` interval bracketing the reads.
+    #[test]
+    fn now_mono_ns_advances_in_step_with_instant() {
+        let sleep = std::time::Duration::from_millis(20);
+        let outer = std::time::Instant::now();
+        let start = now_mono_ns();
+        std::thread::sleep(sleep);
+        let mono = now_mono_ns() - start;
+        let outer = outer.elapsed().as_nanos() as u64;
+        assert!(
+            (sleep.as_nanos() as u64 / 2..=outer + outer / 100).contains(&mono),
+            "mono advanced {mono} ns over a {sleep:?} sleep; the Instant around it saw {outer} ns"
         );
     }
 }

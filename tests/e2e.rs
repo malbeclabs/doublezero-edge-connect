@@ -1,3 +1,5 @@
+#![cfg(unix)] // Multicast ingest is unsupported on Windows.
+
 mod common;
 
 use common::{assertions, bridge::Bridge, replay, ws_client};

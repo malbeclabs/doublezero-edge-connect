@@ -14,6 +14,7 @@
 //!
 //! Both reuse the BTC single-publisher golden (`tob_refdata.bin` / `tob_marketdata.bin`, venue
 //! Hyperliquid) so the public coin `BTC` shares the edge feed's `(venue, symbol)` floor.
+#![cfg(unix)] // Multicast ingest is unsupported on Windows.
 
 mod common;
 
