@@ -2413,8 +2413,13 @@ impl Arbiter {
                 }
                 FeedMessage::Trade(t) => {
                     if let Some(key) = trade_key(t) {
-                        crate::model::lock(map).entry(key).or_default().trade =
-                            Some(TradeEntry::of(t));
+                        // Broadcast regardless; the map keeps only the newest print.
+                        let incoming = TradeEntry::of(t);
+                        let mut map = crate::model::lock(map);
+                        let held = &mut map.entry(key).or_default().trade;
+                        if held.is_none_or(|h| incoming.supersedes(&h)) {
+                            *held = Some(incoming);
+                        }
                     }
                 }
                 _ => {}
@@ -10808,6 +10813,106 @@ mod tests {
         dup.recv_ts_ns = 9_000;
         a.emit(FeedMessage::Trade(dup), edge(2), TEST_CATEGORY);
         assert_eq!(held_trade(&map, &with_id).unwrap().as_of_ns, 2_000);
+    }
+
+    /// `trade` on instrument 1 with `trade_id`, venue time `source_ts_ns` and price `price`.
+    fn timed_trade(trade_id: u64, source_ts_ns: u64, price: f64) -> NormalizedTrade {
+        NormalizedTrade {
+            instrument_id: 1,
+            source_ts_ns,
+            price,
+            recv_ts_ns: source_ts_ns + 5,
+            ..trade(trade_id)
+        }
+    }
+
+    /// The trade dedup admits any id it has not seen, in arrival order, so a mirror's late copy
+    /// of an older print is still broadcast. The map answers "what was the last trade", so that
+    /// older print must not replace the newer one it already holds.
+    #[test]
+    fn an_older_trade_does_not_replace_a_newer_one() {
+        let (mut a, mut rx, map) = mapped();
+        let six = timed_trade(6, 2_000, 101.0);
+        a.emit(FeedMessage::Trade(six.clone()), edge(1), TEST_CATEGORY);
+        a.emit(
+            FeedMessage::Trade(timed_trade(5, 1_000, 100.0)),
+            edge(2),
+            TEST_CATEGORY,
+        );
+        let mut broadcast = 0;
+        while let Ok(m) = rx.try_recv() {
+            broadcast += matches!(&*m, FeedMessage::Trade(_)) as usize;
+        }
+        assert_eq!(broadcast, 2, "both prints still reach the wire");
+        let held = held_trade(&map, &six).unwrap();
+        assert_eq!((held.trade_id, held.price), (6, 101.0));
+    }
+
+    /// The id-less send point (`trade_id == 0`) orders by venue time the same way.
+    #[test]
+    fn an_older_id_less_trade_does_not_replace_a_newer_one() {
+        let (mut a, _rx, map) = mapped();
+        let newer = timed_trade(0, 2_000, 101.0);
+        a.emit(FeedMessage::Trade(newer.clone()), edge(1), TEST_CATEGORY);
+        a.emit(
+            FeedMessage::Trade(timed_trade(0, 1_000, 100.0)),
+            edge(1),
+            TEST_CATEGORY,
+        );
+        assert_eq!(held_trade(&map, &newer).unwrap().price, 101.0);
+    }
+
+    /// At equal venue times the trade id breaks the tie; a later time always replaces.
+    #[test]
+    fn trade_id_breaks_a_tie_in_venue_time() {
+        let (mut a, _rx, map) = mapped();
+        let t = timed_trade(8, 2_000, 101.0);
+        a.emit(FeedMessage::Trade(t.clone()), edge(1), TEST_CATEGORY);
+        a.emit(
+            FeedMessage::Trade(timed_trade(7, 2_000, 100.0)),
+            edge(1),
+            TEST_CATEGORY,
+        );
+        assert_eq!(
+            held_trade(&map, &t).unwrap().trade_id,
+            8,
+            "lower id at a tie"
+        );
+        a.emit(
+            FeedMessage::Trade(timed_trade(9, 2_000, 102.0)),
+            edge(1),
+            TEST_CATEGORY,
+        );
+        assert_eq!(
+            held_trade(&map, &t).unwrap().trade_id,
+            9,
+            "higher id at a tie"
+        );
+        a.emit(
+            FeedMessage::Trade(timed_trade(3, 3_000, 103.0)),
+            edge(1),
+            TEST_CATEGORY,
+        );
+        assert_eq!(
+            held_trade(&map, &t).unwrap().trade_id,
+            3,
+            "a later time wins"
+        );
+    }
+
+    /// A venue time of `0` means unavailable, so there is no order to keep: the latest arrival
+    /// replaces, as before.
+    #[test]
+    fn a_trade_without_venue_time_replaces_by_arrival() {
+        let (mut a, _rx, map) = mapped();
+        let t = timed_trade(6, 2_000, 101.0);
+        a.emit(FeedMessage::Trade(t.clone()), edge(1), TEST_CATEGORY);
+        a.emit(
+            FeedMessage::Trade(timed_trade(5, 0, 100.0)),
+            edge(1),
+            TEST_CATEGORY,
+        );
+        assert_eq!(held_trade(&map, &t).unwrap().trade_id, 5);
     }
 
     /// A quote and a trade for one instrument share one entry, each half kept by its own writer.

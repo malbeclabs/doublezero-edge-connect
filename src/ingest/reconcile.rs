@@ -1002,7 +1002,7 @@ impl Reconciler {
                 books_dropped,
                 values_dropped,
                 "channel left the channel filter's admitted set; dropped its catalog/book/history \
-                 state"
+                 and latest-values state"
             );
         }
     }

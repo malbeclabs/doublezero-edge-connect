@@ -81,6 +81,24 @@ impl TradeEntry {
             as_of_ns: t.recv_ts_ns,
         }
     }
+
+    /// Whether this trade is the newer print than `held`, so it may replace it as the last trade.
+    /// The trade dedup admits any id it has not seen, in arrival order, so a mirror's late copy
+    /// of an older print reaches here after the newer one. Venue time decides; at equal times the
+    /// trade id breaks the tie. Where either has no venue time (`0`), or no id at a tie, there is
+    /// no order to keep and the later arrival replaces.
+    pub fn supersedes(&self, held: &TradeEntry) -> bool {
+        if self.source_ts_ns == 0 || held.source_ts_ns == 0 {
+            return true;
+        }
+        if self.source_ts_ns != held.source_ts_ns {
+            return self.source_ts_ns > held.source_ts_ns;
+        }
+        if self.trade_id == 0 || held.trade_id == 0 {
+            return true;
+        }
+        self.trade_id > held.trade_id
+    }
 }
 
 /// One instrument's entry. Each half has its own writer and its own purges: a reset of the
