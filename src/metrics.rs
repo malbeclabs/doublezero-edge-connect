@@ -412,8 +412,9 @@ pub struct Metrics {
     /// Frames sent by the Binance-compatible sink, by `stream` kind (bookTicker/aggTrade/trade).
     pub binance_sink_messages: IntCounterVec,
     /// What the Binance-compatible sink did not send, by `reason`: `client_lagged` (one slow consumer
-    /// missed broadcast messages) or `unknown_aggressor` (a subscribed print with no aggressor side,
-    /// which Binance's schema cannot express).
+    /// missed messages), `prepare_lagged` (the shared stage fell behind the broadcast, so every
+    /// client missed them) or `unknown_aggressor` (a print with no aggressor side, which Binance's
+    /// schema cannot express).
     pub binance_sink_dropped: IntCounterVec,
 
     // --- Public WS inputs (per-venue backstops; off by default) ---

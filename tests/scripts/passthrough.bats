@@ -141,3 +141,15 @@ binance_listening() {
     bash "$SCRIPTS_DIR/connect.sh" ) >"$out" 2>&1 || { echo "# exited $?"; sed 's/^/#   /' "$out"; false; }
   ! grep -q 'Binance' "$out"
 }
+
+@test "an IPv6 host address is bracketed in the printed URLs (all scripts)" {
+  printf '#!/usr/bin/env bash\necho "2001:db8::1 203.0.113.9"\n' >"$STUB_BIN/hostname"
+  chmod +x "$STUB_BIN/hostname"
+  for s in "${SCRIPTS[@]}"; do
+    local out="$BATS_TEST_TMPDIR/$s.out"
+    ( common_env; export DZ_INSTALL_CLI=0 BINANCE_WS_BIND='[::]:8083' DZ_SUBSCRIPTION_REFRESH_SECS=0
+      binance_listening '[::]:8083'; bash "$SCRIPTS_DIR/$s.sh" ) >"$out" 2>&1 || { echo "# $s exited $?"; sed 's/^/#   /' "$out"; false; }
+    grep -q 'Binance spot *: ws://\[2001:db8::1\]:8083/spot' "$out" || { echo "# $s:"; sed 's/^/#   /' "$out"; false; }
+    ! grep -q 'ws://2001:db8::1:' "$out"
+  done
+}

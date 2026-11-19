@@ -766,6 +766,8 @@ fi
 # 8. status + management hints
 # ----------------------------------------------------------------------------
 HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"; HOST_IP="${HOST_IP:-localhost}"
+# Bracketed when IPv6, since every use is a URL host followed by a :port.
+case "$HOST_IP" in *:*) HOST_IP="[$HOST_IP]" ;; esac
 # Reflect any WS_BIND override in the printed URL (take the port after the last colon).
 [ -n "${WS_BIND:-}" ]  && WS_PORT="${WS_BIND##*:}"
 echo

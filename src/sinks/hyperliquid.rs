@@ -69,7 +69,7 @@ pub(super) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Capacity of the prepared-frame fan-out. A constant like every other limit here — this sink has no
 /// operator-tunable behaviour — and set well above the backbone's own shipped default, so this hop is
 /// never the one that drops a batch a client would otherwise have kept.
-const PREPARED_CAPACITY: usize = 4096;
+pub(super) const PREPARED_CAPACITY: usize = 4096;
 /// Shortest interval between one client's `l4Book` re-bootstraps — see `rebootstrap`.
 const REBOOTSTRAP_MIN_INTERVAL: Duration = Duration::from_secs(5);
 

@@ -14,7 +14,7 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -31,7 +31,7 @@ use tokio_tungstenite::{
     tungstenite::{
         handshake::server::{ErrorResponse, Request, Response},
         http::StatusCode,
-        Message as WsMessage,
+        Message as WsMessage, Utf8Bytes,
     },
     WebSocketStream,
 };
@@ -42,6 +42,7 @@ use super::{
     hyperliquid::{
         finish_close, inbound_allowed, inbound_limits, json, ms_or_now, ClientGuard,
         CLOSE_HANDSHAKE_TIMEOUT, HANDSHAKE_TIMEOUT, HEARTBEAT, IDLE_TIMEOUT, MAX_CLIENTS,
+        PREPARED_CAPACITY,
     },
 };
 use crate::{
@@ -300,9 +301,11 @@ fn unscaled(v: f64) -> String {
 
 /// Bid price, bid size, ask price and ask size.
 fn quote_values(q: &NormalizedQuote) -> [String; 4] {
-    let w = &q.wire;
-    if *w == QuoteWire::default() {
-        return [q.bid, q.bid_size, q.ask, q.ask_size].map(unscaled);
+    let (w, scaled) = (&q.wire, [q.bid, q.bid_size, q.ask, q.ask_size]);
+    // An all-zero wire is also a real empty book at integer precision, so only values it could not
+    // have produced mark a quote that carries none.
+    if *w == QuoteWire::default() && scaled.iter().any(|v| *v != 0.0) {
+        return scaled.map(unscaled);
     }
     [
         fixed(w.bid_price.into(), w.price_exponent),
@@ -314,9 +317,9 @@ fn quote_values(q: &NormalizedQuote) -> [String; 4] {
 
 /// Price and quantity.
 fn trade_values(t: &NormalizedTrade) -> [String; 2] {
-    let w = &t.wire;
-    if *w == TradeWire::default() {
-        return [t.price, t.size].map(unscaled);
+    let (w, scaled) = (&t.wire, [t.price, t.size]);
+    if *w == TradeWire::default() && scaled.iter().any(|v| *v != 0.0) {
+        return scaled.map(unscaled);
     }
     [
         fixed(w.price.into(), w.price_exponent),
@@ -444,42 +447,109 @@ fn trade(t: &NormalizedTrade, kind: Kind, buyer_is_maker: bool, framing: Framing
     }
 }
 
-/// Every frame one broadcast message produces for this connection. Another Source ID is another
-/// engine, never rendered here even under the same symbol.
-fn frames(msg: &FeedMessage, engine: Engine, framing: Framing, subs: &Subs) -> Vec<(Kind, String)> {
-    match msg {
-        FeedMessage::Quote(q)
-            if q.source_id == engine.source_id() && subs.has(Kind::BookTicker, &q.symbol) =>
-        {
-            vec![(Kind::BookTicker, book_ticker(q, engine, framing))]
-        }
-        FeedMessage::Trade(t) if t.source_id == engine.source_id() => {
-            let kinds: Vec<Kind> = [Kind::AggTrade, Kind::Trade]
-                .into_iter()
-                .filter(|k| subs.has(*k, &t.symbol))
-                .collect();
-            if kinds.is_empty() {
-                return Vec::new();
-            }
+enum Event {
+    Quote(NormalizedQuote),
+    /// With Binance's `m`: whether the buyer was the maker.
+    Trade(NormalizedTrade, bool),
+}
+
+/// One Binance quote or print shared by every client. Each `(kind, framing)` is rendered at most
+/// once, by the first client that sends it, so N clients cost one render and a stream nobody
+/// subscribed to costs none.
+struct Prepared {
+    engine: Engine,
+    event: Event,
+    rendered: [OnceLock<Utf8Bytes>; 6],
+}
+
+impl Prepared {
+    /// `None` for anything but a quote or print from one of Binance's two engines.
+    fn new(msg: &FeedMessage) -> Option<Self> {
+        let id = match msg {
+            FeedMessage::Quote(q) => q.source_id,
+            FeedMessage::Trade(t) => t.source_id,
+            _ => return None,
+        };
+        let engine = [Engine::UsdM, Engine::Spot]
+            .into_iter()
+            .find(|e| e.source_id() == id)?;
+        let event = match msg {
+            FeedMessage::Quote(q) => Event::Quote(q.clone()),
             // `m` is the one field a consumer reads directionally, and Binance's schema has no
             // "unknown", so such a print is dropped rather than guessed.
-            let buyer_is_maker = match t.aggressor_side {
-                Side::Buy => false,
-                Side::Sell => true,
+            FeedMessage::Trade(t) => match t.aggressor_side {
+                Side::Buy => Event::Trade(t.clone(), false),
+                Side::Sell => Event::Trade(t.clone(), true),
                 Side::Unknown => {
                     metrics()
                         .binance_sink_dropped
                         .with_label_values(&["unknown_aggressor"])
                         .inc();
-                    return Vec::new();
+                    return None;
                 }
-            };
-            kinds
-                .into_iter()
-                .map(|k| (k, trade(t, k, buyer_is_maker, framing)))
-                .collect()
+            },
+            _ => return None,
+        };
+        Some(Self {
+            engine,
+            event,
+            rendered: Default::default(),
+        })
+    }
+
+    /// The frames one client is owed: the streams it subscribed to, on its own engine. Another
+    /// Source ID is another engine, never sent here even under the same symbol.
+    fn frames(&self, engine: Engine, framing: Framing, subs: &Subs) -> Vec<(Kind, Utf8Bytes)> {
+        if self.engine != engine {
+            return Vec::new();
         }
-        _ => Vec::new(),
+        let (symbol, kinds): (&str, &[Kind]) = match &self.event {
+            Event::Quote(q) => (&q.symbol, &[Kind::BookTicker]),
+            Event::Trade(t, _) => (&t.symbol, &[Kind::AggTrade, Kind::Trade]),
+        };
+        kinds
+            .iter()
+            .filter(|k| subs.has(**k, symbol))
+            .map(|&kind| {
+                let slot = &self.rendered[kind as usize * 2 + framing as usize];
+                let frame = slot.get_or_init(|| {
+                    match &self.event {
+                        Event::Quote(q) => book_ticker(q, engine, framing),
+                        Event::Trade(t, m) => trade(t, kind, *m, framing),
+                    }
+                    .into()
+                });
+                (kind, frame.clone())
+            })
+            .collect()
+    }
+}
+
+/// Filters the broadcast to Binance's quotes and prints once for every client, so other feeds'
+/// traffic wakes none of them.
+async fn prepare_loop(
+    mut backbone: broadcast::Receiver<Arc<FeedMessage>>,
+    out: broadcast::Sender<Arc<Prepared>>,
+) {
+    loop {
+        match backbone.recv().await {
+            Ok(m) => {
+                if out.receiver_count() == 0 {
+                    continue;
+                }
+                if let Some(p) = Prepared::new(&m) {
+                    let _ = out.send(Arc::new(p));
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!("binance sink prepare stage lagged, dropped {n}");
+                metrics()
+                    .binance_sink_dropped
+                    .with_label_values(&["prepare_lagged"])
+                    .inc();
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
     }
 }
 
@@ -495,6 +565,8 @@ pub async fn bind(addr: &str) -> Result<TcpListener> {
 /// Never returns an accept error: `main`'s `select!` would exit the process over it.
 pub async fn serve(listener: TcpListener, tx: broadcast::Sender<Arc<FeedMessage>>) -> Result<()> {
     let clients = Arc::new(AtomicUsize::new(0));
+    let (prepared, _) = broadcast::channel::<Arc<Prepared>>(PREPARED_CAPACITY);
+    tokio::spawn(prepare_loop(tx.subscribe(), prepared.clone()));
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -514,10 +586,10 @@ pub async fn serve(listener: TcpListener, tx: broadcast::Sender<Arc<FeedMessage>
             clients: clients.clone(),
             gauge: metrics().binance_sink_clients.clone(),
         };
-        let tx = tx.clone();
+        let prepared = prepared.clone();
         tokio::spawn(async move {
             let _guard = guard;
-            if let Err(e) = serve_client(stream, tx).await {
+            if let Err(e) = serve_client(stream, prepared).await {
                 warn!(%peer, "binance sink client ended: {e}");
             }
         });
@@ -559,7 +631,7 @@ async fn accept(stream: TcpStream) -> Result<(WebSocketStream<TcpStream>, Route)
     Ok((ws, route))
 }
 
-async fn serve_client(stream: TcpStream, tx: broadcast::Sender<Arc<FeedMessage>>) -> Result<()> {
+async fn serve_client(stream: TcpStream, prepared: broadcast::Sender<Arc<Prepared>>) -> Result<()> {
     let (
         ws,
         Route {
@@ -576,7 +648,7 @@ async fn serve_client(stream: TcpStream, tx: broadcast::Sender<Arc<FeedMessage>>
         send(&mut write, refused_streams(&refused), IDLE_TIMEOUT).await?;
     }
     // Only now, so nothing broadcast during the handshake reaches the client as if it were live.
-    let mut rx = tx.subscribe();
+    let mut rx = prepared.subscribe();
     let mut last_seen = Instant::now();
     let mut hb = tokio::time::interval(HEARTBEAT);
     let mut win_start = Instant::now();
@@ -614,10 +686,10 @@ async fn serve_client(stream: TcpStream, tx: broadcast::Sender<Arc<FeedMessage>>
             },
 
             msg = rx.recv() => match msg {
-                Ok(m) => {
-                    for (kind, frame) in frames(&m, engine, framing, &subs) {
+                Ok(p) => {
+                    for (kind, frame) in p.frames(engine, framing, &subs) {
                         metrics().binance_sink_messages.with_label_values(&[kind.name()]).inc();
-                        send(&mut write, text(frame), IDLE_TIMEOUT).await?;
+                        send(&mut write, WsMessage::Text(frame), IDLE_TIMEOUT).await?;
                     }
                 }
                 // Every frame here is a whole quote or a single print, so a gap costs the prints
@@ -783,6 +855,21 @@ mod tests {
 
     fn parse(frame: &str) -> Value {
         serde_json::from_str(frame).unwrap()
+    }
+
+    /// What one broadcast message yields for a client, through the shared stage.
+    fn frames(
+        msg: &FeedMessage,
+        engine: Engine,
+        framing: Framing,
+        subs: &Subs,
+    ) -> Vec<(Kind, String)> {
+        Prepared::new(msg).map_or_else(Vec::new, |p| {
+            p.frames(engine, framing, subs)
+                .into_iter()
+                .map(|(k, f)| (k, f.to_string()))
+                .collect()
+        })
     }
 
     fn text_of(m: &WsMessage) -> Value {
@@ -1092,6 +1179,15 @@ mod tests {
         assert_eq!(v["q"], "100000000.00000001");
     }
 
+    /// An all-zero wire is also a real quote: an empty book at integer precision.
+    #[test]
+    fn an_empty_book_at_integer_precision_renders_from_the_wire() {
+        let q = quote(6, "BTCUSDT", (0, 0), (0, 0), (0, 0));
+        assert_eq!(q.wire, QuoteWire::default(), "fixture sanity");
+        let v = parse(&book_ticker(&q, Engine::UsdM, Framing::Raw));
+        assert_eq!((v["b"].as_str(), v["B"].as_str()), (Some("0"), Some("0")));
+    }
+
     /// A quote with no wire values renders at Binance's finest precision rather than as integers.
     #[test]
     fn a_quote_without_wire_values_renders_at_eight_decimals() {
@@ -1154,6 +1250,26 @@ mod tests {
             v["data"],
             parse(&book_ticker(&usdsm_quote(), Engine::UsdM, Framing::Raw))
         );
+    }
+
+    /// N clients sharing a stream cost one render, not N.
+    #[test]
+    fn one_render_serves_every_client() {
+        let s = subs(&["btcusdt@bookTicker"]);
+        let p = Prepared::new(&FeedMessage::Quote(usdsm_quote())).unwrap();
+        let first = p.frames(Engine::UsdM, Framing::Raw, &s);
+        let second = p.frames(Engine::UsdM, Framing::Raw, &s);
+        assert_eq!(first[0].1.as_str().as_ptr(), second[0].1.as_str().as_ptr());
+    }
+
+    /// Other feeds never reach a client, so their traffic wakes none of them.
+    #[test]
+    fn only_binance_quotes_and_prints_are_forwarded() {
+        let mut hl = usdsm_quote();
+        hl.source_id = 1;
+        assert!(Prepared::new(&FeedMessage::Quote(hl)).is_none());
+        assert!(Prepared::new(&FeedMessage::Quote(usdsm_quote())).is_some());
+        assert!(Prepared::new(&FeedMessage::Trade(print(8, Side::Buy))).is_some());
     }
 
     /// Both engines list `BTCUSDT`: the path's Source ID is the only thing that keeps them apart.
@@ -1305,16 +1421,18 @@ mod tests {
         ))
         .await
         .unwrap();
-        // The client subscribes to the broadcast only once its handshake and URL streams are done.
-        timeout(WAIT, async {
-            while tx.receiver_count() == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        // The client subscribes only once its handshake and URL streams are done, so publish until
+        // a print reaches it.
+        let v = timeout(WAIT, async {
+            loop {
+                let _ = tx.send(Arc::new(FeedMessage::Trade(print(8, Side::Buy))));
+                if let Some(v) = next_text(&mut ws, Duration::from_millis(20)).await {
+                    return v;
+                }
             }
         })
         .await
         .unwrap();
-        let _ = tx.send(Arc::new(FeedMessage::Trade(print(8, Side::Buy))));
-        let v = next_text(&mut ws, WAIT).await.unwrap();
         assert_eq!(v["stream"], "btcusdt@trade");
         assert_eq!(v["data"]["t"], TRADE_ID);
         srv.abort();

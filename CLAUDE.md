@@ -1142,8 +1142,11 @@ Modules are grouped by role under `src/`:
   all-or-nothing ack would leave the client with no stream at all. Beyond `hyperliquid`'s limits,
   **every** inbound frame is charged against the cap (binary and pong included), every write is
   bounded by `IDLE_TIMEOUT` (a pending send also stalls the heartbeat and idle reap, so a peer that
-  stops reading would otherwise hold its slot for good), and the broadcast is subscribed only after
-  the handshake.
+  stops reading would otherwise hold its slot for good), and the client is subscribed only after
+  the handshake. Clients read a shared stage (`prepare_loop`) that forwards only Binance's quotes and
+  prints, so other feeds' traffic wakes none of them, and each `(kind, framing)` of a message is
+  rendered at most once, by the first client that sends it (`Prepared`): N clients cost one render
+  and an unsubscribed stream none.
 - **`sinks/api.rs`**'s `/v1/products` rows carry `book_complete` (the replay entry's `baselined()`,
   absent for a market with no book), read off the same `BookSnapshot` lookup `feed_kind` already makes.
   It is the one place a market withheld from every new WebSocket subscriber shows without the
