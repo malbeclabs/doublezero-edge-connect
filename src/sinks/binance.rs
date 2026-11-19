@@ -56,9 +56,6 @@ const MAX_STREAMS: usize = 1024;
 /// Longest symbol accepted in a stream name, which is retained per subscription.
 const MAX_SYMBOL_LEN: usize = 32;
 
-/// Longest refusal sent back, so a request naming thousands of streams cannot amplify itself.
-const MAX_REFUSAL_LEN: usize = 300;
-
 /// The exponent a value renders at when its instrument's is unknown: Binance's finest precision.
 const FALLBACK_EXPONENT: i8 = -8;
 
@@ -186,7 +183,8 @@ impl Subs {
         self.0.iter().map(HashSet::len).sum()
     }
 
-    /// Add or remove each named stream, returning the ones this sink cannot serve.
+    /// Add or remove each named stream, returning the ones a subscribe asked for and this sink
+    /// cannot serve. Removing a stream it never served is a no-op.
     fn apply<'a>(
         &mut self,
         streams: impl IntoIterator<Item = &'a Value>,
@@ -201,6 +199,7 @@ impl Subs {
                 Some((symbol, kind)) if self.has(kind, &symbol) || self.len() < MAX_STREAMS => {
                     self.0[kind as usize].insert(symbol);
                 }
+                _ if !add => {}
                 _ => refused.push(s.as_str().map_or_else(|| s.to_string(), str::to_string)),
             }
         }
@@ -237,15 +236,11 @@ fn refusal(code: i64, msg: &str) -> WsMessage {
 }
 
 fn refused_streams(refused: &[String]) -> WsMessage {
-    let mut msg = format!(
+    let msg = format!(
         "Invalid request: this sink serves <symbol>@bookTicker, <symbol>@aggTrade and \
          <symbol>@trade, at most {MAX_STREAMS} per connection; refused: {}",
         refused.join(", ")
     );
-    if let Some((cut, _)) = msg.char_indices().nth(MAX_REFUSAL_LEN) {
-        msg.truncate(cut);
-        msg.push('…');
-    }
     refusal(2, &msg)
 }
 
@@ -457,13 +452,6 @@ fn frames(
             vec![(Kind::BookTicker, book_ticker(q, engine, framing))]
         }
         FeedMessage::Trade(t) if t.source_id == engine.source_id() => {
-            // `m` is the one field a consumer reads directionally, and Binance's schema has no
-            // "unknown", so such a print is dropped rather than guessed.
-            let buyer_is_maker = match t.aggressor_side {
-                Side::Buy => false,
-                Side::Sell => true,
-                Side::Unknown => return Vec::new(),
-            };
             let kinds: Vec<Kind> = [Kind::AggTrade, Kind::Trade]
                 .into_iter()
                 .filter(|k| subs.has(*k, &t.symbol))
@@ -471,6 +459,19 @@ fn frames(
             if kinds.is_empty() {
                 return Vec::new();
             }
+            // `m` is the one field a consumer reads directionally, and Binance's schema has no
+            // "unknown", so such a print is dropped rather than guessed.
+            let buyer_is_maker = match t.aggressor_side {
+                Side::Buy => false,
+                Side::Sell => true,
+                Side::Unknown => {
+                    metrics()
+                        .binance_sink_dropped
+                        .with_label_values(&["unknown_aggressor"])
+                        .inc();
+                    return Vec::new();
+                }
+            };
             let exponents = trade_exponents(instruments, t);
             kinds
                 .into_iter()
@@ -1000,11 +1001,21 @@ mod tests {
         assert_eq!(s.len(), MAX_STREAMS);
     }
 
+    /// Nautilus's Rust clients unsubscribe their refused `@depth` stream on stop, which must not
+    /// draw a second refusal.
     #[test]
-    fn a_huge_refusal_is_truncated() {
-        let refused: Vec<String> = (0..5_000).map(|i| format!("s{i}@depth")).collect();
-        let v = text_of(&refused_streams(&refused));
-        assert!(v["msg"].as_str().unwrap().chars().count() <= MAX_REFUSAL_LEN + 1);
+    fn an_unsubscribe_of_an_unserved_stream_is_acknowledged() {
+        let mut s = subs(&["btcusdt@bookTicker"]);
+        let out = control(
+            r#"{"method":"UNSUBSCRIBE","params":["btcusdt@depth@0ms"],"id":6}"#,
+            &mut s,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            text_of(&out[0]),
+            serde_json::json!({"result": null, "id": 6})
+        );
+        assert!(s.has(Kind::BookTicker, "BTCUSDT"));
     }
 
     // --- frames ---
@@ -1160,12 +1171,18 @@ mod tests {
         assert_eq!(parse(&unknown[0].1)["p"], "61825.50000000");
     }
 
-    /// Binance's schema has no "unknown" aggressor, and `m` is read directionally.
+    /// Binance's schema has no "unknown" aggressor, and `m` is read directionally. Counted, so a
+    /// publisher stamping none is not mistaken for a quiet tape.
     #[test]
-    fn a_print_with_no_known_aggressor_is_dropped() {
+    fn a_print_with_no_known_aggressor_is_dropped_and_counted() {
+        let dropped = metrics()
+            .binance_sink_dropped
+            .with_label_values(&["unknown_aggressor"]);
+        let before = dropped.get();
         let s = subs(&["btcusdt@aggTrade"]);
         let m = FeedMessage::Trade(print(6, Side::Unknown));
         assert!(frames(&m, Engine::UsdM, Framing::Raw, &s, &catalog(-2, -3)).is_empty());
+        assert_eq!(dropped.get() - before, 1);
     }
 
     // --- golden frames (pinned here, parsed as Nautilus parses them by tests/binance_sink_shapes.rs) ---

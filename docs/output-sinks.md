@@ -134,7 +134,7 @@ Like the Hyperliquid sink, it is a rendering, not a second protocol. Nothing abo
 | `/usdsm/stream` | The same | `{"stream":…,"data":…}`, like Binance's `/stream` |
 | `/spot`, `/spot/ws` or `/spot/stream` | Spot (Source ID 8, `edge-binance-spot-tob`) | As above |
 
-Name streams in a `SUBSCRIBE` (`{"method":"SUBSCRIBE","params":["btcusdt@bookTicker"],"id":1}`, acknowledged with `{"result":null,"id":1}`) or in the URL (`/stream?streams=btcusdt@bookTicker/btcusdt@trade`). Either path serves three streams, at most 1,024 per connection:
+Name streams in a `SUBSCRIBE` (`{"method":"SUBSCRIBE","params":["btcusdt@bookTicker"],"id":1}`, acknowledged with `{"result":null,"id":1}`) or in the URL (`/spot/stream?streams=btcusdt@bookTicker/btcusdt@trade`). Either path serves three streams, at most 1,024 per connection:
 
 | Stream | Frame |
 |---|---|
@@ -142,7 +142,9 @@ Name streams in a `SUBSCRIBE` (`{"method":"SUBSCRIBE","params":["btcusdt@bookTic
 | `<symbol>@aggTrade` | Our `trade`, one execution per frame. |
 | `<symbol>@trade` | Our `trade`. |
 
-Any other stream (`@depth`, `@markPrice`, `@kline_…`, tickers, the all-market streams) or method is refused with `{"code":2,"msg":…}` naming it. The refusal carries **no `id`**: NautilusTrader's futures client reads any frame with an `id` as an acknowledgement, and would mark the refused stream subscribed. Nautilus's Rust clients log the refusal as a WebSocket error. Its Python client skips any frame without a `stream`, so there a refused stream is just silent.
+A `SUBSCRIBE` naming any other stream (`@depth`, `@markPrice`, `@kline_…`, tickers, the all-market streams), or any other method, is refused with `{"code":2,"msg":…}` naming it; an `UNSUBSCRIBE` naming one is simply acknowledged. The refusal carries **no `id`**: NautilusTrader's futures client reads any frame with an `id` as an acknowledgement, and would mark the refused stream subscribed. Nautilus's Rust clients log the refusal as a WebSocket error. Its Python client skips any frame without a `stream`, so there the refusal is silent.
+
+**Subscribe to quotes and trades, not order books.** This sink serves no depth. A Rust node's book stays empty, but a Python node's is worse: it takes Binance's REST snapshot and never receives an update, so it sits frozen beside live quotes from this feed.
 
 **What the feed cannot supply.** These fields are placeholders, and a consumer must not read meaning into them:
 
@@ -150,7 +152,7 @@ Any other stream (`@depth`, `@markPrice`, `@kline_…`, tickers, the all-market 
 - Each `aggTrade` frame is a single execution: `a`, `f` and `l` all carry Binance's raw trade id, which is also `trade`'s `t`. A consumer therefore sees more prints than Binance's own aggregated stream sends.
 - `E` and `T` both carry the venue time in milliseconds, or the send time when the venue gave none.
 
-A print whose aggressor side is unknown is dropped, since `m` has no "unknown". An empty side of the book renders as a zero price and size, and Nautilus's Rust spot client logs and skips such a quote. Prices and quantities carry the instrument's declared precision, trailing zeros included, as Binance formats them. Nautilus's Python client takes a value's precision from its string, so `101` beside `100.5` would fail the quote.
+A print whose aggressor side is unknown is dropped, since `m` has no "unknown", and counted as `dz_binance_sink_dropped_total{reason="unknown_aggressor"}`. An empty side of the book renders as a zero price and size, and Nautilus's Rust spot client logs and skips such a quote. Prices and quantities carry the instrument's declared precision, trailing zeros included, as Binance formats them. Nautilus's Python client takes a value's precision from its string, so `101` beside `100.5` would fail the quote.
 
 **Pointing NautilusTrader v1.231.0 at it.** Instruments still load from Binance's REST API, so leave `base_url_http` at its default; only the WebSocket moves. Leave `api_key` unset on the Rust futures data client: it sends the key to the WebSocket as a header, in clear text over `ws://`.
 
