@@ -1124,7 +1124,9 @@ Modules are grouped by role under `src/`:
   bare events (Nautilus's futures client uses its base URL verbatim) and `/stream` wraps them (its spot
   and Python clients append `/stream`). Four traps, each checked against that source:
   ⚠️ **prices and quantities render at the instrument's declared precision, trailing zeros kept** —
-  the quote's `QuoteWire` exponents, a trade's from the instrument catalog — because the Python client
+  from the wire integers (`QuoteWire`, and `TradeWire` on a trade), never the scaled `f64`s, which
+  round past ~15 significant digits, nor the instrument catalog, which can already hold a later
+  definition than the one a queued print was scaled with — because the Python client
   takes a value's precision from its string, `QuoteTick` refuses a bid and ask of different precision,
   and the risk engine refuses an order more precise than the instrument; `hyperliquid`'s trimmed
   `num()` breaks the first, a fixed padding the last. ⚠️ **A refusal carries no `id`**: the futures
@@ -1134,7 +1136,14 @@ Modules are grouped by role under `src/`:
   set, so every later subscribe on that client waits forever. Only an unknown path or query parameter
   fails the handshake. ⚠️ **Placeholders**: `u` is `0` (the feed carries only its low 32 bits, and
   Nautilus's book reads a sequence of `0` as none), and each `aggTrade` is one execution with `a`, `f`
-  and `l` all the raw trade id — the publishers decode Binance's per-execution `@trade` topic.
+  and `l` all the raw trade id — the publishers decode Binance's per-execution `@trade` topic. A
+  `SUBSCRIBE` naming a refused stream beside served ones is still acknowledged: after a reconnect
+  Nautilus re-sends every topic, never-acknowledged ones included, in one request, so an
+  all-or-nothing ack would leave the client with no stream at all. Beyond `hyperliquid`'s limits,
+  **every** inbound frame is charged against the cap (binary and pong included), every write is
+  bounded by `IDLE_TIMEOUT` (a pending send also stalls the heartbeat and idle reap, so a peer that
+  stops reading would otherwise hold its slot for good), and the broadcast is subscribed only after
+  the handshake.
 - **`sinks/api.rs`**'s `/v1/products` rows carry `book_complete` (the replay entry's `baselined()`,
   absent for a market with no book), read off the same `BookSnapshot` lookup `feed_kind` already makes.
   It is the one place a market withheld from every new WebSocket subscriber shows without the

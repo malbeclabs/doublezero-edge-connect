@@ -779,14 +779,7 @@ async fn main() -> Result<()> {
         None
     } else {
         match sinks::binance::bind(&args.binance_ws_bind).await {
-            Ok(listener) => {
-                let (tx, instruments) = (tx.clone(), instruments.clone());
-                Some(tokio::spawn(sinks::binance::serve(
-                    listener,
-                    tx,
-                    instruments,
-                )))
-            }
+            Ok(listener) => Some(tokio::spawn(sinks::binance::serve(listener, tx.clone()))),
             Err(e) => {
                 warn!(bind = %args.binance_ws_bind, "Binance-compatible sink disabled: {e}");
                 None

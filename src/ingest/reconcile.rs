@@ -2973,6 +2973,7 @@ mod tests {
             recv_ts_ns,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            wire: Default::default(),
         }
     }
 

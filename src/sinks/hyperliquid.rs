@@ -1681,6 +1681,7 @@ mod tests {
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            wire: Default::default(),
             category: TEST_CATEGORY.into(),
         }
     }

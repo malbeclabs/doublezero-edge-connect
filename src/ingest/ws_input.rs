@@ -373,6 +373,7 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         recv_ts_ns: now_ns(),
         kernel_rx_ts_ns: 0,
         ws_send_ts_ns: 0,
+        wire: Default::default(),
     };
     metrics()
         .ws_input_messages

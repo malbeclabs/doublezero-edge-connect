@@ -254,6 +254,7 @@ pub struct NormalizedQuote {
 /// `DatagramCtx::canonical_channel`, so a mirror publisher's offset channel keys with its primary.
 /// The raw integers let two copies of one ID be compared exactly under equal exponents, where the
 /// scaled values round; under different exponents the copies are definition skew, not a conflict.
+/// `sinks::binance` renders from them too, for the same reason.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QuoteWire {
     pub channel: u8,
@@ -320,6 +321,21 @@ pub struct NormalizedTrade {
     /// Wall clock (ns since epoch) stamped by the WS server just before send; 0 until stamped.
     #[serde(default)]
     pub ws_send_ts_ns: u64,
+    /// Producer-side and never serialized, like `category`. See [`TradeWire`].
+    #[serde(skip)]
+    pub wire: TradeWire,
+}
+
+/// A trade's raw wire price and quantity under the exponents the edge decoder scaled them with, all
+/// zero from any other input. `sinks::binance` renders the exact decimal from these: the scaled
+/// `f64`s round past ~15 significant digits, and the catalog can hold a later definition than this
+/// print's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TradeWire {
+    pub price: i64,
+    pub qty: u64,
+    pub price_exponent: i8,
+    pub qty_exponent: i8,
 }
 
 /// A normalized derived mid price for an instrument (from the Midpoint feed). Like a

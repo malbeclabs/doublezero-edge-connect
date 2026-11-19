@@ -172,7 +172,7 @@ BinanceDataClientConfig { product_type: BinanceProductType::Spot, spot_market_da
 
 Give each client its engine's base path, nothing more: the Rust futures client reads bare events and silently drops wrapped ones from `/usdsm/stream`, and the Python client appends `/stream` itself.
 
-Client limits are the Hyperliquid sink's: 64 clients, 600 inbound frames per minute, and a 20s heartbeat with a 60s idle reap. A slow client misses messages and is counted rather than disconnected, since every frame is a whole quote or one print. Observability is `dz_binance_sink_clients`, `dz_binance_sink_messages_total{stream}` and `dz_binance_sink_dropped_total{reason}`. There is **no TLS**.
+Client limits are the Hyperliquid sink's: 64 clients, 600 inbound frames per minute, and a 20s heartbeat with a 60s idle reap. Every inbound frame counts against that limit, whatever its kind. A client that falls behind misses messages and is counted rather than disconnected, since every frame is a whole quote or one print; one that stops reading for 60s is disconnected. Observability is `dz_binance_sink_clients`, `dz_binance_sink_messages_total{stream}` and `dz_binance_sink_dropped_total{reason}`. There is **no TLS**.
 
 ## Metrics (Prometheus)
 

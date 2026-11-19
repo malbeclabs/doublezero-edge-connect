@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -37,17 +37,17 @@ use tokio_tungstenite::{
 };
 use tracing::{info, warn};
 
-use super::hyperliquid::{
-    finish_close, inbound_allowed, inbound_limits, json, ms_or_now, ClientGuard,
-    CLOSE_HANDSHAKE_TIMEOUT, HANDSHAKE_TIMEOUT, HEARTBEAT, IDLE_TIMEOUT, MAX_CLIENTS,
+use super::{
+    http::parse_query_params,
+    hyperliquid::{
+        finish_close, inbound_allowed, inbound_limits, json, ms_or_now, ClientGuard,
+        CLOSE_HANDSHAKE_TIMEOUT, HANDSHAKE_TIMEOUT, HEARTBEAT, IDLE_TIMEOUT, MAX_CLIENTS,
+    },
 };
 use crate::{
     ingest::sources::{BINANCE_SPOT_SOURCE_ID, BINANCE_USDSM_SOURCE_ID},
     metrics::metrics,
-    model::{
-        FeedMessage, InstrumentSnapshot, NormalizedQuote, NormalizedTrade, QuoteWire, Side,
-        SourceKey,
-    },
+    model::{FeedMessage, NormalizedQuote, NormalizedTrade, QuoteWire, Side, TradeWire},
 };
 
 /// Binance's own per-connection stream limit.
@@ -56,8 +56,8 @@ const MAX_STREAMS: usize = 1024;
 /// Longest symbol accepted in a stream name, which is retained per subscription.
 const MAX_SYMBOL_LEN: usize = 32;
 
-/// The exponent a value renders at when its instrument's is unknown: Binance's finest precision.
-const FALLBACK_EXPONENT: i8 = -8;
+/// Pause after a failed accept, so a persistent error such as `EMFILE` cannot spin a worker.
+const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 
 const NOT_FOUND: &str = "not found: connect to /usdsm (Binance USD-M perpetuals, Source ID 6) or \
                          /spot (Binance spot, Source ID 8)\n";
@@ -113,19 +113,15 @@ fn route(path: &str, query: Option<&str>) -> Result<Route, (StatusCode, &'static
         _ => return Err((StatusCode::NOT_FOUND, NOT_FOUND)),
     };
     let mut streams = Vec::new();
-    for param in query
-        .unwrap_or_default()
-        .split('&')
-        .filter(|p| !p.is_empty())
-    {
+    for (key, names) in parse_query_params(query.unwrap_or_default()) {
         // Binance also takes `timeUnit`; ignoring it would serve milliseconds to a client expecting
         // microseconds.
-        let Some(("streams", names)) = param.split_once('=') else {
+        if key != "streams" {
             return Err((
                 StatusCode::BAD_REQUEST,
                 "unsupported query parameter: only streams= is supported\n",
             ));
-        };
+        }
         streams.extend(
             names
                 .split('/')
@@ -278,36 +274,54 @@ fn control(frame: &str, subs: &mut Subs) -> Vec<WsMessage> {
 
 // --- the wire shapes ---
 
-/// At the instrument's declared precision, trailing zeros kept, as Binance formats it. Nautilus's
-/// Python client takes precision from the string: its `QuoteTick` refuses a bid and ask of different
-/// precision, and its risk engine an order more precise than the instrument.
-fn fixed(v: f64, exponent: i8) -> String {
-    format!("{v:.*}", usize::from(exponent.min(0).unsigned_abs()))
-}
-
-/// The quote's wire exponents, or the fallback for a quote not decoded from top-of-book (no Binance
-/// quote today).
-fn quote_exponents(q: &NormalizedQuote) -> (i8, i8) {
-    if q.wire == QuoteWire::default() {
-        (FALLBACK_EXPONENT, FALLBACK_EXPONENT)
-    } else {
-        (q.wire.price_exponent, q.wire.qty_exponent)
+/// A wire integer at its exponent, trailing zeros kept: the instrument's declared precision, as
+/// Binance formats it. Nautilus's Python client takes precision from the string: its `QuoteTick`
+/// refuses a bid and ask of different precision, and its risk engine an order more precise than the
+/// instrument.
+fn fixed(mantissa: i128, exponent: i8) -> String {
+    if exponent >= 0 {
+        return match mantissa {
+            0 => "0".into(),
+            m => format!("{m}{}", "0".repeat(exponent.unsigned_abs().into())),
+        };
     }
+    let dp = usize::from(exponent.unsigned_abs());
+    let digits = format!("{:0>width$}", mantissa.unsigned_abs(), width = dp + 1);
+    let (int, frac) = digits.split_at(digits.len() - dp);
+    let sign = if mantissa < 0 { "-" } else { "" };
+    format!("{sign}{int}.{frac}")
 }
 
-/// A trade carries no exponents of its own, so they come from its instrument's catalog entry.
-fn trade_exponents(instruments: &InstrumentSnapshot, t: &NormalizedTrade) -> (i8, i8) {
-    let key = (
-        SourceKey::of(t),
-        t.category.clone(),
-        t.channel,
-        t.instrument_id,
-    );
-    crate::model::lock(instruments)
-        .get(&key)
-        .map_or((FALLBACK_EXPONENT, FALLBACK_EXPONENT), |i| {
-            (i.price_exponent, i.qty_exponent)
-        })
+/// A value from an input with no wire integers, none of them Binance's today, at Binance's finest
+/// precision.
+fn unscaled(v: f64) -> String {
+    format!("{v:.8}")
+}
+
+/// Bid price, bid size, ask price and ask size.
+fn quote_values(q: &NormalizedQuote) -> [String; 4] {
+    let w = &q.wire;
+    if *w == QuoteWire::default() {
+        return [q.bid, q.bid_size, q.ask, q.ask_size].map(unscaled);
+    }
+    [
+        fixed(w.bid_price.into(), w.price_exponent),
+        fixed(w.bid_qty.into(), w.qty_exponent),
+        fixed(w.ask_price.into(), w.price_exponent),
+        fixed(w.ask_qty.into(), w.qty_exponent),
+    ]
+}
+
+/// Price and quantity.
+fn trade_values(t: &NormalizedTrade) -> [String; 2] {
+    let w = &t.wire;
+    if *w == TradeWire::default() {
+        return [t.price, t.size].map(unscaled);
+    }
+    [
+        fixed(w.price.into(), w.price_exponent),
+        fixed(w.qty.into(), w.qty_exponent),
+    ]
 }
 
 #[derive(Serialize)]
@@ -381,7 +395,7 @@ fn framed<T: Serialize>(framing: Framing, symbol: &str, kind: Kind, data: &T) ->
 
 /// Venue time in both `E` and `T`: the feed carries one timestamp.
 fn book_ticker(q: &NormalizedQuote, engine: Engine, framing: Framing) -> String {
-    let (px, qty) = quote_exponents(q);
+    let [b, bid_qty, a, ask_qty] = quote_values(q);
     let time = ms_or_now(q.source_ts_ns);
     let futures = engine == Engine::UsdM;
     let data = BookTicker {
@@ -390,23 +404,17 @@ fn book_ticker(q: &NormalizedQuote, engine: Engine, framing: Framing) -> String 
         event_time: futures.then_some(time),
         transaction_time: time,
         s: &q.symbol,
-        b: fixed(q.bid, px),
-        bid_qty: fixed(q.bid_size, qty),
-        a: fixed(q.ask, px),
-        ask_qty: fixed(q.ask_size, qty),
+        b,
+        bid_qty,
+        a,
+        ask_qty,
     };
     framed(framing, &q.symbol, Kind::BookTicker, &data)
 }
 
-fn trade(
-    t: &NormalizedTrade,
-    kind: Kind,
-    buyer_is_maker: bool,
-    (px, qty): (i8, i8),
-    framing: Framing,
-) -> String {
+fn trade(t: &NormalizedTrade, kind: Kind, buyer_is_maker: bool, framing: Framing) -> String {
     let time = ms_or_now(t.source_ts_ns);
-    let (p, q) = (fixed(t.price, px), fixed(t.size, qty));
+    let [p, q] = trade_values(t);
     if kind == Kind::AggTrade {
         let data = AggTrade {
             e: "aggTrade",
@@ -438,13 +446,7 @@ fn trade(
 
 /// Every frame one broadcast message produces for this connection. Another Source ID is another
 /// engine, never rendered here even under the same symbol.
-fn frames(
-    msg: &FeedMessage,
-    engine: Engine,
-    framing: Framing,
-    subs: &Subs,
-    instruments: &InstrumentSnapshot,
-) -> Vec<(Kind, String)> {
+fn frames(msg: &FeedMessage, engine: Engine, framing: Framing, subs: &Subs) -> Vec<(Kind, String)> {
     match msg {
         FeedMessage::Quote(q)
             if q.source_id == engine.source_id() && subs.has(Kind::BookTicker, &q.symbol) =>
@@ -472,10 +474,9 @@ fn frames(
                     return Vec::new();
                 }
             };
-            let exponents = trade_exponents(instruments, t);
             kinds
                 .into_iter()
-                .map(|k| (k, trade(t, k, buyer_is_maker, exponents, framing)))
+                .map(|k| (k, trade(t, k, buyer_is_maker, framing)))
                 .collect()
         }
         _ => Vec::new(),
@@ -492,17 +493,14 @@ pub async fn bind(addr: &str) -> Result<TcpListener> {
 }
 
 /// Never returns an accept error: `main`'s `select!` would exit the process over it.
-pub async fn serve(
-    listener: TcpListener,
-    tx: broadcast::Sender<Arc<FeedMessage>>,
-    instruments: InstrumentSnapshot,
-) -> Result<()> {
+pub async fn serve(listener: TcpListener, tx: broadcast::Sender<Arc<FeedMessage>>) -> Result<()> {
     let clients = Arc::new(AtomicUsize::new(0));
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
                 warn!("binance sink accept failed: {e}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
                 continue;
             }
         };
@@ -516,11 +514,10 @@ pub async fn serve(
             clients: clients.clone(),
             gauge: metrics().binance_sink_clients.clone(),
         };
-        let rx = tx.subscribe();
-        let instruments = instruments.clone();
+        let tx = tx.clone();
         tokio::spawn(async move {
             let _guard = guard;
-            if let Err(e) = serve_client(stream, rx, instruments).await {
+            if let Err(e) = serve_client(stream, tx).await {
                 warn!(%peer, "binance sink client ended: {e}");
             }
         });
@@ -562,11 +559,7 @@ async fn accept(stream: TcpStream) -> Result<(WebSocketStream<TcpStream>, Route)
     Ok((ws, route))
 }
 
-async fn serve_client(
-    stream: TcpStream,
-    mut rx: broadcast::Receiver<Arc<FeedMessage>>,
-    instruments: InstrumentSnapshot,
-) -> Result<()> {
+async fn serve_client(stream: TcpStream, tx: broadcast::Sender<Arc<FeedMessage>>) -> Result<()> {
     let (
         ws,
         Route {
@@ -580,8 +573,10 @@ async fn serve_client(
     let named: Vec<Value> = streams.into_iter().map(Value::String).collect();
     let refused = subs.apply(&named, true);
     if !refused.is_empty() {
-        write.send(refused_streams(&refused)).await?;
+        send(&mut write, refused_streams(&refused), IDLE_TIMEOUT).await?;
     }
+    // Only now, so nothing broadcast during the handshake reaches the client as if it were live.
+    let mut rx = tx.subscribe();
     let mut last_seen = Instant::now();
     let mut hb = tokio::time::interval(HEARTBEAT);
     let mut win_start = Instant::now();
@@ -590,42 +585,39 @@ async fn serve_client(
     loop {
         tokio::select! {
             incoming = read.next() => match incoming {
-                Some(Ok(WsMessage::Text(frame))) => {
-                    last_seen = Instant::now();
-                    if !inbound_allowed(&mut win_start, &mut win_count) {
-                        return end_rate_limited(&mut write, &mut read).await;
-                    }
-                    for answer in control(&frame, &mut subs) {
-                        write.send(answer).await?;
-                    }
-                }
-                // Charged like a control frame: it costs an outbound `Pong`.
-                Some(Ok(WsMessage::Ping(p))) => {
-                    last_seen = Instant::now();
-                    if !inbound_allowed(&mut win_start, &mut win_count) {
-                        return end_rate_limited(&mut write, &mut read).await;
-                    }
-                    write.send(WsMessage::Pong(p)).await?;
-                }
-                Some(Ok(WsMessage::Pong(_))) => last_seen = Instant::now(),
                 Some(Ok(WsMessage::Close(_))) | None => break,
-                Some(Ok(_)) => {}
+                // Every frame is charged, whatever its kind, so none can bypass the cap.
+                Some(Ok(frame)) => {
+                    last_seen = Instant::now();
+                    if !inbound_allowed(&mut win_start, &mut win_count) {
+                        return end_rate_limited(&mut write, &mut read).await;
+                    }
+                    match frame {
+                        WsMessage::Text(request) => {
+                            for answer in control(&request, &mut subs) {
+                                send(&mut write, answer, IDLE_TIMEOUT).await?;
+                            }
+                        }
+                        WsMessage::Ping(p) => send(&mut write, WsMessage::Pong(p), IDLE_TIMEOUT).await?,
+                        _ => {}
+                    }
+                }
                 Some(Err(e)) => return Err(e.into()),
             },
 
             _ = hb.tick() => {
                 if last_seen.elapsed() > IDLE_TIMEOUT {
-                    let _ = write.send(WsMessage::Close(None)).await;
+                    let _ = send(&mut write, WsMessage::Close(None), CLOSE_HANDSHAKE_TIMEOUT).await;
                     break;
                 }
-                write.send(WsMessage::Ping(Vec::new().into())).await?;
+                send(&mut write, WsMessage::Ping(Vec::new().into()), IDLE_TIMEOUT).await?;
             },
 
             msg = rx.recv() => match msg {
                 Ok(m) => {
-                    for (kind, frame) in frames(&m, engine, framing, &subs, &instruments) {
+                    for (kind, frame) in frames(&m, engine, framing, &subs) {
                         metrics().binance_sink_messages.with_label_values(&[kind.name()]).inc();
-                        write.send(text(frame)).await?;
+                        send(&mut write, text(frame), IDLE_TIMEOUT).await?;
                     }
                 }
                 // Every frame here is a whole quote or a single print, so a gap costs the prints
@@ -641,6 +633,19 @@ async fn serve_client(
     Ok(())
 }
 
+/// Bounded, because a peer that stops reading leaves a send pending for good, and with it this
+/// connection's heartbeat and idle reap: its client slot would never be released.
+async fn send<S>(write: &mut S, msg: WsMessage, deadline: Duration) -> Result<()>
+where
+    S: SinkExt<WsMessage> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    tokio::time::timeout(deadline, write.send(msg))
+        .await
+        .map_err(|_| anyhow::anyhow!("client stopped reading"))??;
+    Ok(())
+}
+
 /// End a connection that crossed the inbound cap, sending the reason before the `Close` and then
 /// waiting for the peer's, so the reason is not lost to a reset (see [`finish_close`]).
 async fn end_rate_limited<S, R, E>(write: &mut S, read: &mut R) -> Result<()>
@@ -649,30 +654,22 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
     R: StreamExt<Item = std::result::Result<WsMessage, E>> + Unpin,
 {
-    write
-        .send(refusal(
-            -1003,
-            "Too many requests: inbound rate limit exceeded",
-        ))
-        .await?;
-    write.send(WsMessage::Close(None)).await?;
+    let reason = refusal(-1003, "Too many requests: inbound rate limit exceeded");
+    send(write, reason, CLOSE_HANDSHAKE_TIMEOUT).await?;
+    send(write, WsMessage::Close(None), CLOSE_HANDSHAKE_TIMEOUT).await?;
     finish_close(read, CLOSE_HANDSHAKE_TIMEOUT).await;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
+    use std::time::Duration;
 
     use tokio::{net::TcpListener, sync::broadcast, time::timeout};
     use tokio_tungstenite::tungstenite::Error as WsError;
 
     use super::*;
-    use crate::model::NormalizedInstrument;
+    use crate::ingest::codec_common::apply_exponent;
 
     const VENUE: &str = "BINANCE";
     /// 2023-11-14T22:13:20.123Z, so `E`/`T` carry a millisecond fraction.
@@ -680,13 +677,12 @@ mod tests {
     const TS_MS: u64 = 1_700_000_000_123;
     const TRADE_ID: u64 = 6_778_484_593;
 
-    /// A quote as the top-of-book decoder emits it: `(price, qty)` per side, with the wire's
-    /// exponents.
+    /// A quote as the top-of-book decoder emits it from wire `(price, qty)` integers per side.
     fn quote(
         source_id: u16,
         symbol: &str,
-        bid: (f64, f64),
-        ask: (f64, f64),
+        bid: (i64, u64),
+        ask: (i64, u64),
         (price_exponent, qty_exponent): (i8, i8),
     ) -> NormalizedQuote {
         NormalizedQuote {
@@ -694,11 +690,11 @@ mod tests {
             source_name: VENUE.into(),
             source_id,
             symbol: symbol.into(),
-            bid: bid.0,
-            bid_size: bid.1,
+            bid: apply_exponent(bid.0, price_exponent),
+            bid_size: apply_exponent(bid.1 as i64, qty_exponent),
             bid_n: 0,
-            ask: ask.0,
-            ask_size: ask.1,
+            ask: apply_exponent(ask.0, price_exponent),
+            ask_size: apply_exponent(ask.1 as i64, qty_exponent),
             ask_n: 0,
             source_ts_ns: TS_NS,
             recv_ts_ns: 0,
@@ -710,10 +706,10 @@ mod tests {
             venue_update_id: 0,
             wire: QuoteWire {
                 channel: 0,
-                bid_price: 1,
-                bid_qty: 1,
-                ask_price: 1,
-                ask_qty: 1,
+                bid_price: bid.0,
+                bid_qty: bid.1,
+                ask_price: ask.0,
+                ask_qty: ask.1,
                 price_exponent,
                 qty_exponent,
             },
@@ -721,16 +717,34 @@ mod tests {
     }
 
     fn usdsm_quote() -> NormalizedQuote {
-        quote(6, "BTCUSDT", (61825.4, 5.512), (61825.5, 9.879), (-2, -3))
+        quote(
+            6,
+            "BTCUSDT",
+            (6_182_540, 5_512),
+            (6_182_550, 9_879),
+            (-2, -3),
+        )
     }
 
     fn spot_quote() -> NormalizedQuote {
-        let mut q = quote(8, "BTCUSDT", (82783.38, 0.00008), (82783.39, 1.5), (-8, -8));
+        let (bid, ask) = ((8_278_338_000_000, 8_000), (8_278_339_000_000, 150_000_000));
+        let mut q = quote(8, "BTCUSDT", bid, ask, (-8, -8));
         q.category = "spot".into();
         q
     }
 
+    /// `61825.50` x `0.002` at USD-M's `(-2, -3)`.
     fn print(source_id: u16, side: Side) -> NormalizedTrade {
+        traded(source_id, side, (6_182_550, 2), (-2, -3))
+    }
+
+    /// A print as the top-of-book decoder emits it from wire `(price, qty)` integers.
+    fn traded(
+        source_id: u16,
+        side: Side,
+        (price, qty): (i64, u64),
+        (price_exponent, qty_exponent): (i8, i8),
+    ) -> NormalizedTrade {
         NormalizedTrade {
             venue: VENUE.into(),
             source_name: VENUE.into(),
@@ -739,8 +753,8 @@ mod tests {
             channel: 0,
             instrument_id: 7,
             category: "usdsm".into(),
-            price: 61825.5,
-            size: 0.002,
+            price: apply_exponent(price, price_exponent),
+            size: apply_exponent(qty as i64, qty_exponent),
             aggressor_side: side,
             trade_id: TRADE_ID,
             cumulative_volume: 0.0,
@@ -748,30 +762,13 @@ mod tests {
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            wire: TradeWire {
+                price,
+                qty,
+                price_exponent,
+                qty_exponent,
+            },
         }
-    }
-
-    /// The catalog holding the definition [`print`]'s trade was scaled with.
-    fn catalog(price_exponent: i8, qty_exponent: i8) -> InstrumentSnapshot {
-        let inst = NormalizedInstrument {
-            venue: VENUE.into(),
-            source_name: VENUE.into(),
-            source_id: 6,
-            symbol: "BTCUSDT".into(),
-            channel: 0,
-            instrument_id: 7,
-            category: "usdsm".into(),
-            price_exponent,
-            qty_exponent,
-            tick_size: 0,
-        };
-        let key = (
-            SourceKey::of(&inst),
-            inst.category.clone(),
-            inst.channel,
-            inst.instrument_id,
-        );
-        Arc::new(Mutex::new(HashMap::from([(key, inst)])))
     }
 
     fn subs(streams: &[&str]) -> Subs {
@@ -850,6 +847,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.streams, ["btcusdt@bookTicker", "ethusdt@trade"]);
+    }
+
+    /// As an HTTP server would, so a client whose URL builder escapes `@` and `/` is not refused.
+    #[test]
+    fn streams_in_the_url_are_percent_decoded() {
+        let r = route(
+            "/spot/stream",
+            Some("streams=btcusdt%40trade%2Fethusdt%40bookTicker"),
+        )
+        .unwrap();
+        assert_eq!(r.streams, ["btcusdt@trade", "ethusdt@bookTicker"]);
     }
 
     #[test]
@@ -1049,7 +1057,7 @@ mod tests {
     /// A trimmed `100.5` beside `101` would fail Nautilus's Python `QuoteTick` (see [`fixed`]).
     #[test]
     fn bid_and_ask_share_one_precision() {
-        let q = quote(6, "BTCUSDT", (100.5, 1.0), (101.0, 2.25), (-1, -2));
+        let q = quote(6, "BTCUSDT", (1_005, 100), (1_010, 225), (-1, -2));
         let v = parse(&book_ticker(&q, Engine::UsdM, Framing::Raw));
         assert_eq!(
             (v["b"].as_str(), v["a"].as_str()),
@@ -1062,10 +1070,26 @@ mod tests {
     }
 
     #[test]
-    fn a_non_negative_exponent_renders_whole_numbers() {
-        assert_eq!(fixed(1200.0, 2), "1200");
-        assert_eq!(fixed(5.0, 0), "5");
-        assert_eq!(fixed(0.0, -3), "0.000");
+    fn wire_integers_render_at_their_exponent() {
+        assert_eq!(fixed(5, -3), "0.005");
+        assert_eq!(fixed(0, -3), "0.000");
+        assert_eq!(fixed(-15, -1), "-1.5");
+        assert_eq!(fixed(12, 2), "1200");
+        assert_eq!(fixed(5, 0), "5");
+        assert_eq!(fixed(0, 2), "0");
+    }
+
+    /// Past ~15 significant digits the scaled `f64` rounds; the wire integer does not.
+    #[test]
+    fn values_past_an_f64s_precision_render_exactly() {
+        let big = 10_000_000_000_000_001;
+        let q = quote(8, "BTCUSDT", (1, big), (2, big), (-8, -8));
+        assert_ne!(format!("{:.8}", q.bid_size), "100000000.00000001");
+        let v = parse(&book_ticker(&q, Engine::Spot, Framing::Raw));
+        assert_eq!(v["B"], "100000000.00000001");
+        let t = traded(8, Side::Buy, (1, big), (-8, -8));
+        let v = parse(&trade(&t, Kind::Trade, false, Framing::Raw));
+        assert_eq!(v["q"], "100000000.00000001");
     }
 
     /// A quote with no wire values renders at Binance's finest precision rather than as integers.
@@ -1093,7 +1117,6 @@ mod tests {
             &print(6, Side::Sell),
             Kind::AggTrade,
             true,
-            (-2, -3),
             Framing::Raw,
         ));
         assert_eq!(
@@ -1107,13 +1130,8 @@ mod tests {
 
     #[test]
     fn a_trade_carries_the_raw_trade_id() {
-        let v = parse(&trade(
-            &print(8, Side::Buy),
-            Kind::Trade,
-            false,
-            (-8, -8),
-            Framing::Raw,
-        ));
+        let t = traded(8, Side::Buy, (6_182_550_000_000, 200_000), (-8, -8));
+        let v = parse(&trade(&t, Kind::Trade, false, Framing::Raw));
         assert_eq!(
             v,
             serde_json::json!({
@@ -1142,33 +1160,30 @@ mod tests {
     #[test]
     fn another_engines_symbol_never_reaches_this_one() {
         let s = subs(&["btcusdt@bookTicker", "btcusdt@aggTrade", "btcusdt@trade"]);
-        let cat = catalog(-2, -3);
         let spot = FeedMessage::Quote(spot_quote());
         let usdsm = FeedMessage::Quote(usdsm_quote());
-        assert!(frames(&spot, Engine::UsdM, Framing::Raw, &s, &cat).is_empty());
-        assert!(frames(&usdsm, Engine::Spot, Framing::Raw, &s, &cat).is_empty());
-        assert_eq!(
-            frames(&usdsm, Engine::UsdM, Framing::Raw, &s, &cat).len(),
-            1
-        );
+        assert!(frames(&spot, Engine::UsdM, Framing::Raw, &s).is_empty());
+        assert!(frames(&usdsm, Engine::Spot, Framing::Raw, &s).is_empty());
+        assert_eq!(frames(&usdsm, Engine::UsdM, Framing::Raw, &s).len(), 1);
         let spot_print = FeedMessage::Trade(print(8, Side::Buy));
-        assert!(frames(&spot_print, Engine::UsdM, Framing::Raw, &s, &cat).is_empty());
+        assert!(frames(&spot_print, Engine::UsdM, Framing::Raw, &s).is_empty());
     }
 
-    /// A trade carries no exponents, so it renders at its instrument's from the catalog.
+    /// At the exponents it was scaled with, which a later definition cannot change; a print with no
+    /// wire values at Binance's finest precision.
     #[test]
-    fn a_trade_renders_at_its_instruments_precision() {
+    fn a_trade_renders_at_its_own_precision() {
         let s = subs(&["btcusdt@aggTrade", "btcusdt@trade"]);
-        let m = FeedMessage::Trade(print(6, Side::Buy));
-        let out = frames(&m, Engine::UsdM, Framing::Raw, &s, &catalog(-2, -3));
+        let m = FeedMessage::Trade(traded(6, Side::Buy, (15, 15), (-3, -3)));
+        let out = frames(&m, Engine::UsdM, Framing::Raw, &s);
         let kinds: Vec<Kind> = out.iter().map(|(k, _)| *k).collect();
         assert_eq!(kinds, [Kind::AggTrade, Kind::Trade]);
-        assert_eq!(parse(&out[0].1)["p"], "61825.50");
-        assert_eq!(parse(&out[0].1)["q"], "0.002");
+        assert_eq!(parse(&out[0].1)["p"], "0.015");
 
-        let empty: InstrumentSnapshot = Default::default();
-        let unknown = frames(&m, Engine::UsdM, Framing::Raw, &s, &empty);
-        assert_eq!(parse(&unknown[0].1)["p"], "61825.50000000");
+        let mut t = print(6, Side::Buy);
+        t.wire = TradeWire::default();
+        let out = frames(&FeedMessage::Trade(t), Engine::UsdM, Framing::Raw, &s);
+        assert_eq!(parse(&out[0].1)["p"], "61825.50000000");
     }
 
     /// Binance's schema has no "unknown" aggressor, and `m` is read directionally. Counted, so a
@@ -1181,7 +1196,7 @@ mod tests {
         let before = dropped.get();
         let s = subs(&["btcusdt@aggTrade"]);
         let m = FeedMessage::Trade(print(6, Side::Unknown));
-        assert!(frames(&m, Engine::UsdM, Framing::Raw, &s, &catalog(-2, -3)).is_empty());
+        assert!(frames(&m, Engine::UsdM, Framing::Raw, &s).is_empty());
         assert_eq!(dropped.get() - before, 1);
     }
 
@@ -1189,10 +1204,7 @@ mod tests {
 
     #[test]
     fn golden_frames_match_the_committed_fixtures() {
-        let cat = catalog(-2, -3);
-        let mut spot_print = print(8, Side::Buy);
-        spot_print.price = 82783.38;
-        spot_print.size = 0.00008;
+        let spot_print = traded(8, Side::Buy, (8_278_338_000_000, 8_000), (-8, -8));
         for (frame, fixture, name) in [
             (
                 book_ticker(&usdsm_quote(), Engine::UsdM, Framing::Raw),
@@ -1200,13 +1212,7 @@ mod tests {
                 "binance_usdsm_bookticker_golden.json",
             ),
             (
-                trade(
-                    &print(6, Side::Sell),
-                    Kind::AggTrade,
-                    true,
-                    trade_exponents(&cat, &print(6, Side::Sell)),
-                    Framing::Raw,
-                ),
+                trade(&print(6, Side::Sell), Kind::AggTrade, true, Framing::Raw),
                 include_str!("../../tests/fixtures/binance_usdsm_aggtrade_golden.json"),
                 "binance_usdsm_aggtrade_golden.json",
             ),
@@ -1216,7 +1222,7 @@ mod tests {
                 "binance_spot_bookticker_golden.json",
             ),
             (
-                trade(&spot_print, Kind::Trade, false, (-8, -8), Framing::Combined),
+                trade(&spot_print, Kind::Trade, false, Framing::Combined),
                 include_str!("../../tests/fixtures/binance_spot_trade_golden.json"),
                 "binance_spot_trade_golden.json",
             ),
@@ -1239,7 +1245,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
-        let srv = tokio::spawn(serve(listener, tx.clone(), catalog(-2, -3)));
+        let srv = tokio::spawn(serve(listener, tx.clone()));
         (tx, addr, srv)
     }
 
@@ -1299,6 +1305,14 @@ mod tests {
         ))
         .await
         .unwrap();
+        // The client subscribes to the broadcast only once its handshake and URL streams are done.
+        timeout(WAIT, async {
+            while tx.receiver_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
         let _ = tx.send(Arc::new(FeedMessage::Trade(print(8, Side::Buy))));
         let v = next_text(&mut ws, WAIT).await.unwrap();
         assert_eq!(v["stream"], "btcusdt@trade");
@@ -1335,20 +1349,19 @@ mod tests {
         srv.abort();
     }
 
-    /// Crossing the inbound cap ends the connection with the reason, then a `Close`.
-    #[tokio::test]
-    async fn crossing_the_inbound_rate_limit_ends_the_connection() {
+    /// Flood past the inbound cap with `frame`, then report whether the rate-limit refusal arrived
+    /// and a `Close` followed it.
+    async fn flood_past_the_cap(frame: impl Fn() -> WsMessage) -> (bool, bool) {
         let (_tx, addr, srv) = spawn().await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/spot"))
             .await
             .unwrap();
-        for i in 0..=600 {
-            let frame = format!(r#"{{"method":"SUBSCRIBE","params":[],"id":{i}}}"#);
-            if ws.send(text(frame)).await.is_err() {
+        for _ in 0..=600 {
+            if ws.send(frame()).await.is_err() {
                 break;
             }
         }
-        let (limited, closed) = timeout(Duration::from_secs(5), async {
+        let out = timeout(Duration::from_secs(5), async {
             let mut limited = false;
             loop {
                 match ws.next().await {
@@ -1361,7 +1374,67 @@ mod tests {
         })
         .await
         .expect("must answer within the timeout");
-        assert!(limited && closed);
         srv.abort();
+        out
+    }
+
+    /// Crossing the inbound cap ends the connection with the reason, then a `Close`, whatever kind
+    /// of frame crossed it: one the cap skipped could be sent without limit.
+    #[tokio::test]
+    async fn every_kind_of_inbound_frame_counts_against_the_rate_limit() {
+        let subscribe = || text(r#"{"method":"SUBSCRIBE","params":[],"id":1}"#.into());
+        let binary = || WsMessage::Binary(vec![0u8; 16].into());
+        let pong = || WsMessage::Pong(Vec::new().into());
+        for (kind, frame) in [
+            ("text", &subscribe as &dyn Fn() -> WsMessage),
+            ("binary", &binary),
+            ("pong", &pong),
+        ] {
+            assert_eq!(flood_past_the_cap(frame).await, (true, true), "{kind}");
+        }
+    }
+
+    /// A sink that never accepts a frame: a peer whose receive window is full.
+    struct Stalled;
+
+    impl futures_util::Sink<WsMessage> for Stalled {
+        type Error = std::io::Error;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _: WsMessage,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A peer that stops reading must not hold its client slot: the send gives up at its deadline.
+    #[tokio::test]
+    async fn a_send_to_a_peer_that_stopped_reading_gives_up() {
+        let deadline = Duration::from_millis(50);
+        let sent = timeout(
+            Duration::from_secs(5),
+            send(&mut Stalled, WsMessage::Ping(Vec::new().into()), deadline),
+        )
+        .await
+        .expect("send must return at its deadline, not hang");
+        assert!(sent.is_err());
     }
 }

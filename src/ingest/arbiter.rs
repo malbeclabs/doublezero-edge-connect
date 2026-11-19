@@ -4524,6 +4524,7 @@ mod tests {
                 recv_ts_ns: 0,
                 kernel_rx_ts_ns: 0,
                 ws_send_ts_ns: 0,
+                wire: Default::default(),
             })
         };
         let (tx, mut rx) = broadcast::channel(64);
@@ -4558,6 +4559,7 @@ mod tests {
             recv_ts_ns: 2_000,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            wire: Default::default(),
         }
     }
 
@@ -4831,6 +4833,7 @@ mod tests {
                 recv_ts_ns: 0,
                 kernel_rx_ts_ns: 0,
                 ws_send_ts_ns: 0,
+                wire: Default::default(),
             })
         };
         let (tx, mut rx) = broadcast::channel(64);
@@ -5021,6 +5024,7 @@ mod tests {
                 recv_ts_ns: recv,
                 kernel_rx_ts_ns: 0,
                 ws_send_ts_ns: 0,
+                wire: Default::default(),
             })
         };
         let (tx, _rx) = broadcast::channel(64);

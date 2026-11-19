@@ -122,7 +122,7 @@ fn parse_headers<'a>(header_lines: impl Iterator<Item = &'a str>) -> Vec<(String
 
 /// Split a query string on `&` into percent-decoded `(key, value)` pairs. A pair with no `=` gets
 /// an empty value; empty segments (e.g. a trailing `&`) are skipped.
-fn parse_query_params(query: &str) -> Vec<(String, String)> {
+pub fn parse_query_params(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())

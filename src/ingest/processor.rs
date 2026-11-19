@@ -796,6 +796,12 @@ impl DatagramProcessor for TobProcessor {
                         recv_ts_ns: ctx.recv_ts_ns,
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
+                        wire: crate::model::TradeWire {
+                            price: t.trade_price_raw,
+                            qty: t.trade_qty_raw,
+                            price_exponent,
+                            qty_exponent,
+                        },
                     };
                     // The arbiter's windowed trade dedup (on trade_id) collapses any cross-transport
                     // copy downstream; this feed only gates on whether it owns this venue's trades.
@@ -1941,6 +1947,12 @@ impl DatagramProcessor for MboProcessor {
                             recv_ts_ns: ctx.recv_ts_ns,
                             kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                             ws_send_ts_ns: 0,
+                            wire: crate::model::TradeWire {
+                                price: o.exec_price_raw,
+                                qty: o.exec_qty_raw,
+                                price_exponent: def.price_exponent,
+                                qty_exponent: def.qty_exponent,
+                            },
                         };
                         if self.tape.load(Ordering::Relaxed) {
                             ctx.emit(FeedMessage::Trade(trade));
@@ -1993,6 +2005,12 @@ impl DatagramProcessor for MboProcessor {
                         recv_ts_ns: ctx.recv_ts_ns,
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0,
+                        wire: crate::model::TradeWire {
+                            price: t.trade_price_raw,
+                            qty: t.trade_qty_raw,
+                            price_exponent,
+                            qty_exponent,
+                        },
                     };
                     if self.tape.load(Ordering::Relaxed) {
                         ctx.emit(FeedMessage::Trade(trade));
@@ -3916,6 +3934,12 @@ impl DatagramProcessor for MbpProcessor {
                         recv_ts_ns: ctx.recv_ts_ns,
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0,
+                        wire: crate::model::TradeWire {
+                            price: t.trade_price_raw,
+                            qty: t.trade_qty_raw,
+                            price_exponent,
+                            qty_exponent,
+                        },
                     };
                     if self.tape.load(Ordering::Relaxed) {
                         ctx.emit(FeedMessage::Trade(trade));
