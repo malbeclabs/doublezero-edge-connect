@@ -5,6 +5,8 @@
 //!   - [`hyperliquid`] - the same data in **Hyperliquid's own schema** for an existing Hyperliquid
 //!     client; off by default, on when `--hl-ws-bind` is set. A rendering, not a second protocol —
 //!     see `docs/output-sinks.md`, never PROTOCOL.md.
+//!   - [`binance`] - Binance's quotes and trades in **Binance's own schema**, for an existing Binance
+//!     client; off by default, on when `--binance-ws-bind` is set. A rendering, like [`hyperliquid`].
 //!   - [`metrics`] - Prometheus metrics HTTP endpoint; off by default, on when `--metrics-bind` is set.
 //!   - [`api`]     - read-only `/v1` JSON query API over the rolling history window + snapshots.
 //!   - [`admin`]   - the one mutation path (runtime channel-filter changes); on by default, at
@@ -28,6 +30,7 @@
 
 pub mod admin;
 pub mod api;
+pub mod binance;
 pub mod http;
 pub mod hyperliquid;
 pub mod metrics;

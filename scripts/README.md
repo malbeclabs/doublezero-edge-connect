@@ -70,7 +70,8 @@ per-feature flags in the script. `tests/scripts/passthrough.bats` fails when a n
 missing from the scripts' `PASSTHROUGH` allowlist.
 
 Common ones: `DZ_IFACE`, `DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `HL_WS_BIND` (the
-Hyperliquid-compatible sink, whose URL the installer prints when set), `RUST_LOG`, and the shred
+Hyperliquid-compatible sink, whose URL the installer prints when set), `BINANCE_WS_BIND` (the
+Binance-compatible sink, whose USD-M and spot URLs it prints), `RUST_LOG`, and the shred
 forwarder's `DZ_SHRED_*` (notably `DZ_SHRED_DEDUP_MODE` — `dedup` by default, `sigverify` / `none`
 to change — and `DZ_SHRED_RPC_URL` for sigverify mode). See the bridge's `Args` in
 [`../src/main.rs`](../src/main.rs) and the sink/shred/input tables in the

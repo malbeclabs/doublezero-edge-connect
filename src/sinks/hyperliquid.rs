@@ -60,12 +60,12 @@ const MAX_COIN_LEN: usize = 32;
 /// Client limits and liveness. Deliberately constants rather than flags: the sink is a compatibility
 /// rendering with no operator-tunable behaviour, and every value here mirrors the normalized sink's
 /// shipped default.
-const MAX_CLIENTS: usize = 64;
+pub(super) const MAX_CLIENTS: usize = 64;
 const MAX_SUBS: usize = 256;
 const MAX_INBOUND_PER_MIN: u32 = 600;
-const HEARTBEAT: Duration = Duration::from_secs(20);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const HEARTBEAT: Duration = Duration::from_secs(20);
+pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Capacity of the prepared-frame fan-out. A constant like every other limit here — this sink has no
 /// operator-tunable behaviour — and set well above the backbone's own shipped default, so this hop is
 /// never the one that drops a batch a client would otherwise have kept.
@@ -76,7 +76,7 @@ const REBOOTSTRAP_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// Cap on an inbound frame. Control frames here are tens of bytes; tungstenite's 64 MiB default would
 /// let `MAX_CLIENTS` peers buffer gigabytes before a single byte is parsed. Read-path only, so the
 /// sink's own large `l4Book` snapshots are unaffected.
-fn inbound_limits() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+pub(super) fn inbound_limits() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(64 * 1024))
         .max_frame_size(Some(64 * 1024))
@@ -359,7 +359,7 @@ fn num(v: f64) -> String {
 /// Hyperliquid's `time` is milliseconds and has no "unknown" encoding, so our `0` sentinel becomes
 /// the send time rather than the epoch — a consumer that timestamps from this field would otherwise
 /// date every message to 1970.
-fn ms_or_now(source_ts_ns: u64) -> u64 {
+pub(super) fn ms_or_now(source_ts_ns: u64) -> u64 {
     if source_ts_ns == 0 {
         now_ns() / 1_000_000
     } else {
@@ -651,7 +651,7 @@ fn render_bbo(q: &NormalizedQuote, coin: &str) -> Option<String> {
 
 /// Serialize a frame we own. Our own types cannot fail to serialize; an empty object rather than a
 /// panic keeps a hypothetical failure from taking a client's task down.
-fn json<T: Serialize>(v: T) -> String {
+pub(super) fn json<T: Serialize>(v: T) -> String {
     serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string())
 }
 
@@ -985,14 +985,15 @@ pub async fn bind(addr: &str) -> Result<TcpListener> {
 }
 
 /// Releases the client slot and gauge on drop, so a panic inside a client task cannot leak either.
-struct ClientGuard {
-    clients: Arc<AtomicUsize>,
+pub(super) struct ClientGuard {
+    pub(super) clients: Arc<AtomicUsize>,
+    pub(super) gauge: prometheus::IntGauge,
 }
 
 impl Drop for ClientGuard {
     fn drop(&mut self) {
         self.clients.fetch_sub(1, Ordering::SeqCst);
-        metrics().hl_sink_clients.dec();
+        self.gauge.dec();
     }
 }
 
@@ -1036,6 +1037,7 @@ pub async fn serve(
         metrics().hl_sink_clients.inc();
         let guard = ClientGuard {
             clients: clients.clone(),
+            gauge: metrics().hl_sink_clients.clone(),
         };
         let rx = prepared_tx.subscribe();
         let books = books.clone();
@@ -1425,7 +1427,7 @@ fn book_coin(sub: &Sub) -> Option<&str> {
 }
 
 /// Charge one inbound frame against the rolling-minute cap, returning whether it is allowed.
-fn inbound_allowed(win_start: &mut Instant, win_count: &mut u32) -> bool {
+pub(super) fn inbound_allowed(win_start: &mut Instant, win_count: &mut u32) -> bool {
     if win_start.elapsed() >= Duration::from_secs(60) {
         *win_start = Instant::now();
         *win_count = 0;
@@ -1436,7 +1438,7 @@ fn inbound_allowed(win_start: &mut Instant, win_count: &mut u32) -> bool {
 
 /// How long a connection being ended waits for the peer's `Close` before it is dropped anyway. A
 /// bound, not a courtesy: a peer that never answers must not hold a client slot open.
-const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Finish the WebSocket closing handshake after this side has sent its `Close`: read, and discard,
 /// whatever the peer still sends until its own `Close` (or the end of the stream) arrives, bounded by
@@ -1450,7 +1452,7 @@ const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// `deadline` is [`CLOSE_HANDSHAKE_TIMEOUT`] in production; a parameter so a test can prove the bound
 /// holds against a peer that never answers without waiting it out.
-async fn finish_close<R, E>(read: &mut R, deadline: Duration)
+pub(super) async fn finish_close<R, E>(read: &mut R, deadline: Duration)
 where
     R: StreamExt<Item = std::result::Result<WsMessage, E>> + Unpin,
 {

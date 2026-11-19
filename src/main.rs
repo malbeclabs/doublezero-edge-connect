@@ -224,6 +224,13 @@ struct Args {
     #[arg(long = "hl-ws-bind", env = "HL_WS_BIND", default_value = "")]
     hl_ws_bind: String,
 
+    /// Bind address for the Binance-compatible WebSocket sink, e.g. `0.0.0.0:8083`. Off by default
+    /// (empty disables it). Serves Binance's own market-stream schema, not PROTOCOL.md: point a
+    /// Binance client's WebSocket base URL at `ws://<host>:<port>/usdsm` (USD-M perpetuals) or
+    /// `/spot`. Not subscription-gated. No TLS; terminate at a proxy if exposed.
+    #[arg(long = "binance-ws-bind", env = "BINANCE_WS_BIND", default_value = "")]
+    binance_ws_bind: String,
+
     /// Prometheus metrics HTTP endpoint bind address (e.g. `127.0.0.1:9090`). Off by default
     /// (opt-in): empty means no endpoint is exposed. Metrics are recorded regardless; this only
     /// controls whether they can be scraped at `GET /metrics`. No TLS — terminate at a proxy.
@@ -766,6 +773,27 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Binance-compatible sink: off by default and not subscription-gated, like the one above.
+    let binance_sink = if args.binance_ws_bind.is_empty() {
+        info!("Binance-compatible sink disabled (empty --binance-ws-bind)");
+        None
+    } else {
+        match sinks::binance::bind(&args.binance_ws_bind).await {
+            Ok(listener) => {
+                let (tx, instruments) = (tx.clone(), instruments.clone());
+                Some(tokio::spawn(sinks::binance::serve(
+                    listener,
+                    tx,
+                    instruments,
+                )))
+            }
+            Err(e) => {
+                warn!(bind = %args.binance_ws_bind, "Binance-compatible sink disabled: {e}");
+                None
+            }
+        }
+    };
+
     // Prometheus metrics endpoint: off by default (opt-in via `--metrics-bind`). Recording is always
     // on; this only exposes the registry over HTTP for scraping.
     let metrics_srv = if args.metrics_bind.is_empty() {
@@ -939,6 +967,10 @@ async fn main() -> Result<()> {
             None => std::future::pending().await,
         } } => r?,
         r = async { match hl_sink {
+            Some(handle) => handle.await,
+            None => std::future::pending().await,
+        } } => r??,
+        r = async { match binance_sink {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r??,

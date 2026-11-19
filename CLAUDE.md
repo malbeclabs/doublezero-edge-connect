@@ -87,9 +87,9 @@ Modules are grouped by role under `src/`:
   nothing about how the data is re-served.
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
   (WebSocket, on by default), `api` (read-only `/v1` query API), `metrics` (Prometheus `/metrics`,
-  off by default), `admin` (the one mutation path in this crate — see below) and `hyperliquid` (the
-  same data in Hyperliquid's own schema, off by default). A new feature is a sibling module here +
-  a spawn in `main.rs`.
+  off by default), `admin` (the one mutation path in this crate — see below), `hyperliquid` (the
+  same data in Hyperliquid's own schema, off by default) and `binance` (Binance's quotes and trades in
+  Binance's own schema, off by default). A new feature is a sibling module here + a spawn in `main.rs`.
 - **`shred/`** — the Solana **shred forwarder** (peer of `ingest/`/`sinks/`, separate from the
   market-data pipeline — no `FeedMessage`, no WebSocket, no market-data decode). Joins the DoubleZero
   `edge-solana-*` shred multicast groups, combines them, and fans each raw datagram out to local
@@ -1114,6 +1114,27 @@ Modules are grouped by role under `src/`:
   A lagging client is re-bootstrapped on `l4Book` at most once per `REBOOTSTRAP_MIN_INTERVAL`, since
   that frame is the most expensive the sink produces and is what makes a struggling client lag again;
   a second gap inside the window ends the connection.
+- **`sinks/binance.rs`** — the **Binance-compatible** sink (`--binance-ws-bind`, off by default, **not**
+  subscription-gated): Binance's `quote`/`trade` re-served as Binance's `bookTicker`, `aggTrade` and
+  `trade`, so a Binance client needs only a new WebSocket base URL. A rendering like `hyperliquid`'s,
+  documented in `docs/output-sinks.md` and never in PROTOCOL.md, and it reuses that sink's limits and
+  helpers. The compatibility target is **NautilusTrader v1.231.0**: its Rust futures and spot-JSON
+  clients and the Python client a Python `TradingNode` runs. The **path picks the engine**, `/usdsm`
+  Source ID 6 and `/spot` 8, with no default because both list `BTCUSDT`; `/ws` or the bare path sends
+  bare events (Nautilus's futures client uses its base URL verbatim) and `/stream` wraps them (its spot
+  and Python clients append `/stream`). Four traps, each checked against that source:
+  ⚠️ **prices and quantities render at the instrument's declared precision, trailing zeros kept** —
+  the quote's `QuoteWire` exponents, a trade's from the instrument catalog — because the Python client
+  takes a value's precision from its string, `QuoteTick` refuses a bid and ask of different precision,
+  and the risk engine refuses an order more precise than the instrument; `hyperliquid`'s trimmed
+  `num()` breaks the first, a fixed padding the last. ⚠️ **A refusal carries no `id`**: the futures
+  handler reads any frame with one as that request's acknowledgement, and a missing `result` as
+  success. ⚠️ **A stream is never refused at the handshake**, only in-band: the Python client names its
+  first stream in the URL (`/stream?streams=`), and a failed connect leaves its `_is_connecting` flag
+  set, so every later subscribe on that client waits forever. Only an unknown path or query parameter
+  fails the handshake. ⚠️ **Placeholders**: `u` is `0` (the feed carries only its low 32 bits, and
+  Nautilus's book reads a sequence of `0` as none), and each `aggTrade` is one execution with `a`, `f`
+  and `l` all the raw trade id — the publishers decode Binance's per-execution `@trade` topic.
 - **`sinks/api.rs`**'s `/v1/products` rows carry `book_complete` (the replay entry's `baselined()`,
   absent for a market with no book), read off the same `BookSnapshot` lookup `feed_kind` already makes.
   It is the one place a market withheld from every new WebSocket subscriber shows without the
@@ -1286,9 +1307,10 @@ Modules are grouped by role under `src/`:
   the shred forwarder) when the reconciler sees the host subscribed to the relevant group. ws
   (output) is *configured* by a non-empty `--ws-bind` (`--ws-bind ""` disables it outright) but only
   *activated* when a market-data feed is subscribed; the public WS input is **off** by
-  default (on when `--ws-input-coins` is non-empty) and is **not** subscription-gated, and neither is
-  the Hyperliquid-compatible sink (**off**, on when `--hl-ws-bind` is non-empty) — it renders whatever
-  the broadcast carries, so it has no group of its own to be subscribed to. README has the
+  default (on when `--ws-input-coins` is non-empty) and is **not** subscription-gated, and neither are
+  the Hyperliquid- and Binance-compatible sinks (**off**, on when `--hl-ws-bind`/`--binance-ws-bind` is
+  non-empty) — each renders whatever the broadcast carries, so it has no group of its own to be
+  subscribed to. README has the
   full activation tables.
 - No TLS on the **service surface** — the WebSocket output and multicast input target a trusted/local
   network; terminate TLS at a reverse proxy if exposed. The **one** exception is the outbound

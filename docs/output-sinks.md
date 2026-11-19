@@ -10,6 +10,7 @@ sink can't stall ingest. Every flag also reads from the env var shown.
 | **WebSocket** (`sinks::ws`) | **on when subscribed** | configured unless `--ws-bind` is empty (`--ws-bind ""` disables it); *activated* only when ≥1 market-data feed is subscribed | `--ws-bind` (`WS_BIND`, default `0.0.0.0:8081`) + the `--ws-*` limits |
 | **Query API** (`sinks::api`) | **on when subscribed** | configured unless `--api-bind` is empty (`--api-bind ""` disables it); *activated* only when ≥1 market-data feed is subscribed — same condition as the WebSocket sink | `--api-bind` (`DZ_API_BIND`, default `127.0.0.1:9099`) |
 | **Hyperliquid-compatible** (`sinks::hyperliquid`) | **off** | on when `--hl-ws-bind` is non-empty; **not** subscription-gated | `--hl-ws-bind` (`HL_WS_BIND`, default empty) |
+| **Binance-compatible** (`sinks::binance`) | **off** | on when `--binance-ws-bind` is non-empty; **not** subscription-gated | `--binance-ws-bind` (`BINANCE_WS_BIND`, default empty) |
 | **Metrics** (`sinks::metrics`) | **off** | on when `--metrics-bind` is non-empty | `--metrics-bind` (`METRICS_BIND`, default empty) |
 
 The metrics endpoint is active when its key config value is non-empty. The WebSocket sink and the
@@ -114,6 +115,62 @@ inside that window ends the connection instead.
 Observability is `dz_hl_sink_clients`, `dz_hl_sink_messages_total{channel}`,
 `dz_hl_sink_dropped_total{reason}` and `dz_hl_sink_folds_total`. There is **no TLS**, as with the
 rest of the service surface.
+
+## Binance-compatible sink
+
+Serves the Binance feeds' quotes and trades in **Binance's own market-stream schema**, so a Binance client, such as NautilusTrader's stock Binance data clients, consumes edge-connect by changing its WebSocket base URL. It is **off by default**; give it a bind address to turn it on:
+
+```bash
+./target/release/doublezero-edge-connect --iface doublezero1 --binance-ws-bind 0.0.0.0:8083
+```
+
+Like the Hyperliquid sink, it is a rendering, not a second protocol. Nothing about it is in PROTOCOL.md, it is not subscription-gated, and a bind failure disables it with a warning.
+
+**The path picks the matching engine.** Both engines list symbols such as `BTCUSDT`, so there is no default path; any other path gets a 404 naming these two.
+
+| Path | Engine | Framing |
+|---|---|---|
+| `/usdsm` or `/usdsm/ws` | USD-margined perpetuals (Source ID 6, `edge-binance-usdsm-tob`) | Bare events, like Binance's `/ws` |
+| `/usdsm/stream` | The same | `{"stream":…,"data":…}`, like Binance's `/stream` |
+| `/spot`, `/spot/ws` or `/spot/stream` | Spot (Source ID 8, `edge-binance-spot-tob`) | As above |
+
+Name streams in a `SUBSCRIBE` (`{"method":"SUBSCRIBE","params":["btcusdt@bookTicker"],"id":1}`, acknowledged with `{"result":null,"id":1}`) or in the URL (`/stream?streams=btcusdt@bookTicker/btcusdt@trade`). Either path serves three streams, at most 1,024 per connection:
+
+| Stream | Frame |
+|---|---|
+| `<symbol>@bookTicker` | Our `quote`. USD-M sends `e`, `u`, `E`, `T`, `s`, `b`, `B`, `a` and `A`. Spot leaves out `e` and `E`, as Binance's spot frame does, and adds `T`. |
+| `<symbol>@aggTrade` | Our `trade`, one execution per frame. |
+| `<symbol>@trade` | Our `trade`. |
+
+Any other stream (`@depth`, `@markPrice`, `@kline_…`, tickers, the all-market streams) or method is refused with `{"code":2,"msg":…}` naming it. The refusal carries **no `id`**: NautilusTrader's futures client reads any frame with an `id` as an acknowledgement, and would mark the refused stream subscribed. Nautilus's Rust clients log the refusal as a WebSocket error. Its Python client skips any frame without a `stream`, so there a refused stream is just silent.
+
+**What the feed cannot supply.** These fields are placeholders, and a consumer must not read meaning into them:
+
+- `u`, Binance's book update id, is `0`. The feed carries only its low 32 bits, and Nautilus reads a sequence of `0` as none.
+- Each `aggTrade` frame is a single execution: `a`, `f` and `l` all carry Binance's raw trade id, which is also `trade`'s `t`. A consumer therefore sees more prints than Binance's own aggregated stream sends.
+- `E` and `T` both carry the venue time in milliseconds, or the send time when the venue gave none.
+
+A print whose aggressor side is unknown is dropped, since `m` has no "unknown". An empty side of the book renders as a zero price and size, and Nautilus's Rust spot client logs and skips such a quote. Prices and quantities carry the instrument's declared precision, trailing zeros included, as Binance formats them. Nautilus's Python client takes a value's precision from its string, so `101` beside `100.5` would fail the quote.
+
+**Pointing NautilusTrader v1.231.0 at it.** Instruments still load from Binance's REST API, so leave `base_url_http` at its default; only the WebSocket moves. Leave `api_key` unset on the Rust futures data client: it sends the key to the WebSocket as a header, in clear text over `ws://`.
+
+A Python `TradingNode`:
+
+```python
+BinanceDataClientConfig(account_type=BinanceAccountType.USDT_FUTURES, base_url_ws="ws://<host>:8083/usdsm")
+BinanceDataClientConfig(account_type=BinanceAccountType.SPOT, base_url_ws="ws://<host>:8083/spot")
+```
+
+A Rust node, where spot must run in JSON mode: the default, SBE, is Binance's binary protocol, which this sink does not speak.
+
+```rust
+BinanceDataClientConfig { product_type: BinanceProductType::UsdM, base_url_ws: Some("ws://<host>:8083/usdsm".into()), ..Default::default() }
+BinanceDataClientConfig { product_type: BinanceProductType::Spot, spot_market_data_mode: BinanceSpotMarketDataMode::Json, base_url_ws: Some("ws://<host>:8083/spot".into()), ..Default::default() }
+```
+
+Give each client its engine's base path, nothing more: the Rust futures client reads bare events and silently drops wrapped ones from `/usdsm/stream`, and the Python client appends `/stream` itself.
+
+Client limits are the Hyperliquid sink's: 64 clients, 600 inbound frames per minute, and a 20s heartbeat with a 60s idle reap. A slow client misses messages and is counted rather than disconnected, since every frame is a whole quote or one print. Observability is `dz_binance_sink_clients`, `dz_binance_sink_messages_total{stream}` and `dz_binance_sink_dropped_total{reason}`. There is **no TLS**.
 
 ## Metrics (Prometheus)
 

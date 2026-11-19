@@ -33,7 +33,7 @@
 #   DZ_LEDGER_RPC_URL=<url>              override the DoubleZero ledger RPC used by the pre-check
 #
 # Any other bridge env var set in the environment is relayed straight to the container
-# (WS_*, HL_WS_BIND, DZ_IFACE, DZ_SHRED_*, METRICS_BIND, DZ_CHANNELS, DZ_ADMIN_BIND, DZ_FEED_REGISTRY[_URL],
+# (WS_*, HL_WS_BIND, BINANCE_WS_BIND, DZ_IFACE, DZ_SHRED_*, METRICS_BIND, DZ_CHANNELS, DZ_ADMIN_BIND, DZ_FEED_REGISTRY[_URL],
 # RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
 #   WS_BIND=0.0.0.0:9000 curl -fsSL https://get.doublezero.xyz/connect-devnet | bash
 #
@@ -640,7 +640,7 @@ PASSTHROUGH=(
   DZ_SUBSCRIPTION_REFRESH_SECS DZ_SUBSCRIPTION_GATING_DISABLE DZ_QUOTE_MAP
   WS_HEARTBEAT_SECS WS_IDLE_TIMEOUT_SECS WS_MAX_CLIENTS
   WS_MAX_SUBS WS_MAX_INBOUND_PER_MIN WS_BROADCAST_CAPACITY
-  HL_WS_BIND DZ_API_BIND METRICS_BIND
+  HL_WS_BIND BINANCE_WS_BIND DZ_API_BIND METRICS_BIND
   DZ_CHANNELS DZ_ADMIN_BIND DZ_FEED_REGISTRY DZ_FEED_REGISTRY_URL
   WS_INPUT_URL WS_INPUT_COINS PHOENIX_WS_INPUT_URL PHOENIX_WS_INPUT_MARKETS
   DZ_ARB_LEADER_TIMEOUT_SECS DZ_ARB_TRANSFER_MARGIN_US DZ_ARB_TRANSFER_WIN_RATE
@@ -864,6 +864,19 @@ if [ "$CONNECT_STATE" = connected ] && [ -n "${HL_WS_BIND:-}" ]; then
     *"sink listening"*) echo "  Hyperliquid : ws://${hl_host}:${HL_WS_BIND##*:}            # Hyperliquid's own schema (docs/output-sinks.md)" ;;
     *"sink disabled"*) warn "The Hyperliquid-compatible sink is NOT serving (HL_WS_BIND=$HL_WS_BIND): ${hl_log#*sink disabled: }" ;;
     *) warn "Could not confirm the Hyperliquid-compatible sink on $HL_WS_BIND: neither its bind nor a bind failure is in the bridge log (RUST_LOG may hide them). Check: sudo docker logs $DZ_NAME | grep Hyperliquid" ;;
+  esac
+fi
+# The Binance-compatible sink is advertised the same way. It serves one matching engine per path.
+if [ "$CONNECT_STATE" = connected ] && [ -n "${BINANCE_WS_BIND:-}" ]; then
+  bn_log="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep -E "Binance-compatible (WebSocket sink listening|sink disabled)" | tail -1 | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' || true)"
+  bn_host="${BINANCE_WS_BIND%:*}"
+  case "$bn_host" in ''|0.0.0.0|'[::]') bn_host="$HOST_IP" ;; esac
+  case "$bn_log" in
+    *"sink listening"*)
+      echo "  Binance USD-M : ws://${bn_host}:${BINANCE_WS_BIND##*:}/usdsm      # Binance's own schema (docs/output-sinks.md)"
+      echo "  Binance spot  : ws://${bn_host}:${BINANCE_WS_BIND##*:}/spot" ;;
+    *"sink disabled"*) warn "The Binance-compatible sink is NOT serving (BINANCE_WS_BIND=$BINANCE_WS_BIND): ${bn_log#*sink disabled: }" ;;
+    *) warn "Could not confirm the Binance-compatible sink on $BINANCE_WS_BIND: neither its bind nor a bind failure is in the bridge log (RUST_LOG may hide them). Check: sudo docker logs $DZ_NAME | grep Binance" ;;
   esac
 fi
 echo

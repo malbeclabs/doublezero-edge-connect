@@ -406,6 +406,15 @@ pub struct Metrics {
     /// (correct) or once per client per batch.
     pub hl_sink_folds: IntCounter,
 
+    // --- Binance-compatible sink (off by default) ---
+    /// Currently-connected clients of the Binance-compatible sink.
+    pub binance_sink_clients: IntGauge,
+    /// Frames sent by the Binance-compatible sink, by `stream` kind (bookTicker/aggTrade/trade).
+    pub binance_sink_messages: IntCounterVec,
+    /// What the Binance-compatible sink did not send, by `reason`: `client_lagged` (one slow consumer
+    /// missed broadcast messages).
+    pub binance_sink_dropped: IntCounterVec,
+
     // --- Public WS inputs (per-venue backstops; off by default) ---
     /// Input health per `venue`: 1 while the public WebSocket session is connected, 0 while
     /// down/reconnecting.
@@ -1170,6 +1179,23 @@ impl Metrics {
                 "dz_hl_sink_folds_total",
                 "Market price-folds performed by the Hyperliquid-compatible sink",
             ),
+            binance_sink_clients: gauge(
+                &registry,
+                "dz_binance_sink_clients",
+                "Clients connected to the Binance-compatible sink",
+            ),
+            binance_sink_messages: counter_vec(
+                &registry,
+                "dz_binance_sink_messages_total",
+                "Frames sent by the Binance-compatible sink, by stream kind",
+                &["stream"],
+            ),
+            binance_sink_dropped: counter_vec(
+                &registry,
+                "dz_binance_sink_dropped_total",
+                "Messages the Binance-compatible sink did not send, by reason",
+                &["reason"],
+            ),
             ws_input_up: gauge_vec(
                 &registry,
                 "dz_ws_input_up",
@@ -1482,6 +1508,9 @@ mod tests {
         m.mbo_guarded_tombstones.set(7);
         m.mbo_guarded_tombstones_max.set(3);
         m.hl_sink_messages.with_label_values(&["l2Book"]).inc();
+        m.binance_sink_messages
+            .with_label_values(&["bookTicker"])
+            .inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -1561,6 +1590,8 @@ mod tests {
             "dz_mbo_guarded_tombstones_max",
             "dz_hl_sink_clients",
             "dz_hl_sink_messages_total",
+            "dz_binance_sink_clients",
+            "dz_binance_sink_messages_total",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
             "dz_history_unattributable_trades_total",

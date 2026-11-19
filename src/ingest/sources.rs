@@ -27,6 +27,10 @@ pub struct SourceAssignment {
 /// Hyperliquid-schema sink (`sinks::hyperliquid`) so the two cannot drift apart.
 pub const HYPERLIQUID_SOURCE_ID: u16 = 1;
 
+/// Binance's two matching engines, named here for the Binance-schema sink (`sinks::binance`).
+pub const BINANCE_USDSM_SOURCE_ID: u16 = 6;
+pub const BINANCE_SPOT_SOURCE_ID: u16 = 8;
+
 /// The compiled-in mirror, used when the resolved document carries no `sources` block. It carries
 /// **every** ID `edge-feed-spec/sources/spec.md` assigns, not only the ones a built-in row uses: a
 /// document with no block validates every row against this table, so a missing ID refuses a valid
@@ -58,7 +62,7 @@ const BUILT_IN: [SourceAssignment; 8] = [
     // as in the document because a `Url` failure degrades to the built-in copy, and the Binance
     // rows must still resolve there.
     SourceAssignment {
-        id: 6,
+        id: BINANCE_USDSM_SOURCE_ID,
         name: BINANCE,
     },
     // Hyperliquid's XYZ builder DEX: a second engine sharing ID 1's name.
@@ -67,7 +71,7 @@ const BUILT_IN: [SourceAssignment; 8] = [
         name: "HYPERLIQUID",
     },
     SourceAssignment {
-        id: 8,
+        id: BINANCE_SPOT_SOURCE_ID,
         name: BINANCE,
     },
 ];

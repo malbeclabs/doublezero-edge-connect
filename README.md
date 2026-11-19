@@ -112,8 +112,8 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 
 **Bridge variables.** The installer relays every non-empty bridge env var straight through to
 the container, so the bridge is tuned entirely from the one-liner. Common ones: `DZ_IFACE`,
-`DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `HL_WS_BIND` (the Hyperliquid-compatible sink — see
-below), `METRICS_BIND` (turn on the Prometheus `/metrics`
+`DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `HL_WS_BIND` and `BINANCE_WS_BIND` (the
+Hyperliquid- and Binance-compatible sinks — see below), `METRICS_BIND` (turn on the Prometheus `/metrics`
 endpoint — off by default), `DZ_API_BIND` (the read-only `/v1` query API), `DZ_ADMIN_BIND` and
 `DZ_CHANNELS` (the runtime-mutable channel filter — see [Admin
 surface](#admin-surface)), `DZ_FEED_REGISTRY`/`DZ_FEED_REGISTRY_URL` (the
@@ -261,6 +261,8 @@ the same data in Hyperliquid's own schema (`l2Book`, `l4Book`, `trades`, `bbo`),
 WebSocket endpoint at it needs no adapter work. Off by default; see
 [Output sinks](docs/output-sinks.md#hyperliquid-compatible-sink) for what it does and does not
 deliver.
+
+Already have a **Binance** client, such as NautilusTrader's? `BINANCE_WS_BIND=0.0.0.0:8083` turns on a sink that serves the Binance feeds' quotes and trades in Binance's own schema (`bookTicker`, `aggTrade`, `trade`): USD-M perpetuals at `ws://<host>:8083/usdsm` and spot at `ws://<host>:8083/spot`. Off by default; see [Output sinks](docs/output-sinks.md#binance-compatible-sink) for the client configuration and what the feed cannot supply.
 
 ## Query market data (the `doublezero-edge` CLI)
 
