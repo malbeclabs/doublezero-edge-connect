@@ -525,6 +525,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- **The Hyperliquid-compatible sink serves `bbo`**, rendered from our top-of-book `quote`, so a stock NautilusTrader Hyperliquid data client pointed at it receives quotes as well as trades and L2. An empty side is `null`, as Hyperliquid sends it, and the MBO book's top never produces `bbo`. See [Output sinks](docs/output-sinks.md#hyperliquid-compatible-sink).
 - **The bridge can keep the latest top-of-book quote and last trade per instrument**, behind
   `--quote-map` / `DZ_QUOTE_MAP`, off by default. Entries are keyed by the instrument's full
   identity, never its symbol, and nothing reads them yet, so turning it on changes no output.

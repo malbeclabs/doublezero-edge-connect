@@ -39,7 +39,7 @@ Hyperliquid venue — `coin` is our `symbol`, and no other venue is rendered. No
 (it has no multicast group of its own to be subscribed to); like the normalized sink, a bind failure
 disables it with a warning rather than taking the process down.
 
-Three channels, subscribed with Hyperliquid's own control frame
+Four channels, subscribed with Hyperliquid's own control frame
 (`{"method":"subscribe","subscription":{"type":…,"coin":…}}`), acknowledged with a
 `subscriptionResponse` echo, and `{"method":"ping"}` answered with `{"channel":"pong"}`:
 
@@ -48,10 +48,12 @@ Three channels, subscribed with Hyperliquid's own control frame
 | `l2Book` | Snapshot-per-update: every frame carries the whole top-N of both sides, `px`/`sz` as strings and `n` as the resting-order count at that price. Honours `nSigFigs` (2–5), `mantissa` (1, 2 or 5, only at `nSigFigs` 5) and `nLevels` (default 20, clamped to 100). Bids bucket down and asks bucket up, so aggregation never invents a price better than the book holds. |
 | `l4Book` | The whole resting book order by order, then order diffs — each carrying the **venue's own order id**. Externally tagged `{"Snapshot":{…}}` / `{"Updates":{…}}`, matching the contract DoubleZero's own Hyperliquid publisher defines. A producer re-baseline arrives as another `Snapshot`, since the channel has no clear. |
 | `trades` | Our `trade`, in Hyperliquid's envelope: string price and size, the aggressor side spelled `B`/`A`, and the venue's own `tid`. |
+| `bbo` | Our `quote`, in Hyperliquid's envelope: `[bid, ask]`, each `{px, sz, n}` from the quote's price, size and `bid_n`/`ask_n`, with `px`/`sz` as strings, or `null` for an empty side. Sent on each quote and nothing on subscribe; every frame is the whole top of book. |
+
+`bbo` comes from the top-of-book feed only; the MBO book's top never produces it. Each frame replaces the consumer's quote, so two separately arbitrated views of one market would alternate on it. A client receiving both feeds gets `bbo` and `trades` from top-of-book and `l2Book` from MBO, so its quote can briefly disagree with its book's top. With only the MBO feed there is no `bbo`.
 
 **What a stock NautilusTrader client actually gets, and what it does not.** Set
-`HyperliquidDataClientConfig.base_url_ws` to this sink and a v1.227.0 Hyperliquid trader receives
-genuine full-depth L2 with no adapter change. It **cannot** receive L3: its Rust WebSocket client has
+`HyperliquidDataClientConfig.base_url_ws` to this sink and a v1.227.0 Hyperliquid trader receives quotes and trades from the top-of-book feed, and genuine full-depth L2 from the MBO feed, with no adapter change. Nautilus logs and skips a `bbo` with an empty side, as it does against Hyperliquid itself. It **cannot** receive L3: its Rust WebSocket client has
 no `l4Book` subscription, so nothing in Nautilus will ever ask for one, and its book path hardcodes
 order id `0`. Order-level is available to a client that asks for `l4Book` — our own adapter, or
 Nautilus once someone extends it. "Hyperliquid-compatible" does not mean "Nautilus gets L3".
@@ -87,8 +89,8 @@ must be told to discard.
 
 **A `coin` is not an identity.** The wire symbol is a truncated label and two markets can share one, so
 a **book** subscription that resolves to more than one is refused, and each one that is served is
-pinned to the market it was bootstrapped from. `trades` is not covered: a print carries no book to pin
-against, so two markets sharing a coin still merge their tapes under one name.
+pinned to the market it was bootstrapped from. `trades` and `bbo` are not covered: neither carries a
+book to pin against, so two markets sharing a coin still merge under one name.
 
 Client limits are fixed rather than configurable (64 clients, 256 subscriptions each, 600 inbound
 control frames per minute, a 20s heartbeat with a 60s idle reap). Both a text control frame and a

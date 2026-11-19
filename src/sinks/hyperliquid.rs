@@ -1,6 +1,6 @@
-//! Hyperliquid-compatible WebSocket sink: re-serve our reconstructed order book and tape in
-//! **Hyperliquid's own schema**, so an existing Hyperliquid client consumes edge-connect by pointing
-//! its WebSocket endpoint here. Off by default (`--hl-ws-bind`).
+//! Hyperliquid-compatible WebSocket sink: re-serve our reconstructed order book, top-of-book quote
+//! and tape in **Hyperliquid's own schema**, so an existing Hyperliquid client consumes edge-connect
+//! by pointing its WebSocket endpoint here. Off by default (`--hl-ws-bind`).
 //!
 //! This is a **rendering, not a second pipeline**: it holds no ingest state, adds no dedup identity
 //! and influences no arbitration. It reads the same broadcast `sinks::ws` reads plus the shared
@@ -9,9 +9,9 @@
 //!
 //! Two references define the wire, and they disagree in one place. **NautilusTrader v1.227.0**
 //! (`crates/adapters/hyperliquid/src/websocket/messages.rs`) is what actually parses our bytes for
-//! `l2Book`/`trades`, so it wins for anything it parses. **DoubleZero's own Hyperliquid publisher**
-//! (`malbeclabs/hyperliquid`, `app/publisher/server/src`) defines `l4Book`, the `nLevels` extension
-//! and the significant-figure arithmetic, which are absent from Nautilus entirely.
+//! `l2Book`/`trades`/`bbo`, so it wins for anything it parses. **DoubleZero's own Hyperliquid
+//! publisher** (`malbeclabs/hyperliquid`, `app/publisher/server/src`) defines `l4Book`, the
+//! `nLevels` extension and the significant-figure arithmetic, which are absent from Nautilus entirely.
 //!
 //! Scoped to the Hyperliquid venue: `coin` is our `symbol`, and a message from any other venue is
 //! never rendered.
@@ -38,7 +38,7 @@ use crate::{
     metrics::metrics,
     model::{
         now_ns, BookAccumulator, BookAction, BookKey, BookSide, BookSnapshot, CountedLevel,
-        FeedMessage, NormalizedBook, NormalizedTrade, ReplayScope, Side,
+        FeedMessage, NormalizedBook, NormalizedQuote, NormalizedTrade, ReplayScope, Side,
     },
 };
 
@@ -110,6 +110,8 @@ enum Sub {
     L4Book { coin: String },
     #[serde(rename_all = "camelCase")]
     Trades { coin: String },
+    #[serde(rename_all = "camelCase")]
+    Bbo { coin: String },
 }
 
 /// The `l2Book` view a subscription asked for: the significant-figure bucket, its mantissa
@@ -147,6 +149,8 @@ enum SubIn {
     L4Book { coin: String },
     #[serde(rename_all = "camelCase")]
     Trades { coin: String },
+    #[serde(rename_all = "camelCase")]
+    Bbo { coin: String },
 }
 
 #[derive(Deserialize)]
@@ -187,6 +191,7 @@ fn normalize(s: SubIn) -> Result<Sub, String> {
     };
     match s {
         SubIn::Trades { coin } => Ok(Sub::Trades { coin: check(coin)? }),
+        SubIn::Bbo { coin } => Ok(Sub::Bbo { coin: check(coin)? }),
         SubIn::L4Book { coin } => Ok(Sub::L4Book { coin: check(coin)? }),
         SubIn::L2Book {
             coin,
@@ -605,6 +610,42 @@ fn render_trade(t: &NormalizedTrade, coin: &str) -> Option<String> {
             tid: t.trade_id,
             users: [ZERO_ADDRESS, ZERO_ADDRESS],
         }],
+    }))
+}
+
+#[derive(Serialize)]
+struct BboData<'a> {
+    coin: &'a str,
+    time: u64,
+    /// `[bid, ask]`, `null` for an empty side, as Hyperliquid sends it.
+    bbo: [Option<Level>; 2],
+}
+
+/// Render our top-of-book `quote` in Hyperliquid's `bbo` envelope. `None` for another venue or coin.
+///
+/// A side with no size is `null`: the decoder turns a side the publisher left out into zeros, and a
+/// consumer would read those as a real bid of 0.
+fn render_bbo(q: &NormalizedQuote, coin: &str) -> Option<String> {
+    if q.source_id != SOURCE_ID || q.symbol.as_ref() != coin {
+        return None;
+    }
+    let side = |px: f64, sz: f64, n: u16| {
+        (sz > 0.0).then(|| Level {
+            px: num(px),
+            sz: num(sz),
+            n: n.into(),
+        })
+    };
+    Some(json(Envelope {
+        channel: "bbo",
+        data: BboData {
+            coin,
+            time: ms_or_now(q.source_ts_ns),
+            bbo: [
+                side(q.bid, q.bid_size, q.bid_n),
+                side(q.ask, q.ask_size, q.ask_n),
+            ],
+        },
     }))
 }
 
@@ -1101,8 +1142,8 @@ fn bootstrap(
         }
     };
     match sub {
-        // Prints are point-in-time: there is nothing to bootstrap, and no reason to take the lock.
-        Sub::Trades { .. } => Vec::new(),
+        // Prints are point-in-time and `bbo` is sent only on change, so neither bootstraps.
+        Sub::Trades { .. } | Sub::Bbo { .. } => Vec::new(),
         Sub::L2Book {
             coin,
             n_sig_figs,
@@ -1149,6 +1190,13 @@ fn frames(
             for sub in subs {
                 if let Sub::Trades { coin } = sub {
                     out.extend(render_trade(t, coin).map(|f| ("trades", Utf8Bytes::from(f))));
+                }
+            }
+        }
+        FeedMessage::Quote(q) => {
+            for sub in subs {
+                if let Sub::Bbo { coin } = sub {
+                    out.extend(render_bbo(q, coin).map(|f| ("bbo", Utf8Bytes::from(f))));
                 }
             }
         }
@@ -1372,7 +1420,7 @@ async fn serve_client(
 fn book_coin(sub: &Sub) -> Option<&str> {
     match sub {
         Sub::L2Book { coin, .. } | Sub::L4Book { coin } => Some(coin),
-        Sub::Trades { .. } => None,
+        Sub::Trades { .. } | Sub::Bbo { .. } => None,
     }
 }
 
@@ -1635,6 +1683,35 @@ mod tests {
         }
     }
 
+    /// `(price, size, n)` per side.
+    fn normalized_quote(
+        symbol: &str,
+        bid: (f64, f64, u16),
+        ask: (f64, f64, u16),
+    ) -> NormalizedQuote {
+        NormalizedQuote {
+            venue: VENUE.into(),
+            source_name: VENUE.into(),
+            source_id: 1,
+            symbol: symbol.into(),
+            bid: bid.0,
+            bid_size: bid.1,
+            bid_n: bid.2,
+            ask: ask.0,
+            ask_size: ask.1,
+            ask_n: ask.2,
+            source_ts_ns: 1_700_000_000_000_000_000,
+            recv_ts_ns: 0,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+            channel: 0,
+            instrument_id: 7,
+            category: TEST_CATEGORY.into(),
+            venue_update_id: 0,
+            wire: Default::default(),
+        }
+    }
+
     // --- Task 1: the subscription protocol ---
 
     /// The exact subscription frame NautilusTrader's Rust client sends. If this stops parsing, a
@@ -1709,6 +1786,24 @@ mod tests {
             parse_control(r#"{"method":"ping"}"#),
             Ok(Control::Ping)
         ));
+    }
+
+    /// The frame Nautilus's `subscribe_quotes` sends, echoed back as its `SubscriptionRequest::Bbo`.
+    #[test]
+    fn parses_the_nautilus_bbo_subscription_and_echoes_it() {
+        let Ok(Control::Subscribe(sub)) =
+            parse_control(r#"{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}"#)
+        else {
+            panic!("must parse as a bbo subscribe")
+        };
+        assert_eq!(sub, Sub::Bbo { coin: "BTC".into() });
+        let WsMessage::Text(echo) = subscription_response("subscribe", &sub) else {
+            panic!("a text frame")
+        };
+        assert_eq!(
+            echo.as_str(),
+            r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}}"#
+        );
     }
 
     /// An aggregation that does not exist is refused rather than coerced to the nearest one that
@@ -2058,6 +2153,30 @@ mod tests {
         let mut t = normalized_trade(VENUE, "BTC", 1.0, 1.0, true, 1);
         t.aggressor_side = Side::Unknown;
         assert!(render_trade(&t, "BTC").is_none());
+    }
+
+    // --- bbo ---
+
+    #[test]
+    fn a_side_with_no_size_renders_null() {
+        let one_sided = normalized_quote("BTC", (0.0, 0.0, 0), (101.0, 4.0, 1));
+        let v: serde_json::Value =
+            serde_json::from_str(&render_bbo(&one_sided, "BTC").unwrap()).unwrap();
+        assert!(v["data"]["bbo"][0].is_null());
+        assert_eq!(v["data"]["bbo"][1]["px"], "101");
+
+        let empty = normalized_quote("BTC", (0.0, 0.0, 0), (0.0, 0.0, 0));
+        let v: serde_json::Value =
+            serde_json::from_str(&render_bbo(&empty, "BTC").unwrap()).unwrap();
+        assert_eq!(v["data"]["bbo"], serde_json::json!([null, null]));
+    }
+
+    #[test]
+    fn bbo_for_another_source_or_coin_renders_nothing() {
+        let mut q = normalized_quote("BTC", (100.5, 2.0, 3), (101.0, 4.0, 1));
+        assert!(render_bbo(&q, "ETH").is_none());
+        q.source_id = 2;
+        assert!(render_bbo(&q, "BTC").is_none());
     }
 
     // --- Task 7: streaming ---
@@ -2451,6 +2570,54 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&f).unwrap();
         assert_eq!(v["channel"], "trades");
         assert_eq!(v["data"][0]["tid"], 7u64);
+        srv.abort();
+    }
+
+    /// A bbo subscriber gets no bootstrap, then quotes for its coin and nothing else.
+    #[tokio::test]
+    async fn a_bbo_subscriber_receives_only_its_quotes() {
+        let books = vec![(key(), accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]))];
+        let (tx, addr, srv) = spawn(books).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_text(&mut ws, Duration::from_secs(2)).await.unwrap();
+        assert!(
+            ack.contains(r#""subscription":{"type":"bbo","coin":"BTC"}"#),
+            "{ack}"
+        );
+
+        let _ = tx.send(Arc::new(FeedMessage::Book(order_book(vec![(
+            BookSide::Bid,
+            100.0,
+            1.0,
+            1,
+        )]))));
+        let _ = tx.send(Arc::new(FeedMessage::Trade(normalized_trade(
+            VENUE, "BTC", 100.5, 2.0, true, 7,
+        ))));
+        let _ = tx.send(Arc::new(FeedMessage::Quote(normalized_quote(
+            "ETH",
+            (1.0, 1.0, 1),
+            (2.0, 1.0, 1),
+        ))));
+        let _ = tx.send(Arc::new(FeedMessage::Quote(normalized_quote(
+            "BTC",
+            (100.5, 2.0, 3),
+            (101.0, 4.0, 1),
+        ))));
+        let f = next_text(&mut ws, Duration::from_secs(2)).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&f).unwrap();
+        assert_eq!(v["channel"], "bbo", "{f}");
+        assert_eq!(v["data"]["coin"], "BTC");
+        assert!(next_text(&mut ws, Duration::from_millis(300))
+            .await
+            .is_none());
         srv.abort();
     }
 
@@ -2989,6 +3156,17 @@ mod tests {
             frame,
             include_str!("../../tests/fixtures/hl_l2book_golden.json").trim_end(),
             "regenerate tests/fixtures/hl_l2book_golden.json from this renderer"
+        );
+    }
+
+    /// The `bbo` golden, pinned the same way.
+    #[test]
+    fn golden_bbo_frame_matches_the_committed_fixture() {
+        let q = normalized_quote("BTC", (100.5, 2.0, 3), (101.0, 4.0, 1));
+        assert_eq!(
+            render_bbo(&q, "BTC").unwrap(),
+            include_str!("../../tests/fixtures/hl_bbo_golden.json").trim_end(),
+            "regenerate tests/fixtures/hl_bbo_golden.json from this renderer"
         );
     }
 

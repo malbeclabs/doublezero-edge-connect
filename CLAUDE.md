@@ -1059,9 +1059,10 @@ Modules are grouped by role under `src/`:
   order-keyed `BookAccumulator` in the shared `BookSnapshot`: `l2Book` (snapshot-per-update from
   `price_fold()` — whose per-level order count is the whole reason the accumulator is order-keyed;
   honours `nSigFigs`/`mantissa`/`nLevels`), `l4Book` (the publisher's
-  externally-tagged `{"Snapshot":…}`, then `{"Updates":…}` order diffs) and `trades`. Two references
+  externally-tagged `{"Snapshot":…}`, then `{"Updates":…}` order diffs) and `trades`.
+  `bbo` renders our top-of-book `quote` only, never the MBO book's top: each frame replaces the consumer's quote, so a second arbitrated view of the market would alternate with it. A side with no size is `null`, because the decoder encodes an absent side as zeros. Nothing is sent on subscribe, as Hyperliquid sends `bbo` only on change. Two references
   define the wire and one rule settles them: **NautilusTrader v1.227.0 wins for anything it parses**
-  (`l2Book`/`trades` field names and types, the `B`/`A` side spelling, `{"channel":"pong"}` for its
+  (`l2Book`/`trades`/`bbo` field names and types, `n` as a number, the `B`/`A` side spelling, `{"channel":"pong"}` for its
   30s `{"method":"ping"}`), and the **DZ Hyperliquid publisher** (`malbeclabs/hyperliquid`,
   `app/publisher/server/src`) is the only authority for `l4Book`, the significant-figure arithmetic and
   the `nLevels` extension. ⚠️ **No rendering happens under the shared `BookSnapshot` lock** — that is

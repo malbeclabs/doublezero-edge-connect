@@ -1,6 +1,6 @@
 //! Our Hyperliquid-compatible output must deserialize into the types its consumer parses.
 //!
-//! For `l2Book`/`trades` these mirror NautilusTrader's
+//! For `l2Book`/`trades`/`bbo` these mirror NautilusTrader's
 //! `crates/adapters/hyperliquid/src/websocket/messages.rs` at **v1.227.0**, the version pinned by the
 //! reference consumer, and `common/enums.rs` for the side spelling. `l4Book` has no Nautilus reader,
 //! so those types mirror the DoubleZero publisher's own (`malbeclabs/hyperliquid`,
@@ -52,6 +52,14 @@ struct WsTradeData {
     users: [String; 2],
 }
 
+#[derive(Debug, Deserialize)]
+struct WsBboData {
+    coin: String,
+    #[allow(dead_code)]
+    time: u64,
+    bbo: [Option<WsLevelData>; 2],
+}
+
 /// The envelope is internally tagged on `channel`; `l2Book`'s `data` is an object and `trades`' is an
 /// array. An unknown `channel` is a hard deserialization error upstream, so the tag must match exactly.
 #[derive(Debug, Deserialize)]
@@ -61,6 +69,8 @@ enum HyperliquidWsMessage {
     L2Book { data: WsBookData },
     #[serde(rename = "trades")]
     Trades { data: Vec<WsTradeData> },
+    #[serde(rename = "bbo")]
+    Bbo { data: WsBboData },
 }
 
 /// A golden `l2Book` frame, byte-for-byte as the sink emits it (the unit test
@@ -109,6 +119,40 @@ fn a_trade_frame_parses_as_nautilus_parses_it() {
 #[test]
 fn a_spelled_out_side_would_not_parse() {
     let bad = r#"{"channel":"trades","data":[{"coin":"BTC","side":"buy","px":"1","sz":"1","hash":"0x0","time":1,"tid":1,"users":["",""]}]}"#;
+    assert!(serde_json::from_str::<HyperliquidWsMessage>(bad).is_err());
+}
+
+/// The golden `bbo` frame, pinned to the renderer by `golden_bbo_frame_matches_the_committed_fixture`.
+#[test]
+fn a_golden_bbo_frame_parses_as_nautilus_parses_it() {
+    let frame = include_str!("fixtures/hl_bbo_golden.json");
+    let HyperliquidWsMessage::Bbo { data } =
+        serde_json::from_str(frame.trim_end()).expect("must parse into Nautilus's shape")
+    else {
+        panic!("must dispatch as bbo")
+    };
+    assert_eq!(data.coin, "BTC");
+    let [Some(bid), Some(ask)] = &data.bbo else {
+        panic!("both sides present")
+    };
+    assert_eq!((bid.px.as_str(), bid.sz.as_str(), bid.n), ("100.5", "2", 3));
+    assert_eq!((ask.px.as_str(), ask.sz.as_str(), ask.n), ("101", "4", 1));
+}
+
+#[test]
+fn a_null_bbo_side_parses_as_none() {
+    let frame = r#"{"channel":"bbo","data":{"coin":"BTC","time":1,"bbo":[null,{"px":"101","sz":"4","n":1}]}}"#;
+    let HyperliquidWsMessage::Bbo { data } = serde_json::from_str(frame).expect("must parse")
+    else {
+        panic!("must dispatch as bbo")
+    };
+    assert!(data.bbo[0].is_none() && data.bbo[1].is_some());
+}
+
+/// Nautilus types `n` as `u32`, so a string count fails the whole frame.
+#[test]
+fn a_string_order_count_would_not_parse() {
+    let bad = r#"{"channel":"bbo","data":{"coin":"BTC","time":1,"bbo":[{"px":"100.5","sz":"2","n":"3"},null]}}"#;
     assert!(serde_json::from_str::<HyperliquidWsMessage>(bad).is_err());
 }
 

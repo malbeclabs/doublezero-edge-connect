@@ -395,7 +395,7 @@ pub struct Metrics {
     // --- Hyperliquid-compatible sink (off by default) ---
     /// Currently-connected clients of the Hyperliquid-compatible sink.
     pub hl_sink_clients: IntGauge,
-    /// Frames sent by the Hyperliquid-compatible sink, by `channel` (l2Book/l4Book/trades).
+    /// Frames sent by the Hyperliquid-compatible sink, by `channel` (l2Book/l4Book/trades/bbo).
     pub hl_sink_messages: IntCounterVec,
     /// What the Hyperliquid-compatible sink did not send, by `reason`: `prepare_lagged` (the shared
     /// stage fell behind the backbone — every client missed those batches), `client_lagged` (one slow
