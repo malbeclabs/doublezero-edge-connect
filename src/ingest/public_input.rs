@@ -67,8 +67,9 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// How long a subscription waits for its answer before the next one is sent. It stays pending.
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Sessions a name may end unanswered before it is refused, on a venue that drops the connection on
-/// an unknown name. One would refuse a valid name for a network drop inside its round trip.
+/// Connection drops with a name's subscription in flight before it is refused, on a venue that drops
+/// the connection on an unknown name. One would refuse a valid name for a network drop inside its
+/// round trip.
 const STRIKES_TO_REFUSE: u8 = 2;
 
 /// One subscribe frame and what it races.
@@ -91,8 +92,8 @@ pub enum Frame {
 /// text frame into emitted `FeedMessage`s. The reconnect loop and frame pump are venue-agnostic and
 /// supplied by [`run`].
 pub trait PublicVenue {
-    /// The venue answers an unknown name by dropping the connection rather than refusing it, so a
-    /// subscription still unanswered when a session ends is a strike against its name.
+    /// The venue answers an unknown name by dropping the connection rather than refusing it, so the
+    /// subscription in flight when the connection drops is a strike against its name.
     const REFUSES_BY_DISCONNECT: bool;
     /// The first data frame after each ack replays state from before the subscription.
     const REPLAYS_ON_SUBSCRIBE: bool;
@@ -243,9 +244,9 @@ struct Sequencer {
     /// Per name, its subscriptions' indices by [`Kind`].
     by_name: HashMap<String, [Option<usize>; 2]>,
     replays: bool,
-    /// Sent this session.
-    sent: Vec<bool>,
-    /// Sessions that ended with the name unanswered.
+    /// Whether a subscription went unanswered past `ACK_TIMEOUT` this session.
+    timed_out: bool,
+    /// Drops of the connection with the name's subscription in flight.
     strikes: HashMap<String, u8>,
     next: usize,
     /// The subscription awaiting its answer, and when to stop waiting.
@@ -263,10 +264,10 @@ impl Sequencer {
         Self {
             venue: venue.to_string(),
             states: vec![SubState::Pending; subs.len()],
-            sent: vec![false; subs.len()],
             subs,
             by_name,
             replays,
+            timed_out: false,
             strikes: HashMap::new(),
             next: 0,
             waiting: None,
@@ -277,7 +278,7 @@ impl Sequencer {
     fn start_session(&mut self) {
         self.next = 0;
         self.waiting = None;
-        self.sent.fill(false);
+        self.timed_out = false;
     }
 
     /// The next subscribe frame, once nothing awaits an answer.
@@ -291,7 +292,6 @@ impl Sequencer {
         let i = self.next;
         let frame = self.subs.get(i)?.frame.clone();
         self.next += 1;
-        self.sent[i] = true;
         self.waiting = Some((i, now + ACK_TIMEOUT));
         Some(frame)
     }
@@ -302,6 +302,7 @@ impl Sequencer {
 
     fn on_timeout(&mut self) {
         self.waiting = None;
+        self.timed_out = true;
     }
 
     fn on_frame(&mut self, frame: Frame) {
@@ -334,24 +335,15 @@ impl Sequencer {
     }
 
     /// Every subscription back to pending for the next session. Where the venue refuses by
-    /// disconnecting, each name sent and still unanswered takes a strike.
+    /// disconnecting, the one in flight takes a strike — unless one timed out this session: a
+    /// venue that has stopped answering names nothing by dropping.
     fn end_session(&mut self, refuses_by_disconnect: bool) {
-        if refuses_by_disconnect {
-            let mut unanswered: Vec<String> = Vec::new();
-            for (i, sub) in self.subs.iter().enumerate() {
-                if self.sent[i]
-                    && self.states[i] == SubState::Pending
-                    && !unanswered.contains(&sub.symbol)
-                {
-                    unanswered.push(sub.symbol.clone());
-                }
-            }
-            for name in unanswered {
-                let strikes = self.strikes.entry(name.clone()).or_default();
-                *strikes += 1;
-                if *strikes >= STRIKES_TO_REFUSE {
-                    self.refuse(&name);
-                }
+        if let (true, false, Some((i, _))) = (refuses_by_disconnect, self.timed_out, self.waiting) {
+            let name = self.subs[i].symbol.clone();
+            let strikes = self.strikes.entry(name.clone()).or_default();
+            *strikes += 1;
+            if *strikes >= STRIKES_TO_REFUSE {
+                self.refuse(&name);
             }
         }
         for i in 0..self.states.len() {
@@ -634,7 +626,7 @@ mod tests {
     /// The name in flight when a dropping venue ends the session takes a strike; a second refuses
     /// it, and it is never sent again. An ack in between clears the strike.
     #[test]
-    fn two_unanswered_sessions_refuse_a_name_on_a_dropping_venue() {
+    fn two_drops_with_a_name_in_flight_refuse_it() {
         let now = Instant::now();
         let mut seq = Sequencer::new(subs(&["BTC", "NOPE"], &Kind::ALL), true, "V");
         let session = |seq: &mut Sequencer| {
@@ -686,6 +678,23 @@ mod tests {
             SubState::Pending,
             "the ack cleared the strike"
         );
+    }
+
+    /// A venue that stops answering names nothing by dropping: a timeout spares every name the
+    /// session's drop would otherwise strike.
+    #[test]
+    fn a_drop_after_a_timeout_strikes_nothing() {
+        let now = Instant::now();
+        let mut seq = Sequencer::new(subs(&["BTC", "ETH"], &[Kind::Quotes]), true, "V");
+        for _ in 0..3 {
+            seq.start_session();
+            seq.next_frame(now);
+            seq.on_timeout();
+            seq.next_frame(now);
+            seq.end_session(true);
+        }
+        assert!(seq.strikes.is_empty());
+        assert_eq!(seq.states, [SubState::Pending, SubState::Pending]);
     }
 
     /// A venue that refuses explicitly takes no strike from a dropped connection, and its refusal

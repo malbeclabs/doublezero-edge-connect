@@ -208,6 +208,16 @@ can be live on the same host at once, so a defined-but-never-traded instrument o
 publisher is legitimately absent from the catalog while every instrument from the former kind appears
 up front.
 
+**Loopback (`127.0.0.1:9099`) by default, and that default is load-bearing.** The container runs host
+networking, so a wildcard bind here would be genuinely reachable off the host — and this surface has
+**no authentication and no TLS**, same as the rest of the service surface. Terminate at a reverse
+proxy if it must be exposed beyond a trusted network.
+
+Activation mirrors the WebSocket sink exactly: *configured* by a non-empty `--api-bind`
+(`--api-bind ""` disables it outright), *activated* by the subscription reconciler only once this
+host is subscribed to ≥1 market-data feed, and bound non-fatally — a taken port disables the API for
+that reconcile cycle rather than crash-looping the tunnel.
+
 ### `GET /v1/race`
 
 How often DoubleZero delivered first against each [public input](input-sources.md), and by how much, per raced symbol and per venue. Everything is cumulative from `since_ns`, which is process start. `venues` is empty when no public input is on.
@@ -238,16 +248,6 @@ RACE = { "won": { "edge": 0, "public": 0 },
 | `racing` | The subscription is live and the edge defines the symbol. Counts accrue only in this state. |
 | `no_edge` | The subscription is live, but the edge does not deliver this symbol to this host: the venue's catalog has instruments and this symbol is not among them, or it has none 30 s after the input first connected. It moves to `racing` if the edge later defines the symbol. |
 | `refused` | The venue rejected the name, so it is not subscribed again until restart. See [Inputs](input-sources.md). |
-
-**Loopback (`127.0.0.1:9099`) by default, and that default is load-bearing.** The container runs host
-networking, so a wildcard bind here would be genuinely reachable off the host — and this surface has
-**no authentication and no TLS**, same as the rest of the service surface. Terminate at a reverse
-proxy if it must be exposed beyond a trusted network.
-
-Activation mirrors the WebSocket sink exactly: *configured* by a non-empty `--api-bind`
-(`--api-bind ""` disables it outright), *activated* by the subscription reconciler only once this
-host is subscribed to ≥1 market-data feed, and bound non-fatally — a taken port disables the API for
-that reconcile cycle rather than crash-looping the tunnel.
 
 ## Admin surface (`/admin`)
 

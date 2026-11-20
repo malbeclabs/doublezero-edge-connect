@@ -123,6 +123,28 @@ async fn the_binary_serves_both_inputs_race() {
     assert_eq!(symbol(&race, "PHOENIX", "SOL")["status"], "pending");
 }
 
+/// An empty list, as a shell sends to mean off, starts no input and leaves the bridge serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_empty_name_list_leaves_its_input_off() {
+    let api = "127.0.0.1:19196";
+    let mut bridge = Bridge::spawn_with_args(
+        "HYPERLIQUID",
+        18196,
+        &[
+            "--ws-input-coins",
+            "",
+            "--phoenix-ws-input-markets",
+            ",",
+            "--api-bind",
+            api,
+        ],
+    );
+    let race = race_until(api, Duration::from_secs(10), |r| r["venues"].is_array()).await;
+    assert_eq!(race["venues"], json!([]), "{race}");
+    assert!(bridge.running(), "the bridge exited");
+}
+
 /// The edge's datagrams handed to the processor the way a receiver hands them on, so the race is
 /// counted through the real decode, arbiter, input and API without a multicast socket.
 struct Edge {
@@ -256,10 +278,12 @@ async fn a_live_symbol_counts_both_inputs() {
     mock.send_bbo("BTC", low_ms - 1_000, 1.0, 1.0, 2.0, 1.0);
     mock.send_trade("BTC", "B", 1.0, 1.0, low_ms - 1_000, 1);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while (emitted("quote"), emitted("trade")) == replayed && tokio::time::Instant::now() < deadline
+    while (emitted("quote") == replayed.0 || emitted("trade") == replayed.1)
+        && tokio::time::Instant::now() < deadline
     {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // The input marks each live right after emitting its frame.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     edge.send(rest, PortRole::Mktdata);

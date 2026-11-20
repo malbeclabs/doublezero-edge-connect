@@ -111,6 +111,10 @@ impl Bridge {
         bridge
     }
 
+    pub fn running(&mut self) -> bool {
+        self.child.try_wait().expect("polling the bridge").is_none()
+    }
+
     fn wait_ready(&self, timeout: Duration, ready_flag: Arc<(Mutex<bool>, Condvar)>) {
         let deadline = Instant::now() + timeout;
 

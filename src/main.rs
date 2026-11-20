@@ -816,15 +816,18 @@ async fn main() -> Result<()> {
     // convention). It emits through the same shared arbiter as the multicast receivers, so the public
     // feed races the edge per (venue, symbol) tick and backstops it. Failure-isolated: it reconnects
     // internally and never returns, so its churn can't touch the multicast hot path.
-    let ws_input = if args.ws_input_coins.is_empty() {
+    // Gated on the names `distinct` keeps: with none the input returns at once, and a finished
+    // input ends `main` below.
+    let ws_input_coins = ingest::public_input::distinct(args.ws_input_coins.clone());
+    let ws_input = if ws_input_coins.is_empty() {
         info!("public WS input disabled (no --ws-input-coins)");
         None
     } else {
-        info!(coins = ?args.ws_input_coins, url = %args.ws_input_url,
+        info!(coins = ?ws_input_coins, url = %args.ws_input_url,
               "starting public WS input");
         Some(tokio::spawn(ingest::ws_input::run(
             args.ws_input_url.clone(),
-            args.ws_input_coins.clone(),
+            ws_input_coins,
             arbiter.clone(),
             instruments.clone(),
         )))
@@ -833,15 +836,17 @@ async fn main() -> Result<()> {
     // Phoenix public-API trade input: off unless `--phoenix-ws-input-markets` is non-empty. Same
     // shape as the HL input — its own failure-isolated task emitting through the shared arbiter, so
     // public trades race the edge Phoenix multicast (deduped on trade_id) and backstop it.
-    let phoenix_ws_input = if args.phoenix_ws_input_markets.is_empty() {
+    let phoenix_ws_input_markets =
+        ingest::public_input::distinct(args.phoenix_ws_input_markets.clone());
+    let phoenix_ws_input = if phoenix_ws_input_markets.is_empty() {
         info!("Phoenix public WS trade input disabled (no --phoenix-ws-input-markets)");
         None
     } else {
-        info!(markets = ?args.phoenix_ws_input_markets, url = %args.phoenix_ws_input_url,
+        info!(markets = ?phoenix_ws_input_markets, url = %args.phoenix_ws_input_url,
               "starting Phoenix public WS trade input");
         Some(tokio::spawn(ingest::phoenix_input::run(
             args.phoenix_ws_input_url.clone(),
-            args.phoenix_ws_input_markets.clone(),
+            phoenix_ws_input_markets,
             arbiter.clone(),
             instruments.clone(),
         )))
