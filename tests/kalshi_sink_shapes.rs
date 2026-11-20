@@ -282,8 +282,12 @@ async fn control_frames_parse_as_nautilus_parses_them() {
             let next = tokio::time::timeout(Duration::from_secs(5), ws.next())
                 .await
                 .unwrap();
-            if let Some(Ok(Message::Text(t))) = next {
-                out.push(serde_json::from_str::<KalshiWsMessage>(&t).expect("must parse"));
+            match next {
+                Some(Ok(Message::Text(t))) => {
+                    out.push(serde_json::from_str::<KalshiWsMessage>(&t).expect("must parse"))
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                other => panic!("after {out:?}, the sink sent {other:?}"),
             }
         }
         out

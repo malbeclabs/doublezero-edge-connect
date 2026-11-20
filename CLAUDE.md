@@ -1157,14 +1157,17 @@ Modules are grouped by role under `src/`:
   books. ⚠️ **`orderbook_delta` is relative**, so the shared stage (`prepare_loop`) is the single
   writer of what every client holds: it folds each logical event at its `last` and publishes the net
   per-level change under one `clock`. A snapshot is copied from the stage under the sink's own mutex,
-  and a client skips a queued change at or below its snapshot's `clock`; committing before
-  broadcasting is what makes that exact. ⚠️ **A replaced book goes out as deltas, removals first**:
+  stamped with the stage's `clock` rather than its market's (an eviction leaves removals queued),
+  and a client skips a queued change at or below it; committing before broadcasting is what makes
+  that exact. ⚠️ **A replaced book goes out as deltas, removals first**:
   Kalshi clients apply a snapshot only on subscribe and `get_snapshot`, and Nautilus rejects a crossed
   or locked book after *each* delta, so any other order fails a re-baseline that moves the spread.
   ⚠️ **A both-sides clear is whole only if the replay entry is** — the arbiter's degraded re-baseline
   is a bare clear. ⚠️ **A re-read of the replay entry is ahead of the broadcast**, so from one until
-  the stage has drained what was queued before it (`catching_up`), every close re-reads rather than
-  folds: folding those batches again walks levels back. ⚠️ **Each event market has two keys**: both
+  the stage has drained what was queued when it counted (`catching_up`), every close re-reads rather
+  than folds: folding those batches again walks levels back. The count is taken **after** the read:
+  the arbiter writes before it broadcasts, so a count taken first misses a commit landing in
+  between. ⚠️ **Each event market has two keys**: both
   hosts publish it and each numbers instruments itself, so the edge-connect channel fold cannot merge
   them. The stage follows one key per ticker and fails over to the other (`FAILOVER_NS`, or a book
   that is not whole); a second key is never an ambiguity to refuse. ⚠️ **Nothing a client does closes its

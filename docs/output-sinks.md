@@ -190,7 +190,7 @@ Like the Hyperliquid sink, it is a rendering, not a second protocol. Nothing abo
 | Channel | Contract |
 |---|---|
 | `orderbook_delta` | An `orderbook_snapshot` on subscribe and on `get_snapshot`, then `orderbook_delta`, from the market-by-price book (`edge-kalshi-*-mbp`). Requires `market_tickers`. |
-| `ticker` | Our top-of-book `quote` (`edge-kalshi-*-tob`), sent on each quote. `send_initial_snapshot` replays the last one. |
+| `ticker` | Our top-of-book `quote` (`edge-kalshi-*-tob`), sent on each quote. `send_initial_snapshot` replays each subscribed market's last one, or every market's without `market_tickers`. |
 | `trade` | Our `trade`. |
 | `market_lifecycle_v2` | Acknowledged, and nothing is ever sent on it. |
 

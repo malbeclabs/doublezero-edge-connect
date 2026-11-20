@@ -283,8 +283,6 @@ struct Book {
     /// The next close re-reads the replay entry instead of folding `pending`, whose event lost
     /// batches or came from another key.
     resync: bool,
-    /// The clock of the last change published, `0` if none.
-    clock: u64,
     /// When the followed key last published, on the monotonic clock.
     seen_ns: u64,
 }
@@ -315,9 +313,8 @@ struct State {
     books: HashMap<Arc<str>, Book>,
     /// `books` in the order they were created, oldest first.
     order: VecDeque<Arc<str>>,
-    /// Messages still queued from before the last re-read of a replay entry. The entry is ahead of
-    /// them, so until they are through, a close re-reads rather than fold them again and walk levels
-    /// back.
+    /// Messages queued behind the last re-read of a replay entry, which may already hold them:
+    /// until they are through, a close re-reads rather than fold them again and walk levels back.
     owed: usize,
     /// Whether the message being folded is one of `owed`.
     catching_up: bool,
@@ -404,7 +401,6 @@ impl Book {
             complete: false,
             pending: Vec::new(),
             resync: true,
-            clock: 0,
             seen_ns: 0,
         }
     }
@@ -577,7 +573,6 @@ impl State {
             return None;
         }
         self.clock += 1;
-        self.books.get_mut(ticker)?.clock = self.clock;
         Some(Prepared::Book {
             ticker: ticker.clone(),
             clock: self.clock,
@@ -586,14 +581,16 @@ impl State {
         })
     }
 
-    /// Fold one broadcast message, or re-read every book after a gap (`None`). `queued` is how many
-    /// messages wait behind it.
+    /// Fold one broadcast message, or re-read every book after a gap (`None`). `queued` counts the
+    /// messages behind it, and is called after the replay reads: the arbiter writes there before it
+    /// broadcasts, so a count taken first misses a commit landing in between. A batch written but
+    /// not yet sent is its entry's newest, so folding it again is a no-op.
     fn next(
         &mut self,
         msg: Option<&FeedMessage>,
         replay: &BookSnapshot,
         instruments: &InstrumentSnapshot,
-        queued: usize,
+        queued: impl FnOnce() -> usize,
     ) -> Vec<Prepared> {
         let out = match msg {
             Some(m) => {
@@ -604,7 +601,7 @@ impl State {
             None => self.resync_all(replay),
         };
         if std::mem::take(&mut self.reread) {
-            self.owed = self.owed.max(queued);
+            self.owed = self.owed.max(queued());
         }
         out
     }
@@ -831,11 +828,11 @@ async fn prepare_loop(
 ) {
     loop {
         let prepared = match backbone.recv().await {
-            Ok(m) => lock(&state).next(Some(&m), &replay, &instruments, backbone.len()),
+            Ok(m) => lock(&state).next(Some(&m), &replay, &instruments, || backbone.len()),
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!("kalshi sink prepare stage lagged, dropped {n}");
                 dropped("prepare_lagged");
-                lock(&state).next(None, &replay, &instruments, backbone.len())
+                lock(&state).next(None, &replay, &instruments, || backbone.len())
             }
             Err(broadcast::error::RecvError::Closed) => break,
         };
@@ -1118,7 +1115,7 @@ impl Session {
             });
             out.extend(self.initial(
                 channel,
-                tickers.as_deref().unwrap_or_default(),
+                tickers.as_deref(),
                 flag("send_initial_snapshot"),
                 state,
             ));
@@ -1126,16 +1123,18 @@ impl Session {
         Ok(out)
     }
 
-    /// What a new market on `channel` is sent first: its book, or its last quote when asked.
+    /// What new markets on `channel` are sent first: their books, or their last quotes when asked.
+    /// `None` is every market.
     fn initial(
         &mut self,
         channel: Channel,
-        tickers: &[Arc<str>],
+        tickers: Option<&[Arc<str>]>,
         send_initial_snapshot: bool,
         state: &Mutex<State>,
     ) -> Vec<Out> {
         match channel {
             Channel::Book => tickers
+                .unwrap_or_default()
                 .iter()
                 .map(|t| self.snapshot(t, None, state))
                 .collect(),
@@ -1143,13 +1142,23 @@ impl Session {
                 let Some(sid) = self.sub_mut(channel).map(|s| s.sid) else {
                     return Vec::new();
                 };
-                let st = lock(state);
-                tickers
+                let quoted = |(t, top): (&Arc<str>, &Top)| Some((t.clone(), top.quote?, top.print));
+                // Rendered after the lock drops: without a filter, this is every market.
+                let quotes: Vec<_> = {
+                    let st = lock(state);
+                    match tickers {
+                        Some(t) => t
+                            .iter()
+                            .filter_map(|t| quoted((t, st.tops.get(t)?)))
+                            .collect(),
+                        None => st.tops.iter().filter_map(quoted).collect(),
+                    }
+                };
+                quotes
                     .iter()
-                    .filter_map(|t| {
-                        let top = st.tops.get(t)?;
-                        let msg = ticker_msg(t, &top.quote?, top.print);
-                        Some(("ticker", frame("ticker", None, Some(sid), None, Some(&msg))))
+                    .map(|(t, q, print)| {
+                        let msg = ticker_msg(t, q, *print);
+                        ("ticker", frame("ticker", None, Some(sid), None, Some(&msg)))
                     })
                     .collect()
             }
@@ -1158,13 +1167,14 @@ impl Session {
     }
 
     /// One market's book as it stands, on the book subscription. Unknown and incomplete markets are
-    /// empty, as Kalshi answers a ticker it has no book for.
+    /// empty, as Kalshi answers a ticker it has no book for. Stamped with the stage's clock rather
+    /// than the market's, so it also covers the removals an eviction left queued.
     fn snapshot(&mut self, ticker: &Arc<str>, id: Option<u64>, state: &Mutex<State>) -> Out {
-        let (clock, [bids, asks]) = lock(state)
-            .books
-            .get(ticker)
-            .map(|b| (b.clock, b.levels.clone()))
-            .unwrap_or_default();
+        let (clock, [bids, asks]) = {
+            let st = lock(state);
+            let levels = st.books.get(ticker).map(|b| b.levels.clone());
+            (st.clock, levels.unwrap_or_default())
+        };
         let Some(sub) = self.sub_mut(Channel::Book) else {
             return error(id, None, refusal(7, "Unknown subscription ID"));
         };
@@ -1292,7 +1302,7 @@ impl Session {
         }
         held.extend(added.iter().cloned());
         let mut out = vec![self.ok(id, sid)];
-        out.extend(self.initial(channel, &added, send_initial_snapshot, state));
+        out.extend(self.initial(channel, Some(&added), send_initial_snapshot, state));
         Ok(out)
     }
 
@@ -1674,7 +1684,7 @@ mod tests {
 
         /// The stage reading `msg`, or a gap, with `queued` more behind it.
         fn read(&self, msg: Option<&FeedMessage>, queued: usize) -> Vec<Prepared> {
-            lock(&self.state).next(msg, &self.replay, &self.catalog, queued)
+            lock(&self.state).next(msg, &self.replay, &self.catalog, || queued)
         }
 
         /// The arbiter's half of a publish alone: what a lagging stage has not read yet.
@@ -1717,22 +1727,21 @@ mod tests {
         }
     }
 
+    fn symbol(id: u32) -> &'static str {
+        match id {
+            2 => OTHER,
+            9 => PERP,
+            _ => TICKER,
+        }
+    }
+
     fn batch(id: u32, changes: Vec<BookChange>, last: bool) -> NormalizedBook {
-        let (k, symbol) = (
-            key(id),
-            if id == 2 {
-                OTHER
-            } else if id == 9 {
-                PERP
-            } else {
-                TICKER
-            },
-        );
+        let k = key(id);
         NormalizedBook {
             venue: k.0.name_arc().clone(),
             source_name: k.0.name_arc().clone(),
             source_id: KALSHI_SOURCE_ID,
-            symbol: symbol.into(),
+            symbol: symbol(id).into(),
             channel: k.2,
             instrument_id: id,
             category: k.1,
@@ -1755,7 +1764,7 @@ mod tests {
             venue: k.0.name_arc().clone(),
             source_name: k.0.name_arc().clone(),
             source_id: KALSHI_SOURCE_ID,
-            symbol: if id == 9 { PERP } else { TICKER }.into(),
+            symbol: symbol(id).into(),
             bid: apply_exponent(bid.0, -4),
             ask: apply_exponent(ask.0, -4),
             bid_size: apply_exponent(bid.1 as i64, -2),
@@ -2019,10 +2028,13 @@ mod tests {
             (Some(OTHER), Some(2))
         );
         assert_eq!(
-            frames[2]["msg"]["clock"], 0,
+            frames[2]["msg"]["clock"], frames[1]["msg"]["clock"],
+            "every snapshot carries the stage's clock"
+        );
+        assert!(
+            frames[2]["msg"].get("yes_dollars_fp").is_none(),
             "a market with no book is empty"
         );
-        assert!(frames[2]["msg"].get("yes_dollars_fp").is_none());
 
         let p = stage.feed(FeedMessage::Book(batch(
             1,
@@ -2221,6 +2233,34 @@ mod tests {
             true,
         )));
         assert_eq!(deliver(&mut s, &next).len(), 1);
+    }
+
+    /// An evicted market's snapshot, gone or back but unpublished, holds its queued removals.
+    #[test]
+    fn an_evicted_markets_queued_removals_are_in_a_later_snapshot() {
+        for recreated in [false, true] {
+            let stage = Stage::new();
+            stage.rebaseline(1, &[(0.40, 10.0)], &[(0.45, 4.0)]);
+            let removals: Vec<Prepared> = lock(&stage.state).evict_oldest().into_iter().collect();
+            assert_eq!(removals.len(), 1);
+            if recreated {
+                let open = batch(
+                    1,
+                    vec![change(BookAction::Update, BookSide::Bid, 0.41, 1.0)],
+                    false,
+                );
+                assert!(stage.feed(FeedMessage::Book(open)).is_empty());
+            }
+            let mut s = Session::default();
+            let mut client = Client::default();
+            for f in subscribe_book(&mut s, &stage, &[TICKER], true) {
+                client.apply(&f, true);
+            }
+            for f in deliver(&mut s, &removals) {
+                client.apply(&f, true);
+            }
+            assert_eq!(client.levels(), (vec![], vec![]));
+        }
     }
 
     /// The answer to the gap carries the command's id and moves the client's watermark.
@@ -2486,6 +2526,62 @@ mod tests {
         assert!(matches!(&p[0], Prepared::Book { deltas, .. } if deltas[0].delta == 100));
     }
 
+    /// A commit landing as the backlog is counted is in the count or not yet in the re-read.
+    #[test]
+    fn a_commit_racing_the_backlog_count_is_never_folded_twice() {
+        let update = |side, price, size| change(BookAction::Update, side, price, size);
+        for gap in [false, true] {
+            let stage = Stage::new();
+            let mut s = Session::default();
+            let mut client = Client::default();
+            for f in subscribe_book(&mut s, &stage, &[TICKER], true) {
+                client.apply(&f, true);
+            }
+            let opening = FeedMessage::Book(batch(
+                1,
+                vec![
+                    change(BookAction::Clear, BookSide::Both, 0.0, 0.0),
+                    update(BookSide::Bid, 0.40, 10.0),
+                ],
+                true,
+            ));
+            stage.publish(&opening);
+            let mut p = Vec::new();
+            if gap {
+                p.extend(stage.read(Some(&opening), 0));
+            }
+            // The third event lifts the 0.42 ask the second one placed.
+            let racing = [
+                vec![update(BookSide::Bid, 0.41, 2.0)],
+                vec![update(BookSide::Ask, 0.42, 5.0)],
+                vec![
+                    change(BookAction::Delete, BookSide::Ask, 0.42, 0.0),
+                    update(BookSide::Bid, 0.43, 1.0),
+                ],
+            ]
+            .map(|changes| FeedMessage::Book(batch(1, changes, true)));
+            // A new book re-reads at its first close, and a gap re-reads every book.
+            let trigger = (!gap).then_some(&opening);
+            p.extend(
+                lock(&stage.state).next(trigger, &stage.replay, &stage.catalog, || {
+                    racing.iter().for_each(|m| stage.publish(m));
+                    0
+                }),
+            );
+            for (i, m) in racing.iter().enumerate() {
+                p.extend(stage.read(Some(m), racing.len() - 1 - i));
+            }
+            for f in deliver(&mut s, &p) {
+                client.apply(&f, true);
+            }
+            assert_eq!(client.levels(), stage_levels(&stage, TICKER));
+            assert_eq!(
+                Some(stage.levels(TICKER)),
+                replay_levels(&stage.replay, &key(1), TICKER)
+            );
+        }
+    }
+
     #[test]
     fn markets_are_added_deleted_and_unsubscribed_on_one_seq() {
         let stage = Stage::new();
@@ -2709,6 +2805,31 @@ mod tests {
         );
         assert!(frames[1].get("seq").is_none());
         assert_eq!(frames[1]["msg"]["yes_ask_dollars"], "0.4200");
+    }
+
+    /// Without a market filter, every market's last quote is replayed; with one, only its markets'.
+    #[test]
+    fn send_initial_snapshot_without_a_filter_replays_every_quote() {
+        let stage = Stage::new();
+        for id in [1, 2] {
+            stage.feed(FeedMessage::Quote(quote(id, (4_000, 1_000), (4_200, 500))));
+        }
+        let replayed = |filter: &[&str]| {
+            let mut params = j!({"channels": ["ticker"], "send_initial_snapshot": true});
+            if !filter.is_empty() {
+                params["market_tickers"] = j!(filter);
+            }
+            let cmd = j!({"id": 1, "cmd": "subscribe", "params": params});
+            let mut tickers: Vec<String> = command(&mut Session::default(), &stage, cmd)
+                .iter()
+                .filter(|f| f["type"] == "ticker")
+                .map(|f| f["msg"]["market_ticker"].as_str().unwrap().into())
+                .collect();
+            tickers.sort();
+            tickers
+        };
+        assert_eq!(replayed(&[]), [TICKER, OTHER]);
+        assert_eq!(replayed(&[OTHER]), [OTHER]);
     }
 
     /// YES and NO sum to exactly a dollar, and a print with no aggressor is not sent.
