@@ -53,10 +53,12 @@ use super::http::{self, Request, Response};
 use crate::{
     history,
     ingest::{
+        arbiter::SharedArbiter,
         channel_filter::ChannelFilter,
         feeds::{feeds, Feed, FeedKind},
         health::{SharedFeedHealth, TapeLiveness},
         processor::DEPTH_LEVELS,
+        race::{Figures, Kind, EDGE, PUBLIC},
         sources::source_ids_of,
     },
     model::{
@@ -116,6 +118,8 @@ struct ApiState {
     /// The `--feed`/`--publisher-port`-selected rows this process may run — fixed for the process's
     /// lifetime, mirroring `sinks::admin::AdminState::enabled`. What the `channels` block iterates.
     enabled: Vec<Feed>,
+    /// Read for `/v1/race`'s board only.
+    arbiter: SharedArbiter,
 }
 
 /// Bind the listener up front so the caller can decide what a bind failure means — mirrors
@@ -138,6 +142,7 @@ pub async fn serve(
     health: SharedFeedHealth,
     filter: Arc<Mutex<ChannelFilter>>,
     enabled: Vec<Feed>,
+    arbiter: SharedArbiter,
 ) -> Result<()> {
     let state = Arc::new(ApiState {
         instruments,
@@ -147,6 +152,7 @@ pub async fn serve(
         health,
         filter,
         enabled,
+        arbiter,
     });
     http::serve_loop(
         listener,
@@ -176,6 +182,9 @@ fn handle(state: &ApiState, req: &Request) -> Response {
     }
     if path == "/v1/status" {
         return status(state);
+    }
+    if path == "/v1/race" {
+        return race(state);
     }
     if let Some(rest) = path.strip_prefix("/v1/products/") {
         return product_scoped(state, rest, req);
@@ -1028,6 +1037,74 @@ fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
 }
 
 // ---------------------------------------------------------------------------------------------
+// GET /v1/race
+// ---------------------------------------------------------------------------------------------
+
+/// Each public input's race against the edge (`ingest::race`). A symbol's status reads the edge
+/// catalog: one pass over it, after the arbiter's lock is released.
+fn race(state: &ApiState) -> Response {
+    let snap = crate::ingest::arbiter::lock(&state.arbiter)
+        .race_board()
+        .snapshot();
+    let mut defined: HashMap<u16, HashSet<Arc<str>>> = snap
+        .venues
+        .iter()
+        .map(|v| (v.source_id, HashSet::new()))
+        .collect();
+    for i in crate::model::lock(&state.instruments).values() {
+        if let Some(symbols) = defined.get_mut(&i.source_id) {
+            symbols.insert(i.symbol.clone());
+        }
+    }
+    let now = crate::model::now_ns();
+    let venues: Vec<Value> = snap
+        .venues
+        .iter()
+        .map(|v| {
+            let catalog = &defined[&v.source_id];
+            let symbols: Vec<Value> = v
+                .symbols
+                .iter()
+                .map(|s| {
+                    let status = s.status(
+                        catalog.contains(s.symbol.as_str()),
+                        !catalog.is_empty(),
+                        v.grace_over(now),
+                    );
+                    let mut out = json!({ "symbol": s.symbol, "status": status.label() });
+                    for kind in Kind::ALL {
+                        if let Some(f) = s.figures(kind) {
+                            out[kind.label()] = race_figures(f);
+                        }
+                    }
+                    out
+                })
+                .collect();
+            let mut out = json!({
+                "venue": v.venue,
+                "public_input": { "up": v.up, "reconnects": v.reconnects },
+                "symbols": symbols,
+            });
+            for kind in Kind::ALL {
+                if let Some(f) = v.total(kind) {
+                    out[kind.label()] = race_figures(&f);
+                }
+            }
+            out
+        })
+        .collect();
+    ok_json(json!({ "since_ns": snap.since_ns, "venues": venues }))
+}
+
+fn race_figures(f: &Figures) -> Value {
+    let lead = |side: usize| json!({ "p50": f.lead[side].quantile(0.5), "p99": f.lead[side].quantile(0.99) });
+    json!({
+        "won": { "edge": f.won[EDGE], "public": f.won[PUBLIC] },
+        "lead_ns": { "edge": lead(EDGE), "public": lead(PUBLIC) },
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
 // GET /v1/status
 // ---------------------------------------------------------------------------------------------
 
@@ -1360,7 +1437,8 @@ fn unknown_endpoint(path: &str) -> Response {
         "unknown_endpoint",
         format!("\"{path}\" is not a route this API serves."),
         "Use one of: /v1/products, /v1/products/{id}, /v1/products/{id}/ticker, \
-         /v1/products/{id}/candles, /v1/products/{id}/book, /v1/best_bid_ask, /v1/status.",
+         /v1/products/{id}/candles, /v1/products/{id}/book, /v1/best_bid_ask, /v1/status, \
+         /v1/race.",
     )
 }
 
@@ -1525,6 +1603,11 @@ mod tests {
         )
     }
 
+    fn test_arbiter() -> SharedArbiter {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        Arc::new(Mutex::new(crate::ingest::arbiter::Arbiter::new(tx, 8)))
+    }
+
     /// Spawn `serve` over an ephemeral listener and return its base URL. The join handle is
     /// dropped intentionally (matches `sinks::metrics`'s test pattern) — the spawned task is
     /// aborted implicitly when the test process exits.
@@ -1550,6 +1633,7 @@ mod tests {
                 health,
                 filter,
                 enabled,
+                test_arbiter(),
             )
             .await;
         });
@@ -2558,6 +2642,7 @@ mod tests {
             health,
             filter,
             enabled,
+            arbiter: test_arbiter(),
         };
         let inst = inst_in("perps", 3, "HUGE", "HUGEBOOK", 9, 1, -4, -2);
 
@@ -2635,6 +2720,7 @@ mod tests {
             health,
             filter,
             enabled,
+            arbiter: test_arbiter(),
         };
         let inst = inst_in("perps", 3, "KALSHI", "EMPTYACC", 2, 41, -4, -2);
         assert_eq!(
@@ -2685,6 +2771,7 @@ mod tests {
             health,
             filter,
             enabled,
+            arbiter: test_arbiter(),
         };
         for id in [41u32, 42u32] {
             let inst = inst_in("perps", 3, "KALSHI", "COLLIDE", 2, id, -4, -2);
@@ -2738,6 +2825,7 @@ mod tests {
             health,
             filter,
             enabled,
+            arbiter: test_arbiter(),
         };
         assert!(is_ambiguous(&state, "SHARED", &Arc::from("B")));
         for (inst, bid) in insts {
@@ -2836,6 +2924,7 @@ mod tests {
             health,
             filter,
             enabled,
+            arbiter: test_arbiter(),
         };
         let inst = inst_in("perps", 3, "HUGE", "HUGEL3", 9, 1, -4, -2);
 
@@ -3944,6 +4033,7 @@ mod tests {
             health,
             filter,
             enabled,
+            arbiter: test_arbiter(),
         };
         for method in ["POST", "PUT", "PATCH", "DELETE"] {
             let req = Request {
@@ -4604,6 +4694,7 @@ mod tests {
             health,
             filter,
             enabled,
+            arbiter: test_arbiter(),
         });
 
         let instruments_guard = instruments.lock().unwrap();
@@ -4627,5 +4718,107 @@ mod tests {
 
         drop(instruments_guard);
         worker.join().unwrap();
+    }
+
+    /// `/v1/race` per the agreed shape: venues sorted, symbols in configured order, a trades-only
+    /// venue carrying no `quotes`, and a status for each symbol read off the edge catalog.
+    #[test]
+    fn race_reports_each_input_by_venue_then_symbol() {
+        use crate::ingest::race::{Kind, SubState};
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        instruments.lock().unwrap().insert(
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
+            inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
+        );
+        let arbiter = test_arbiter();
+        {
+            let mut a = crate::ingest::arbiter::lock(&arbiter);
+            let board = a.race_board();
+            board.register(2, "PHOENIX", [("SOL", Kind::Trades)]);
+            board.register(
+                1,
+                "HYPERLIQUID",
+                ["BTC", "ETH", "NOPE"]
+                    .into_iter()
+                    .flat_map(|s| Kind::ALL.map(|k| (s, k))),
+            );
+            board.set_up(1, true);
+            board.count_reconnect(1);
+            for (symbol, state) in [
+                ("BTC", SubState::Live),
+                ("ETH", SubState::Acked),
+                ("NOPE", SubState::Refused),
+            ] {
+                for kind in Kind::ALL {
+                    board.set_state(1, symbol, kind, state);
+                }
+            }
+        }
+        let state = ApiState {
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+            filter,
+            enabled,
+            arbiter,
+        };
+        let (status, _, body) = race(&state);
+        assert_eq!(status, "200 OK");
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["since_ns"].as_u64().is_some_and(|ns| ns > 0));
+        let venues = v["venues"].as_array().unwrap();
+        assert_eq!(venues[0]["venue"], "HYPERLIQUID");
+        assert_eq!(
+            venues[0]["public_input"],
+            json!({ "up": true, "reconnects": 1 })
+        );
+        let statuses: Vec<(&str, &str)> = venues[0]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["symbol"].as_str().unwrap(), s["status"].as_str().unwrap()))
+            .collect();
+        // ETH: confirmed, while the edge defines the venue's BTC but not it.
+        assert_eq!(
+            statuses,
+            [("BTC", "racing"), ("ETH", "no_edge"), ("NOPE", "refused")]
+        );
+        assert_eq!(
+            venues[0]["quotes"],
+            json!({
+                "won": { "edge": 0, "public": 0 },
+                "lead_ns": {
+                    "edge": { "p50": null, "p99": null },
+                    "public": { "p50": null, "p99": null },
+                },
+            })
+        );
+        assert_eq!(venues[0]["symbols"][0]["trades"], venues[0]["trades"]);
+
+        assert_eq!(venues[1]["venue"], "PHOENIX");
+        assert!(venues[1].get("quotes").is_none());
+        assert!(venues[1]["symbols"][0].get("quotes").is_none());
+        assert_eq!(venues[1]["symbols"][0]["status"], "pending");
+        assert_eq!(venues[1]["public_input"]["up"], false);
+    }
+
+    /// No public input, no venues.
+    #[test]
+    fn race_is_empty_with_no_public_input() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        let state = ApiState {
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+            filter,
+            enabled,
+            arbiter: test_arbiter(),
+        };
+        let v: Value = serde_json::from_slice(&race(&state).2).unwrap();
+        assert_eq!(v["venues"], json!([]));
     }
 }

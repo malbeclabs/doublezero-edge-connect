@@ -170,8 +170,8 @@ product in one response, no page size imposed unless asked), `GET /v1/products/{
 fields), `GET /v1/products/{id}/ticker` (recent trades + best bid/ask), `GET
 /v1/products/{id}/candles` (OHLCV, `granularity`/`limit` query params), `GET /v1/products/{id}/book`
 (order book), `GET /v1/best_bid_ask` (best bid/ask, optionally narrowed with a comma-separated
-`product_ids` query param), and `GET /v1/status`
-(per-venue feed health plus history-store stats). `{id}` is `SOURCE:SYMBOL` (e.g. `HYPERLIQUID:BTC`),
+`product_ids` query param), `GET /v1/status`
+(per-venue feed health plus history-store stats), and [`GET /v1/race`](#get-v1race). `{id}` is `SOURCE:SYMBOL` (e.g. `HYPERLIQUID:BTC`),
 with an `#<channel>.<instrument_id>` suffix needed only where a bare symbol collides across markets.
 The [`doublezero-edge`](../README.md#query-market-data-the-doublezero-edge-cli) CLI is a thin client
 over this surface.
@@ -207,6 +207,37 @@ known*](../PROTOCOL.md#a-symbol-appears-only-once-its-source-id-is-known)). Both
 can be live on the same host at once, so a defined-but-never-traded instrument on the latter kind of
 publisher is legitimately absent from the catalog while every instrument from the former kind appears
 up front.
+
+### `GET /v1/race`
+
+How often DoubleZero delivered first against each [public input](input-sources.md), and by how much, per raced symbol and per venue. Everything is cumulative from `since_ns`, which is process start. `venues` is empty when no public input is on.
+
+```json
+{
+  "since_ns": 1795132800000000000,
+  "venues": [{
+    "venue": "HYPERLIQUID",
+    "public_input": { "up": true, "reconnects": 0 },
+    "quotes": RACE,
+    "trades": RACE,
+    "symbols": [{ "symbol": "BTC", "status": "racing", "quotes": RACE, "trades": RACE }]
+  }]
+}
+RACE = { "won": { "edge": 0, "public": 0 },
+         "lead_ns": { "edge": { "p50": null, "p99": null }, "public": { "p50": null, "p99": null } } }
+```
+
+- `quotes.won` counts quote ticks by which input delivered the tick first, the rule of `dz_quote_ticks_won_total`: a tick the public input never delivers is an edge win. `trades.won` counts trade ids by whose copy was admitted first. A quote judged on its `Venue Update ID` is not counted, as on that metric, so a venue whose edge quotes carry one reads `0` for both.
+- `lead_ns` is how far ahead the winner was when the other input's first copy arrived, keyed by the winner: p50 and p99, within about 9%, and `null` with no samples.
+- A symbol counts only while its public subscription is confirmed and past the venue's replay of earlier state, so only while its input is connected. A venue's figures are its symbols' merged.
+- Venues are sorted by name, and symbols keep their configured order. Phoenix races trades only, so it has no `quotes`.
+
+| `status` | Meaning |
+|---|---|
+| `pending` | The public subscription is not confirmed yet, or the edge has defined none of the venue's instruments yet. That is startup. |
+| `racing` | The subscription is live and the edge defines the symbol. Counts accrue only in this state. |
+| `no_edge` | The subscription is live, but the edge does not deliver this symbol to this host: the venue's catalog has instruments and this symbol is not among them, or it has none 30 s after the input first connected. It moves to `racing` if the edge later defines the symbol. |
+| `refused` | The venue rejected the name, so it is not subscribed again until restart. See [Inputs](input-sources.md). |
 
 **Loopback (`127.0.0.1:9099`) by default, and that default is load-bearing.** The container runs host
 networking, so a wildcard bind here would be genuinely reachable off the host — and this surface has

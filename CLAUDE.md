@@ -742,11 +742,14 @@ Modules are grouped by role under `src/`:
   two-path row (Kalshi's); docs/metrics.md carries the same caveat, since a dashboard alerting on the ratio
   would otherwise show a standing false positive.
 - **`ingest/public_input.rs`** — venue-generic **public WS input** scaffolding shared by all
-  public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
+  public backstops: the `PublicVenue` trait (`venue`/`source_id`/`url`/`subscriptions`/`handle_text`,
+  plus `REFUSES_BY_DISCONNECT`/`REPLAYS_ON_SUBSCRIBE`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
-  `venue`; no-op when `subscribe_msgs()` is empty; never propagates an error), the frame pump, and the
+  `venue`; no-op when `subscriptions()` is empty; never propagates an error), the frame pump, and the
   decode helpers (`instrument_known`, `parse_decimal`, `finite_non_negative`). Each venue implements
   only its URL + subscribe frames + wire decode.
+  The `Sequencer` sends **one subscription at a time**, each after the previous one's answer or `ACK_TIMEOUT`, because Hyperliquid answers an unknown coin (`btc` included) by dropping the connection with no frame: only with one subscription in flight is the drop attributable. A name still unanswered when a session ends takes a strike there, and two refuse it for the life of the process — one strike would let a network drop refuse a valid coin. Phoenix refuses with a `400` and takes no strikes. Each subscription's standing is pushed onto `ingest::race`'s board, which gates counting on it.
+- **`ingest/race.rs`** — the board behind `GET /v1/race`: per raced symbol, who delivered each quote tick and trade first, and by how much. It lives inside the `Arbiter`, so counting takes no second lock, and `sinks::api` renders a `snapshot` after the lock drops. `won` reuses the arbiter's own decisions, so it is `dz_quote_ticks_won_total`'s rule on raced symbols; `lead_ns` cannot (the floor's one contest per tick usually goes to an edge mirror), so the board pairs each input's first copy of a `source_ts` tick or `trade_id`, stale copies included. ⚠️ A symbol counts only while its subscription is `Live` — acked, and on Hyperliquid past the replay frame the venue sends on subscribe. Counted otherwise, every tick the public input does not deliver is an edge walkover and the replay pairs with old edge copies; leaving `Live` forgets unpaired copies for the same reason. `status` is derived per request from the board and the edge catalog, never stored.
 - **`ingest/ws_input.rs`** — the Hyperliquid `PublicVenue` (off by default), the first public backstop.
   Connects `wss://api.hyperliquid.xyz/ws` over TLS, subscribes `bbo` + `trades` per coin on one
   connection, decodes the HL JSON → `FeedMessage`, scales the public block time (ms) to ns so it

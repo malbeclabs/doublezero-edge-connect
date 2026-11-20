@@ -1,11 +1,12 @@
 //! Mock public WebSocket **input** server for E2E tests (Hyperliquid and Phoenix shapes).
 //!
-//! Stands in for a venue's public `wss://`: it accepts the bridge's WS-input connection, drains its
-//! `subscribe` frames, and emits scripted JSON on demand (the test pushes frames through a channel,
-//! so it controls exactly when each public update lands relative to the multicast replay). It speaks
-//! both the Hyperliquid `bbo`/`trades` shape ([`Self::send_bbo`]/[`Self::send_trade`]) and the
-//! Phoenix `trades` shape ([`Self::send_phoenix_trade`]). This is the input-side counterpart to
-//! `replay` (multicast) — the output side (`ws_client` + `assertions`) is reused unchanged.
+//! Stands in for a venue's public `wss://`: it accepts the bridge's WS-input connection, answers its
+//! `subscribe` frames as the venue does, and emits scripted JSON on demand (the test pushes frames
+//! through a channel, so it controls exactly when each public update lands relative to the multicast
+//! replay). It speaks both the Hyperliquid `bbo`/`trades` shape ([`Self::send_bbo`]/
+//! [`Self::send_trade`]) and the Phoenix `trades` shape ([`Self::send_phoenix_trade`]). This is the
+//! input-side counterpart to `replay` (multicast) — the output side (`ws_client` + `assertions`) is
+//! reused unchanged.
 
 use std::time::Duration;
 
@@ -21,10 +22,20 @@ pub struct MockWsInput {
 }
 
 impl MockWsInput {
-    /// Bind a loopback port and start accepting WS connections. Each accepted connection drains the
-    /// input's subscribe frames and then forwards any JSON pushed via [`Self::send_raw`] to the
-    /// socket, reconnecting (re-accepting) if the input's connection drops.
+    /// Bind a loopback port and start accepting WS connections. Each accepted connection acks the
+    /// input's subscribe frames and forwards any JSON pushed via [`Self::send_raw`] to the socket,
+    /// reconnecting (re-accepting) if the input's connection drops.
     pub async fn start() -> Self {
+        Self::serve(None).await
+    }
+
+    /// Like [`Self::start`], but a subscription to a name outside `known` is refused as the venue
+    /// refuses it: Hyperliquid drops the connection without a frame, Phoenix answers `400`.
+    pub async fn start_knowing(known: &[&str]) -> Self {
+        Self::serve(Some(known.iter().map(|s| s.to_string()).collect())).await
+    }
+
+    async fn serve(known: Option<Vec<String>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock ws");
@@ -40,9 +51,9 @@ impl MockWsInput {
                     continue;
                 };
                 let (mut write, mut read) = ws.split();
-                // Pump test-scripted frames out while draining (and ignoring) inbound subscribes.
-                // A send error or a closed read half drops back to re-accept; a closed channel ends
-                // the server.
+                // Pump test-scripted frames out while answering inbound subscribes. A send error, a
+                // closed read half or a refusal by disconnect drops back to re-accept; a closed
+                // channel ends the server.
                 loop {
                     tokio::select! {
                         outgoing = rx.recv() => match outgoing {
@@ -54,7 +65,16 @@ impl MockWsInput {
                             None => return, // channel closed: server shutting down
                         },
                         incoming = read.next() => match incoming {
-                            Some(Ok(_)) => continue, // subscribe frame (or ping) — ignore
+                            Some(Ok(Message::Text(txt))) => match answer(&txt, known.as_deref()) {
+                                Answer::Reply(reply) => {
+                                    if write.send(Message::Text(reply.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Answer::Drop => break, // no close frame, as Hyperliquid does
+                                Answer::Nothing => continue,
+                            },
+                            Some(Ok(_)) => continue, // ping/pong
                             _ => break,              // peer closed/errored: re-accept
                         },
                     }
@@ -123,4 +143,39 @@ impl MockWsInput {
             r#"{{"channel":"trades","symbol":"{symbol}","trades":[{{"tradeSequenceNumber":"{seq}","side":"{side}","baseAmount":{base},"quoteAmount":{quote},"timestamp":"{ts_secs}","slot":1,"taker":"x"}}]}}"#
         ));
     }
+}
+
+enum Answer {
+    Reply(String),
+    Drop,
+    Nothing,
+}
+
+/// The venue's answer to one inbound text frame, in the shape of whichever venue's subscribe it is.
+fn answer(txt: &str, known: Option<&[String]>) -> Answer {
+    let frame: serde_json::Value = serde_json::from_str(txt).unwrap_or_default();
+    let sub = &frame["subscription"];
+    let is_known = |name: &str| known.is_none_or(|k| k.iter().any(|n| n == name));
+    if frame["method"] == "subscribe" {
+        if !is_known(sub["coin"].as_str().unwrap_or_default()) {
+            return Answer::Drop;
+        }
+        return Answer::Reply(format!(
+            r#"{{"channel":"subscriptionResponse","data":{{"method":"subscribe","subscription":{sub}}}}}"#
+        ));
+    }
+    if frame["type"] == "subscribe" {
+        let symbol = sub["symbol"].as_str().unwrap_or_default();
+        let answered = format!(r#"{{"channel":"trades","marketSymbol":"{symbol}"}}"#);
+        return Answer::Reply(if is_known(symbol) {
+            format!(
+                r#"{{"channel":"subscriptionStatus","status":"subscribed","subscription":{answered}}}"#
+            )
+        } else {
+            format!(
+                r#"{{"channel":"error","error":"unknown market symbol '{symbol}'","code":400,"subscription":{answered}}}"#
+            )
+        });
+    }
+    Answer::Nothing
 }

@@ -21,16 +21,16 @@
 //! `FEEDS` row depends on this input; it stays off until explicitly enabled with
 //! `--phoenix-ws-input-markets`.
 
-use std::collections::BTreeSet;
-
 use serde::Deserialize;
 
 use crate::{
     ingest::{
         arbiter::{lock, SharedArbiter, Transport},
         public_input::{
-            self, finite_non_negative, resolve_instrument, PublicVenue, ResolvedInstrument,
+            self, finite_non_negative, resolve_instrument, Frame, PublicVenue, ResolvedInstrument,
+            Subscription,
         },
+        race::Kind,
     },
     metrics::metrics,
     model::{
@@ -69,21 +69,37 @@ fn phoenix_venue() -> &'static str {
 /// `category_names_the_row_this_backstop_mirrors` pins the value.
 const PHOENIX_CATEGORY: &str = "perps";
 
-/// One Phoenix `trades` frame: the channel tag, the public market symbol, and the fills. Only the
-/// `trades` channel is acted on; every other frame (subscription status, heartbeat/pong, or one with
-/// no `channel` key at all) is ignored without counting as a decode error — so
-/// `dz_ws_input_decode_errors_total{venue=Phoenix}` stays a real health signal on a chatty control
-/// channel. Fills are decoded **per element** (as raw JSON here, then one-by-one in `handle_text`) so
-/// a single malformed fill can't fail the whole batch — the backstop matters most during bursts, when
-/// `trades` arrays are largest.
+/// One Phoenix frame: a `trades` frame's market symbol and fills, or a subscription answer. Only
+/// those are acted on; every other frame (heartbeat/pong, or one with no `channel` key at all) is
+/// ignored without counting as a decode error — so `dz_ws_input_decode_errors_total{venue=Phoenix}`
+/// stays a real health signal on a chatty control channel. Fills are decoded **per element** (as raw
+/// JSON here, then one-by-one in `handle_text`) so a single malformed fill can't fail the whole batch
+/// — the backstop matters most during bursts, when `trades` arrays are largest.
 #[derive(Deserialize)]
-struct TradesFrame {
+struct PhoenixFrame {
     #[serde(default)]
     channel: Option<String>,
     #[serde(default)]
     symbol: Option<String>,
     #[serde(default)]
     trades: Option<Vec<serde_json::Value>>,
+    /// `subscribed` on a `subscriptionStatus` answer.
+    #[serde(default)]
+    status: Option<String>,
+    /// `400` on an `error` answer refusing an unknown market.
+    #[serde(default)]
+    code: Option<u64>,
+    /// The subscription an answer is about.
+    #[serde(default)]
+    subscription: Option<Subscribed>,
+}
+
+#[derive(Deserialize)]
+struct Subscribed {
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(rename = "marketSymbol", default)]
+    market_symbol: Option<String>,
 }
 
 /// One fill in a Phoenix `trades` frame. Fields beyond these (slot, slotIndex, taker, lots, fees,
@@ -106,7 +122,7 @@ struct Fill {
 /// the wire `symbol` is already the edge symbol — there is no mapping, only the set of markets to back.
 struct PhoenixVenue {
     url: String,
-    symbols: BTreeSet<String>,
+    symbols: Vec<String>,
 }
 
 impl PhoenixVenue {
@@ -116,25 +132,47 @@ impl PhoenixVenue {
     fn new(url: String, markets: Vec<String>) -> Self {
         Self {
             url,
-            symbols: markets.into_iter().collect(),
+            symbols: public_input::distinct(markets),
         }
     }
 
-    /// Decode one Phoenix `trades` frame and emit each fill as a `NormalizedTrade`.
-    fn handle_text(&self, txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) {
-        let frame: TradesFrame = match serde_json::from_str(txt) {
+    /// Decode one Phoenix frame, emitting each fill of a `trades` frame as a `NormalizedTrade`.
+    fn handle_text(
+        &self,
+        txt: &str,
+        arbiter: &SharedArbiter,
+        instruments: &InstrumentSnapshot,
+    ) -> Frame {
+        let frame: PhoenixFrame = match serde_json::from_str(txt) {
             Ok(f) => f,
             Err(e) => {
                 self.decode_error();
                 tracing::debug!(error = %e, "Phoenix public WS: undecodable frame ignored");
-                return;
+                return Frame::Other;
             }
         };
-        if frame.channel.as_deref() != Some("trades") {
-            return; // subscription status / heartbeats / other (or no) channels — nothing to emit
+        let answered = frame.subscription.and_then(|s| {
+            (s.channel.as_deref() == Some("trades"))
+                .then_some(s.market_symbol)
+                .flatten()
+        });
+        match (frame.channel.as_deref(), answered) {
+            (Some("trades"), _) => {}
+            (Some("subscriptionStatus"), Some(symbol))
+                if frame.status.as_deref() == Some("subscribed") =>
+            {
+                return Frame::Ack {
+                    symbol,
+                    kind: Kind::Trades,
+                }
+            }
+            (Some("error"), Some(symbol)) if frame.code == Some(400) => {
+                return Frame::Refused { symbol }
+            }
+            _ => return Frame::Other, // heartbeats / other (or no) channels — nothing to emit
         }
         let (Some(symbol), Some(fills)) = (frame.symbol, frame.trades) else {
-            return; // a trades frame missing its symbol or fills carries nothing actionable
+            return Frame::Other; // a trades frame missing its symbol or fills carries nothing actionable
         };
         // Decode each fill on its own: one malformed element (a missing field, a null, a new shape)
         // is skipped with a single decode-error bump, so the rest of the batch still emits.
@@ -147,6 +185,10 @@ impl PhoenixVenue {
                 }
             }
         }
+        Frame::Data {
+            symbol,
+            kind: Kind::Trades,
+        }
     }
 
     /// Map one public fill onto a `NormalizedTrade` (venue `Phoenix`, the shared bare symbol) and emit
@@ -158,7 +200,7 @@ impl PhoenixVenue {
         arbiter: &SharedArbiter,
         instruments: &InstrumentSnapshot,
     ) {
-        if !self.symbols.contains(symbol) {
+        if !self.symbols.iter().any(|s| s == symbol) {
             return; // a market we didn't subscribe to; ignore
         }
         // Precision-before-price, and the load-bearing safety net for the edge==public symbol
@@ -248,26 +290,42 @@ impl PhoenixVenue {
 }
 
 impl PublicVenue for PhoenixVenue {
+    // An unknown market is answered with an `error` frame naming it.
+    const REFUSES_BY_DISCONNECT: bool = false;
+    // `trades` carries only fills made after the subscription.
+    const REPLAYS_ON_SUBSCRIBE: bool = false;
+
     fn venue(&self) -> &str {
         phoenix_venue()
+    }
+
+    fn source_id(&self) -> u16 {
+        PHOENIX_SOURCE_ID
     }
 
     fn url(&self) -> &str {
         &self.url
     }
 
-    fn subscribe_msgs(&self) -> Vec<String> {
+    fn subscriptions(&self) -> Vec<Subscription> {
         self.symbols
             .iter()
-            .map(|symbol| {
-                format!(
+            .map(|symbol| Subscription {
+                symbol: symbol.clone(),
+                kind: Kind::Trades,
+                frame: format!(
                     r#"{{"type":"subscribe","subscription":{{"channel":"trades","symbol":"{symbol}"}}}}"#
-                )
+                ),
             })
             .collect()
     }
 
-    fn handle_text(&self, txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) {
+    fn handle_text(
+        &self,
+        txt: &str,
+        arbiter: &SharedArbiter,
+        instruments: &InstrumentSnapshot,
+    ) -> Frame {
         PhoenixVenue::handle_text(self, txt, arbiter, instruments)
     }
 }
@@ -493,15 +551,61 @@ mod tests {
         );
     }
 
-    /// Subscribe frames carry the configured bare symbols verbatim (no transform), one per market.
+    /// Subscribe frames carry the configured bare symbols verbatim (no transform), one per market,
+    /// in configured order and each once.
     #[test]
-    fn subscribe_msgs_carry_configured_symbols() {
-        let v = venue(&["SOL", "BTC"]);
-        let subs = v.subscribe_msgs();
-        assert_eq!(subs.len(), 2);
-        assert!(subs.iter().all(|s| s.contains(r#""channel":"trades""#)));
-        assert!(subs.iter().any(|s| s.contains(r#""symbol":"SOL""#)));
-        assert!(subs.iter().any(|s| s.contains(r#""symbol":"BTC""#)));
+    fn subscriptions_carry_configured_symbols() {
+        let v = venue(&["SOL", "BTC", "SOL", ""]);
+        let subs = v.subscriptions();
+        assert_eq!(
+            subs.iter().map(|s| s.symbol.as_str()).collect::<Vec<_>>(),
+            ["SOL", "BTC"]
+        );
+        assert!(subs.iter().all(|s| s.kind == Kind::Trades));
+        assert_eq!(
+            subs[1].frame,
+            r#"{"type":"subscribe","subscription":{"channel":"trades","symbol":"BTC"}}"#
+        );
+    }
+
+    /// Answers captured from `perp-api.phoenix.trade/v1/ws` (2026-11-20).
+    #[test]
+    fn live_answers_ack_or_refuse_their_market() {
+        let (arbiter, _rx) = arbiter_with_rx();
+        let instruments = instruments_with("SOL");
+        let v = venue(&["SOL", "NOPEMARKETZZ"]);
+        let frame = |txt: &str| v.handle_text(txt, &arbiter, &instruments);
+        assert_eq!(
+            frame(
+                r#"{"channel":"subscriptionStatus","status":"subscribed","subscription":{"channel":"trades","marketSymbol":"SOL"},"clientId":"9867eaea-61de-4dc3-ba9e-f3a920aaf6db"}"#
+            ),
+            Frame::Ack {
+                symbol: "SOL".into(),
+                kind: Kind::Trades
+            }
+        );
+        assert_eq!(
+            frame(
+                r#"{"channel":"error","error":"Subscription manager failed to process request for client 9867eaea-61de-4dc3-ba9e-f3a920aaf6db: Invalid subscription request: unknown market symbol 'NOPEMARKETZZ'","code":400,"subscription":{"channel":"trades","marketSymbol":"NOPEMARKETZZ"}}"#
+            ),
+            Frame::Refused {
+                symbol: "NOPEMARKETZZ".into()
+            }
+        );
+        assert_eq!(
+            frame(
+                r#"{"channel":"error","error":"internal","code":500,"subscription":{"channel":"trades","marketSymbol":"SOL"}}"#
+            ),
+            Frame::Other,
+            "only a 400 names a market as unknown"
+        );
+        assert_eq!(
+            frame(&trades_frame("SOL", "1", "bid", 1.0, 100.0, "1775578550")),
+            Frame::Data {
+                symbol: "SOL".into(),
+                kind: Kind::Trades
+            }
+        );
     }
 
     /// A **verbatim** public `trades` frame captured from `perp-api.phoenix.trade` (2026-06-30,

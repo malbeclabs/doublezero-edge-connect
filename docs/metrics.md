@@ -208,6 +208,8 @@ sum(rate(dz_quote_ticks_won_total{transport="edge"}[5m]))
 sum(rate(dz_quote_ticks_won_total[5m]))
 ```
 
+This counts every tick of the venue, so with a public input racing only some symbols, every other symbol's ticks are edge walkovers. [`GET /v1/race`](output-sinks.md#get-v1race) applies the same rule to the raced symbols alone, while their public subscriptions are live.
+
 The `winner`/`loser` labels on `dz_quote_lead_ns`, `dz_trade_lead_ns` and `dz_depth_lead_ns` carry
 **transport** classes (`edge`/`public`), the same value space as the `transport` label above; they
 keep their own names because `winner`/`loser` is what distinguishes the two ends of one contest.

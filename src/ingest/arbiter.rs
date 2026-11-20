@@ -51,6 +51,7 @@ use crate::{
         feeds::ArbitrationMode,
         path_race::PathRace,
         processor::WarnRateLimit,
+        race::RaceBoard,
     },
     metrics::metrics,
     model::{
@@ -1778,6 +1779,8 @@ pub struct Arbiter {
     /// The cross-path trade matcher: the only producer of the matched leads
     /// [`StickyAuthority::observe_matched_lead`] elects on.
     race: PathRace,
+    /// The DoubleZero-vs-public race behind `GET /v1/race`.
+    race_board: RaceBoard,
     /// Per-market `book` state, bounded by [`MAX_BOOK_MARKETS`] with `book_order` as the eviction
     /// queue (oldest first, mirroring `processor::PerPublisher`).
     book_markets: HashMap<MarketKey, BookMarket>,
@@ -2126,6 +2129,7 @@ impl Arbiter {
             transfer_log: WarnRateLimit::default(),
             books: StickyAuthority::new(AuthorityConfig::DEFAULT),
             race: PathRace::default(),
+            race_board: RaceBoard::default(),
             book_markets: HashMap::new(),
             book_order: VecDeque::new(),
             book_replay: None,
@@ -2431,6 +2435,10 @@ impl Arbiter {
     /// Wire the shared instrument catalog, which a Source ID purge also clears.
     pub fn set_instrument_catalog(&mut self, instruments: InstrumentSnapshot) {
         self.instrument_catalog = Some(instruments);
+    }
+
+    pub fn race_board(&mut self) -> &mut RaceBoard {
+        &mut self.race_board
     }
 
     /// The pre-resolved metric children for `venue`, created on first use.
@@ -3823,6 +3831,11 @@ impl Arbiter {
                 let decision =
                     self.quotes
                         .admit(key, q.source_ts_ns, QuoteId::of(q), publisher, q.recv_ts_ns);
+                self.race_board.on_quote(
+                    q,
+                    pub_idx(publisher),
+                    decision == Admit::Emitted { opened_tick: true },
+                );
                 let vm = self.vm(&q.venue);
                 match decision {
                     Admit::Emitted { opened_tick } => {
@@ -3908,6 +3921,8 @@ impl Arbiter {
                 }
                 let key = (SourceKey::of(t), t.symbol.clone());
                 let decision = self.trades.admit(key, t.trade_id, publisher, t.recv_ts_ns);
+                self.race_board
+                    .on_trade(t, pub_idx(publisher), decision.emitted());
                 let vm = self.vm(&t.venue);
                 match decision {
                     Admit::Emitted { .. } => {
@@ -5649,6 +5664,81 @@ mod tests {
                 .get(),
             1
         );
+    }
+
+    /// `/v1/race`'s `won` is the ticks-won and trades-admitted rule restricted to a raced symbol while
+    /// its subscription is live: fed the same messages, the board and the metrics agree.
+    #[test]
+    fn race_won_matches_the_metrics_on_a_live_raced_symbol() {
+        use crate::ingest::race::{Kind, SubState, EDGE, PUBLIC};
+        let venue = "RaceWon";
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let public = Transport::PublicWs;
+        let (tx, _rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.race_board()
+            .register(0, venue, [("BTC", Kind::Quotes), ("BTC", Kind::Trades)]);
+        let q = |symbol: &str, ts: u64, recv_ts_ns: u64| {
+            FeedMessage::Quote(NormalizedQuote {
+                symbol: symbol.into(),
+                recv_ts_ns,
+                ..quote_at(venue, ts, 100.0 + recv_ts_ns as f64)
+            })
+        };
+        let t = |trade_id: u64, recv_ts_ns: u64| {
+            FeedMessage::Trade(NormalizedTrade {
+                venue: venue.into(),
+                symbol: "BTC".into(),
+                recv_ts_ns,
+                ..trade(trade_id)
+            })
+        };
+        let m = crate::metrics::metrics();
+        let metric = |vec: &prometheus::IntCounterVec| {
+            [EDGE, PUBLIC].map(|side| {
+                vec.with_label_values(&[venue, ["edge", "public"][side]])
+                    .get()
+            })
+        };
+
+        a.emit(q("BTC", 500, 50), edge_a, TEST_CATEGORY); // before the subscription is live
+        for kind in Kind::ALL {
+            a.race_board().set_state(0, "BTC", kind, SubState::Live);
+        }
+        let (ticks0, trades0) = (metric(&m.quote_ticks_won), metric(&m.trades_admitted));
+        for (msg, from) in [
+            (q("BTC", 1_000, 100), edge_a),   // opens 1000
+            (q("BTC", 1_000, 101), edge_a),   // in-tick content
+            (q("BTC", 1_000, 102), edge_b),   // mirror
+            (q("BTC", 1_000, 5_100), public), // late public copy: edge led by 5,000
+            (q("BTC", 2_000, 200), public),   // public opens 2000
+            (q("BTC", 2_000, 300), edge_a),   // public led by 100
+            (q("BTC", 3_000, 400), edge_a),   // walkover
+            (t(7, 100), edge_a),
+            (t(7, 250), public), // edge led by 150
+            (t(8, 300), public),
+        ] {
+            a.emit(msg, from, TEST_CATEGORY);
+        }
+        let delta = |now: [u64; 2], then: [u64; 2]| [now[0] - then[0], now[1] - then[1]];
+        let (ticks, trades_admitted) = (
+            delta(metric(&m.quote_ticks_won), ticks0),
+            delta(metric(&m.trades_admitted), trades0),
+        );
+        a.emit(q("ETH", 4_000, 500), edge_a, TEST_CATEGORY); // not raced
+
+        let snap = a.race_board().snapshot();
+        let quotes = snap.venues[0].total(Kind::Quotes).unwrap();
+        let trades = snap.venues[0].total(Kind::Trades).unwrap();
+        assert_eq!(quotes.won, [2, 1]);
+        assert_eq!(quotes.won, ticks);
+        assert_eq!(trades.won, [1, 1]);
+        assert_eq!(trades.won, trades_admitted);
+        let p50 = |f: &crate::ingest::race::Figures, side: usize| f.lead[side].quantile(0.5);
+        assert!(p50(&quotes, EDGE).is_some_and(|ns| (4_500..5_500).contains(&ns)));
+        assert!(p50(&quotes, PUBLIC).is_some_and(|ns| (90..110).contains(&ns)));
+        assert!(p50(&trades, EDGE).is_some_and(|ns| (135..165).contains(&ns)));
     }
 
     /// The depth mirror (`dz_depth_ticks_won_total`): same once-per-tick attribution on the depth

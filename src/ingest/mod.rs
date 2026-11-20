@@ -23,6 +23,7 @@ pub mod pricebook;
 pub mod processor;
 pub mod public_input;
 pub mod quote_map;
+pub mod race;
 pub mod receiver;
 pub mod reconcile;
 pub mod registry;

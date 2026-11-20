@@ -22,7 +22,8 @@ use tracing::warn;
 use crate::{
     ingest::{
         arbiter::{lock, SharedArbiter, Transport},
-        public_input::{self, parse_decimal, resolve_instrument, PublicVenue},
+        public_input::{self, parse_decimal, resolve_instrument, Frame, PublicVenue, Subscription},
+        race::Kind,
     },
     metrics::metrics,
     model::{
@@ -98,6 +99,20 @@ struct Level {
     n: u16,
 }
 
+/// A `subscriptionResponse` payload: the subscription Hyperliquid confirmed.
+#[derive(Deserialize)]
+struct SubscriptionResponse {
+    method: String,
+    subscription: Subscribed,
+}
+
+#[derive(Deserialize)]
+struct Subscribed {
+    #[serde(rename = "type")]
+    channel: String,
+    coin: String,
+}
+
 /// A `trades` payload element. `tid` is Hyperliquid's trade id — the same value the edge feed carries
 /// as `trade_id`, so the arbiter's windowed trade dedup collapses cross-transport copies on it.
 #[derive(Deserialize)]
@@ -118,27 +133,45 @@ struct HyperliquidVenue {
 }
 
 impl PublicVenue for HyperliquidVenue {
+    // An unknown coin, `btc` for `BTC` included, drops the connection with no frame.
+    const REFUSES_BY_DISCONNECT: bool = true;
+    // `bbo` opens with the current top of book and `trades` with the last 30 prints.
+    const REPLAYS_ON_SUBSCRIBE: bool = true;
+
     fn venue(&self) -> &str {
         hl_venue()
+    }
+
+    fn source_id(&self) -> u16 {
+        HL_SOURCE_ID
     }
 
     fn url(&self) -> &str {
         &self.url
     }
 
-    fn subscribe_msgs(&self) -> Vec<String> {
+    fn subscriptions(&self) -> Vec<Subscription> {
         let mut subs = Vec::with_capacity(self.coins.len() * 2);
         for coin in &self.coins {
-            for kind in ["bbo", "trades"] {
-                subs.push(format!(
-                    r#"{{"method":"subscribe","subscription":{{"type":"{kind}","coin":"{coin}"}}}}"#
-                ));
+            for (kind, channel) in [(Kind::Quotes, "bbo"), (Kind::Trades, "trades")] {
+                subs.push(Subscription {
+                    symbol: coin.clone(),
+                    kind,
+                    frame: format!(
+                        r#"{{"method":"subscribe","subscription":{{"type":"{channel}","coin":"{coin}"}}}}"#
+                    ),
+                });
             }
         }
         subs
     }
 
-    fn handle_text(&self, txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) {
+    fn handle_text(
+        &self,
+        txt: &str,
+        arbiter: &SharedArbiter,
+        instruments: &InstrumentSnapshot,
+    ) -> Frame {
         handle_text(txt, arbiter, instruments)
     }
 }
@@ -152,6 +185,7 @@ pub async fn run(
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
 ) {
+    let coins = public_input::distinct(coins);
     let want_subs = coins.len() * 2; // bbo + trades per coin
     if want_subs > HL_MAX_SUBSCRIPTIONS_PER_CONN {
         warn!(
@@ -165,9 +199,9 @@ pub async fn run(
     public_input::run(HyperliquidVenue { url, coins }, arbiter, instruments).await
 }
 
-/// Decode one text frame and emit any resulting quote/trade. Unknown channels (e.g.
-/// `subscriptionResponse`, `pong`) and malformed payloads are ignored — this is a best-effort feed.
-fn handle_text(txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) {
+/// Decode one text frame and emit any resulting quote/trade. Unknown channels (e.g. `pong`) and
+/// malformed payloads are ignored — this is a best-effort feed.
+fn handle_text(txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) -> Frame {
     let env: Envelope = match serde_json::from_str(txt) {
         Ok(e) => e,
         Err(e) => {
@@ -176,24 +210,52 @@ fn handle_text(txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnaps
                 .with_label_values(&[hl_venue()])
                 .inc();
             tracing::debug!(error = %e, "public WS: undecodable frame ignored");
-            return;
+            return Frame::Other;
         }
     };
     match env.channel.as_str() {
         "bbo" => {
             if let Ok(d) = serde_json::from_value::<BboData>(env.data) {
+                let symbol = d.coin.clone();
                 emit_bbo(d, arbiter, instruments);
+                return Frame::Data {
+                    symbol,
+                    kind: Kind::Quotes,
+                };
             }
         }
         "trades" => {
             if let Ok(trades) = serde_json::from_value::<Vec<TradeData>>(env.data) {
+                let symbol = trades.first().map(|t| t.coin.clone());
                 for t in trades {
                     emit_trade(t, arbiter, instruments);
                 }
+                if let Some(symbol) = symbol {
+                    return Frame::Data {
+                        symbol,
+                        kind: Kind::Trades,
+                    };
+                }
             }
         }
-        _ => {} // subscriptionResponse, pong, error, etc. — nothing to emit
+        "subscriptionResponse" => {
+            if let Ok(r) = serde_json::from_value::<SubscriptionResponse>(env.data) {
+                let kind = match r.subscription.channel.as_str() {
+                    "bbo" => Some(Kind::Quotes),
+                    "trades" => Some(Kind::Trades),
+                    _ => None,
+                };
+                if let (Some(kind), "subscribe") = (kind, r.method.as_str()) {
+                    return Frame::Ack {
+                        symbol: r.subscription.coin,
+                        kind,
+                    };
+                }
+            }
+        }
+        _ => {} // pong, error, etc. — nothing to emit
     }
+    Frame::Other
 }
 
 /// Parse a decimal-string level into real-unit `(price, size)` `f64`s, or `None` if either fails or
@@ -616,21 +678,79 @@ mod tests {
         );
     }
 
-    /// The Hyperliquid venue builds two subscribe frames (bbo + trades) per coin.
+    /// The Hyperliquid venue builds two subscribe frames (bbo + trades) per coin, in coin order.
     #[test]
-    fn subscribe_msgs_bbo_and_trades_per_coin() {
+    fn subscriptions_bbo_and_trades_per_coin() {
         let v = HyperliquidVenue {
             url: DEFAULT_WS_INPUT_URL.to_string(),
             coins: vec!["BTC".to_string(), "ETH".to_string()],
         };
-        let subs = v.subscribe_msgs();
-        assert_eq!(subs.len(), 4);
-        assert!(subs
-            .iter()
-            .any(|s| s.contains(r#""type":"bbo""#) && s.contains(r#""coin":"BTC""#)));
-        assert!(subs
-            .iter()
-            .any(|s| s.contains(r#""type":"trades""#) && s.contains(r#""coin":"ETH""#)));
+        let subs = v.subscriptions();
+        assert_eq!(
+            subs.iter()
+                .map(|s| (s.symbol.as_str(), s.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("BTC", Kind::Quotes),
+                ("BTC", Kind::Trades),
+                ("ETH", Kind::Quotes),
+                ("ETH", Kind::Trades)
+            ]
+        );
+        assert_eq!(
+            subs[3].frame,
+            r#"{"method":"subscribe","subscription":{"type":"trades","coin":"ETH"}}"#
+        );
+    }
+
+    /// Frames captured from `api.hyperliquid.xyz/ws` (2026-11-20).
+    #[test]
+    fn live_frames_answer_and_name_their_subscription() {
+        let (arbiter, _rx) = arbiter_with_rx();
+        let instruments = instruments_with("BTC");
+        let frame = |txt: &str| handle_text(txt, &arbiter, &instruments);
+        assert_eq!(
+            frame(
+                r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}}"#
+            ),
+            Frame::Ack {
+                symbol: "BTC".into(),
+                kind: Kind::Quotes
+            }
+        );
+        assert_eq!(
+            frame(
+                r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"trades","coin":"BTC"}}}"#
+            ),
+            Frame::Ack {
+                symbol: "BTC".into(),
+                kind: Kind::Trades
+            }
+        );
+        assert_eq!(
+            frame(
+                r#"{"channel":"bbo","data":{"coin":"BTC","time":1795180090321,"bbo":[{"px":"61614.0","sz":"19.53435","n":81},{"px":"61615.0","sz":"0.00818","n":1}]}}"#
+            ),
+            Frame::Data {
+                symbol: "BTC".into(),
+                kind: Kind::Quotes
+            }
+        );
+        assert_eq!(
+            frame(
+                r#"{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"61615.0","sz":"0.0015","time":1795180122061,"tid":1}]}"#
+            ),
+            Frame::Data {
+                symbol: "BTC".into(),
+                kind: Kind::Trades
+            }
+        );
+        assert_eq!(
+            frame(
+                r#"{"channel":"subscriptionResponse","data":{"method":"unsubscribe","subscription":{"type":"bbo","coin":"BTC"}}}"#
+            ),
+            Frame::Other
+        );
     }
 
     /// The backstop must name itself the way the edge does, or one market becomes two keys in the

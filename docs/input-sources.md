@@ -76,6 +76,8 @@ ID at least once (refdata alone does not populate it), so the backstop covers an
 opens partway through but not a cold start where the edge has never gone live for that instrument.
 The outbound `wss://` client is the one place TLS is used (rustls + bundled webpki roots).
 
+**Subscriptions go out one at a time**, each after the venue's answer to the one before or 5 s without one, so an answer names exactly one subscription. Connecting therefore costs about one round trip per subscription: two per Hyperliquid coin, one per Phoenix market. A name the venue rejects is not sent again until restart. Phoenix rejects an unknown market with a `400`. Hyperliquid instead drops the connection without a frame, so a coin is refused once two sessions have ended with its subscription unanswered: one could be a network drop. A mistyped coin therefore costs about 4 s and two reconnects. Names are case-sensitive and used as given (`kPEPE` is a Hyperliquid coin, `btc` is not), and a name given twice is sent once. [`GET /v1/race`](output-sinks.md#get-v1race) reports each name's standing and how often each input delivered first.
+
 The **Phoenix** input is **trades only** — it does not backstop quotes, because the edge Phoenix
 Quote is a spline-blended BBO while Phoenix's public orderbook channel is resting-only (a different
 quantity). Phoenix names each market with the same bare ticker on the edge and public feeds (the edge
