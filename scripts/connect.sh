@@ -847,11 +847,24 @@ fi
 # ----------------------------------------------------------------------------
 # 8. status + management hints
 # ----------------------------------------------------------------------------
-HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"; HOST_IP="${HOST_IP:-localhost}"
-# Bracketed when IPv6, since every use is a URL host followed by a :port.
-case "$HOST_IP" in *:*) HOST_IP="[$HOST_IP]" ;; esac
+HOST_IPS="$(hostname -I 2>/dev/null || true)"
+# A wildcard bind prints as this host's first address of the same family: an IPv4-only listener
+# is unreachable at an IPv6 address, and the reverse.
+url_host() {
+  local ip
+  case "$1" in
+    ''|0.0.0.0)
+      for ip in $HOST_IPS; do case "$ip" in *:*) ;; *) printf '%s' "$ip"; return ;; esac; done
+      printf '127.0.0.1' ;;
+    '[::]')
+      for ip in $HOST_IPS; do case "$ip" in *:*) printf '[%s]' "$ip"; return ;; esac; done
+      printf '[::1]' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
 # Reflect any WS_BIND override in the printed URL (take the port after the last colon).
 [ -n "${WS_BIND:-}" ]  && WS_PORT="${WS_BIND##*:}"
+ws_host="$(url_host "${WS_BIND:+${WS_BIND%:*}}")"
 echo
 # Brief pause so the freshly-connected tunnel settles before we read status.
 spin_sleep 5 "Waiting for the tunnel to settle"
@@ -949,10 +962,10 @@ else
   done
   if [ -n "$ws_up" ]; then
     info "Done. The bridge is serving normalized quotes:"
-    echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # normalized quotes (see PROTOCOL.md)"
+    echo "  WebSocket : ws://${ws_host}:${WS_PORT}            # normalized quotes (see PROTOCOL.md)"
   elif [ -n "$shreds_up" ]; then
     info "Done. Forwarding shreds. The WebSocket quote sink is idle -- it activates once this host is subscribed to a market-data feed."
-    echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # activates once >=1 market-data feed is subscribed"
+    echo "  WebSocket : ws://${ws_host}:${WS_PORT}            # activates once >=1 market-data feed is subscribed"
   else
     info "Done. Connected."
     echo
@@ -960,7 +973,7 @@ else
     echo "  group -- a market-data feed for WS, an edge-solana-* group for shreds. Allow up to"
     echo "  one refresh interval (DZ_SUBSCRIPTION_REFRESH_SECS, default 30s)."
     echo
-    echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # once >=1 market-data feed is subscribed"
+    echo "  WebSocket : ws://${ws_host}:${WS_PORT}            # once >=1 market-data feed is subscribed"
     echo "  Logs      : sudo docker logs $DZ_NAME"
   fi
 fi
@@ -969,8 +982,7 @@ fi
 # confirm it, since the likeliest failure is another process holding that port.
 if [ "$CONNECT_STATE" = connected ] && [ -n "${HL_WS_BIND:-}" ]; then
   hl_log="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep -E "Hyperliquid-compatible (WebSocket sink listening|sink disabled)" | tail -1 | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' || true)"
-  hl_host="${HL_WS_BIND%:*}"
-  case "$hl_host" in ''|0.0.0.0|'[::]') hl_host="$HOST_IP" ;; esac
+  hl_host="$(url_host "${HL_WS_BIND%:*}")"
   case "$hl_log" in
     *"sink listening"*) echo "  Hyperliquid : ws://${hl_host}:${HL_WS_BIND##*:}            # Hyperliquid's own schema (docs/output-sinks.md)" ;;
     *"sink disabled"*) warn "The Hyperliquid-compatible sink is NOT serving (HL_WS_BIND=$HL_WS_BIND): ${hl_log#*sink disabled: }" ;;
@@ -980,8 +992,7 @@ fi
 # The Binance-compatible sink is advertised the same way. It serves one matching engine per path.
 if [ "$CONNECT_STATE" = connected ] && [ -n "${BINANCE_WS_BIND:-}" ]; then
   bn_log="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep -E "Binance-compatible (WebSocket sink listening|sink disabled)" | tail -1 | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' || true)"
-  bn_host="${BINANCE_WS_BIND%:*}"
-  case "$bn_host" in ''|0.0.0.0|'[::]') bn_host="$HOST_IP" ;; esac
+  bn_host="$(url_host "${BINANCE_WS_BIND%:*}")"
   case "$bn_log" in
     *"sink listening"*)
       echo "  Binance USD-M : ws://${bn_host}:${BINANCE_WS_BIND##*:}/usdsm      # Binance's own schema (docs/output-sinks.md)"

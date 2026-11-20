@@ -142,14 +142,35 @@ binance_listening() {
   ! grep -q 'Binance' "$out"
 }
 
-@test "an IPv6 host address is bracketed in the printed URLs (all scripts)" {
-  printf '#!/usr/bin/env bash\necho "2001:db8::1 203.0.113.9"\n' >"$STUB_BIN/hostname"
+# run_on_host <script> <out> <addresses>: run an installer on a host whose `hostname -I` lists
+# <addresses>, with the WebSocket sink and HL on 0.0.0.0 and Binance on [::].
+run_on_host() {
+  printf '#!/usr/bin/env bash\necho "%s"\n' "$3" >"$STUB_BIN/hostname"
   chmod +x "$STUB_BIN/hostname"
+  local extra="$BATS_TEST_TMPDIR/listening.log"
+  printf 'INFO doublezero_edge_connect::sinks::hyperliquid: Hyperliquid-compatible WebSocket sink listening bind=0.0.0.0:8082\n' >"$extra"
+  printf 'INFO doublezero_edge_connect::sinks::binance: Binance-compatible WebSocket sink listening bind=[::]:8083\n' >>"$extra"
+  ( common_env; export DZ_INSTALL_CLI=0 HL_WS_BIND=0.0.0.0:8082 BINANCE_WS_BIND='[::]:8083' DZ_SUBSCRIPTION_REFRESH_SECS=0 DZ_TEST_DOCKER_LOG_EXTRA="$extra"
+    bash "$SCRIPTS_DIR/$1.sh" ) >"$2" 2>&1 || { echo "# $1 exited $?"; sed 's/^/#   /' "$2"; false; }
+}
+
+@test "IPv6 listed first: each URL names this host's address in its bind's family (all scripts)" {
   for s in "${SCRIPTS[@]}"; do
     local out="$BATS_TEST_TMPDIR/$s.out"
-    ( common_env; export DZ_INSTALL_CLI=0 BINANCE_WS_BIND='[::]:8083' DZ_SUBSCRIPTION_REFRESH_SECS=0
-      binance_listening '[::]:8083'; bash "$SCRIPTS_DIR/$s.sh" ) >"$out" 2>&1 || { echo "# $s exited $?"; sed 's/^/#   /' "$out"; false; }
-    grep -q 'Binance spot *: ws://\[2001:db8::1\]:8083/spot' "$out" || { echo "# $s:"; sed 's/^/#   /' "$out"; false; }
-    ! grep -q 'ws://2001:db8::1:' "$out"
+    run_on_host "$s" "$out" '2001:db8::1 203.0.113.9 2001:db8::2'
+    grep -q 'WebSocket *: ws://203.0.113.9:8081 ' "$out" \
+      && grep -q 'Hyperliquid *: ws://203.0.113.9:8082 ' "$out" \
+      && grep -q 'Binance USD-M *: ws://\[2001:db8::1\]:8083/usdsm' "$out" \
+      && grep -q 'Binance spot *: ws://\[2001:db8::1\]:8083/spot' "$out" \
+      || { echo "# $s:"; sed 's/^/#   /' "$out"; false; }
   done
+}
+
+@test "no address in a wildcard bind's family: the URL names that family's loopback" {
+  local out="$BATS_TEST_TMPDIR/out"
+  run_on_host connect "$out" '2001:db8::1'
+  grep -q 'WebSocket *: ws://127.0.0.1:8081 ' "$out" && grep -q 'Hyperliquid *: ws://127.0.0.1:8082 ' "$out" \
+    || { sed 's/^/#   /' "$out"; false; }
+  run_on_host connect "$out" '203.0.113.9'
+  grep -q 'Binance spot *: ws://\[::1\]:8083/spot' "$out" || { sed 's/^/#   /' "$out"; false; }
 }
