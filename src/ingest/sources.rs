@@ -27,6 +27,9 @@ pub struct SourceAssignment {
 /// Hyperliquid-schema sink (`sinks::hyperliquid`) so the two cannot drift apart.
 pub const HYPERLIQUID_SOURCE_ID: u16 = 1;
 
+/// Kalshi's Source ID, named here for the Kalshi-schema sink (`sinks::kalshi`).
+pub const KALSHI_SOURCE_ID: u16 = 3;
+
 /// Binance's two matching engines, named here for the Binance-schema sink (`sinks::binance`).
 pub const BINANCE_USDSM_SOURCE_ID: u16 = 6;
 pub const BINANCE_SPOT_SOURCE_ID: u16 = 8;
@@ -45,7 +48,7 @@ const BUILT_IN: [SourceAssignment; 8] = [
         name: "PHOENIX",
     },
     SourceAssignment {
-        id: 3,
+        id: KALSHI_SOURCE_ID,
         name: KALSHI,
     },
     // Setai's two platforms. They predate the rule that a `Code` names the venue, so each keeps its

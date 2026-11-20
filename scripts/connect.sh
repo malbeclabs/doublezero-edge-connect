@@ -35,7 +35,7 @@
 #   DZ_LEDGER_RPC_URL=<url>              override the DoubleZero ledger RPC used by the pre-check
 #
 # Any other bridge env var set in the environment is relayed straight to the container
-# (WS_*, HL_WS_BIND, BINANCE_WS_BIND, DZ_IFACE, DZ_SHRED_*, METRICS_BIND, DZ_CHANNELS, DZ_ADMIN_BIND, DZ_FEED_REGISTRY[_URL],
+# (WS_*, HL_WS_BIND, BINANCE_WS_BIND, KALSHI_WS_BIND, DZ_IFACE, DZ_SHRED_*, METRICS_BIND, DZ_CHANNELS, DZ_ADMIN_BIND, DZ_FEED_REGISTRY[_URL],
 # RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
 #   WS_BIND=0.0.0.0:9000 curl -fsSL https://get.doublezero.xyz/connect | bash
 #
@@ -719,7 +719,7 @@ PASSTHROUGH=(
   DZ_SUBSCRIPTION_REFRESH_SECS DZ_SUBSCRIPTION_GATING_DISABLE DZ_QUOTE_MAP
   WS_HEARTBEAT_SECS WS_IDLE_TIMEOUT_SECS WS_MAX_CLIENTS
   WS_MAX_SUBS WS_MAX_INBOUND_PER_MIN WS_BROADCAST_CAPACITY
-  HL_WS_BIND BINANCE_WS_BIND DZ_API_BIND METRICS_BIND
+  HL_WS_BIND BINANCE_WS_BIND KALSHI_WS_BIND DZ_API_BIND METRICS_BIND
   DZ_CHANNELS DZ_ADMIN_BIND DZ_FEED_REGISTRY DZ_FEED_REGISTRY_URL
   WS_INPUT_URL WS_INPUT_COINS PHOENIX_WS_INPUT_URL PHOENIX_WS_INPUT_MARKETS
   DZ_ARB_LEADER_TIMEOUT_SECS DZ_ARB_TRANSFER_MARGIN_US DZ_ARB_TRANSFER_WIN_RATE
@@ -999,6 +999,16 @@ if [ "$CONNECT_STATE" = connected ] && [ -n "${BINANCE_WS_BIND:-}" ]; then
       echo "  Binance spot  : ws://${bn_host}:${BINANCE_WS_BIND##*:}/spot" ;;
     *"sink disabled"*) warn "The Binance-compatible sink is NOT serving (BINANCE_WS_BIND=$BINANCE_WS_BIND): ${bn_log#*sink disabled: }" ;;
     *) warn "Could not confirm the Binance-compatible sink on $BINANCE_WS_BIND: neither its bind nor a bind failure is in the bridge log (RUST_LOG may hide them). Check: sudo docker logs $DZ_NAME | grep Binance" ;;
+  esac
+fi
+# The Kalshi-compatible sink is advertised the same way, at the trade API's WebSocket path.
+if [ "$CONNECT_STATE" = connected ] && [ -n "${KALSHI_WS_BIND:-}" ]; then
+  kalshi_log="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep -E "Kalshi-compatible (WebSocket sink listening|sink disabled)" | tail -1 | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' || true)"
+  kalshi_host="$(url_host "${KALSHI_WS_BIND%:*}")"
+  case "$kalshi_log" in
+    *"sink listening"*) echo "  Kalshi      : ws://${kalshi_host}:${KALSHI_WS_BIND##*:}/trade-api/ws/v2   # Kalshi's own schema (docs/output-sinks.md)" ;;
+    *"sink disabled"*) warn "The Kalshi-compatible sink is NOT serving (KALSHI_WS_BIND=$KALSHI_WS_BIND): ${kalshi_log#*sink disabled: }" ;;
+    *) warn "Could not confirm the Kalshi-compatible sink on $KALSHI_WS_BIND: neither its bind nor a bind failure is in the bridge log (RUST_LOG may hide them). Check: sudo docker logs $DZ_NAME | grep Kalshi" ;;
   esac
 fi
 echo

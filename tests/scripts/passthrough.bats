@@ -174,3 +174,30 @@ run_on_host() {
   run_on_host connect "$out" '203.0.113.9'
   grep -q 'Binance spot *: ws://\[::1\]:8083/spot' "$out" || { sed 's/^/#   /' "$out"; false; }
 }
+
+# kalshi_listening <bind>: make the stub bridge log a successful Kalshi bind.
+kalshi_listening() {
+  local extra="$BATS_TEST_TMPDIR/kalshi-listening.log"
+  printf 'INFO doublezero_edge_connect::sinks::kalshi: Kalshi-compatible WebSocket sink listening bind=%s\n' "$1" >"$extra"
+  export DZ_TEST_DOCKER_LOG_EXTRA="$extra"
+}
+
+@test "KALSHI_WS_BIND set: the Done output prints the Kalshi sink URL at the trade API path (all scripts)" {
+  for s in "${SCRIPTS[@]}"; do
+    local out="$BATS_TEST_TMPDIR/$s.out"
+    ( common_env; export DZ_INSTALL_CLI=0 KALSHI_WS_BIND=0.0.0.0:8084 DZ_SUBSCRIPTION_REFRESH_SECS=0
+      kalshi_listening 0.0.0.0:8084; bash "$SCRIPTS_DIR/$s.sh" ) >"$out" 2>&1 || { echo "# $s exited $?"; sed 's/^/#   /' "$out"; false; }
+    grep -q 'Kalshi *: ws://.*:8084/trade-api/ws/v2' "$out" \
+      || { echo "# $s never printed the Kalshi sink URL:"; sed 's/^/#   /' "$out"; false; }
+    ! grep -q 'ws://0.0.0.0:8084' "$out"
+  done
+}
+
+@test "Kalshi sink failed to bind: warns with the bridge's reason instead of printing a URL" {
+  local out="$BATS_TEST_TMPDIR/out" extra="$BATS_TEST_TMPDIR/extra.log"
+  printf 'WARN doublezero_edge_connect: Kalshi-compatible sink disabled: Address already in use (os error 98) bind=127.0.0.1:8084\n' >"$extra"
+  ( common_env; export DZ_INSTALL_CLI=0 KALSHI_WS_BIND=127.0.0.1:8084 DZ_SUBSCRIPTION_REFRESH_SECS=0 DZ_TEST_DOCKER_LOG_EXTRA="$extra"
+    bash "$SCRIPTS_DIR/connect.sh" ) >"$out" 2>&1 || { echo "# exited $?"; sed 's/^/#   /' "$out"; false; }
+  grep -q 'Kalshi-compatible sink is NOT serving.*Address already in use' "$out" || { sed 's/^/#   /' "$out"; false; }
+  ! grep -q 'Kalshi *: ws://' "$out"
+}

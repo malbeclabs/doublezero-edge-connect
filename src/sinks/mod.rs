@@ -7,6 +7,9 @@
 //!     see `docs/output-sinks.md`, never PROTOCOL.md.
 //!   - [`binance`] - Binance's quotes and trades in **Binance's own schema**, for an existing Binance
 //!     client; off by default, on when `--binance-ws-bind` is set. A rendering, like [`hyperliquid`].
+//!   - [`kalshi`] - Kalshi's event-contract books, quotes and trades in **Kalshi's own schema**, for an
+//!     existing Kalshi client; off by default, on when `--kalshi-ws-bind` is set. A rendering, like
+//!     [`hyperliquid`].
 //!   - [`metrics`] - Prometheus metrics HTTP endpoint; off by default, on when `--metrics-bind` is set.
 //!   - [`api`]     - read-only `/v1` JSON query API over the rolling history window + snapshots.
 //!   - [`admin`]   - the one mutation path (runtime channel-filter changes); on by default, at
@@ -33,5 +36,6 @@ pub mod api;
 pub mod binance;
 pub mod http;
 pub mod hyperliquid;
+pub mod kalshi;
 pub mod metrics;
 pub mod ws;

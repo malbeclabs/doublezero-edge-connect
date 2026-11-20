@@ -11,6 +11,7 @@ sink can't stall ingest. Every flag also reads from the env var shown.
 | **Query API** (`sinks::api`) | **on when subscribed** | configured unless `--api-bind` is empty (`--api-bind ""` disables it); *activated* only when ≥1 market-data feed is subscribed — same condition as the WebSocket sink | `--api-bind` (`DZ_API_BIND`, default `127.0.0.1:9099`) |
 | **Hyperliquid-compatible** (`sinks::hyperliquid`) | **off** | on when `--hl-ws-bind` is non-empty; **not** subscription-gated | `--hl-ws-bind` (`HL_WS_BIND`, default empty) |
 | **Binance-compatible** (`sinks::binance`) | **off** | on when `--binance-ws-bind` is non-empty; **not** subscription-gated | `--binance-ws-bind` (`BINANCE_WS_BIND`, default empty) |
+| **Kalshi-compatible** (`sinks::kalshi`) | **off** | on when `--kalshi-ws-bind` is non-empty; **not** subscription-gated | `--kalshi-ws-bind` (`KALSHI_WS_BIND`, default empty) |
 | **Metrics** (`sinks::metrics`) | **off** | on when `--metrics-bind` is non-empty | `--metrics-bind` (`METRICS_BIND`, default empty) |
 
 The metrics endpoint is active when its key config value is non-empty. The WebSocket sink and the
@@ -173,6 +174,53 @@ BinanceDataClientConfig { product_type: BinanceProductType::Spot, spot_market_da
 Give each client its engine's base path, nothing more: the Rust futures client reads bare events and silently drops wrapped ones from `/usdsm/stream`, and the Python client appends `/stream` itself.
 
 Client limits are the Hyperliquid sink's: 64 clients, 600 inbound frames per minute, and a 20s heartbeat with a 60s idle reap. Every inbound frame counts against that limit, whatever its kind. A client that falls behind misses messages and is counted rather than disconnected, since every frame is a whole quote or one print; one that stops reading for 60s is disconnected. Observability is `dz_binance_sink_clients`, `dz_binance_sink_messages_total{stream}` and `dz_binance_sink_dropped_total{reason}`. There is **no TLS**.
+
+## Kalshi-compatible sink
+
+Serves Kalshi's event contracts in **Kalshi's own trade-API WebSocket protocol**, so a Kalshi client, such as NautilusTrader 2.0's Kalshi data client, reads edge-connect by changing its WebSocket URL. It is **off by default**; give it a bind address to turn it on:
+
+```bash
+./target/release/doublezero-edge-connect --iface doublezero1 --kalshi-ws-bind 0.0.0.0:8084
+```
+
+Like the Hyperliquid sink, it is a rendering, not a second protocol. Nothing about it is in PROTOCOL.md, it is not subscription-gated, and a bind failure disables it with a warning. Connect to `ws://<host>:8084/trade-api/ws/v2`, Kalshi's own path; any other path gets a 404. The handshake's signed `KALSHI-ACCESS-*` headers are accepted, never checked and never logged.
+
+**Only event contracts are served**: markets whose definition declares Prediction Binary at the publisher's fixed point, which is the sports, elections and up/down feeds. Kalshi's perpetuals share its Source ID, but Kalshi serves them on a separate margin socket at a per-contract scale. So `/trade-api/ws/v2/margin` gets a 404, and a command naming a perpetual's ticker is refused.
+
+| Channel | Contract |
+|---|---|
+| `orderbook_delta` | An `orderbook_snapshot` on subscribe and on `get_snapshot`, then `orderbook_delta`, from the market-by-price book (`edge-kalshi-*-mbp`). Requires `market_tickers`. |
+| `ticker` | Our top-of-book `quote` (`edge-kalshi-*-tob`), sent on each quote. `send_initial_snapshot` replays the last one. |
+| `trade` | Our `trade`. |
+| `market_lifecycle_v2` | Acknowledged, and nothing is ever sent on it. |
+
+**The book.** Kalshi's book lists YES bids and NO bids. Our bid at `p` is a YES bid at `p`. Our ask at `a` is a NO bid at `1 − a`, reported at `a` itself when the subscription sets `use_yes_price`, as NautilusTrader's does. Prices are `price_dollars` strings to four decimals and sizes are `_fp` strings to two, which is Kalshi's fixed point and the feed's, so nothing is rounded.
+
+**A replaced book is sent as deltas, not as a snapshot.** Kalshi sends `orderbook_snapshot` only when a market is subscribed and in answer to `get_snapshot`, and its clients apply no other. So when the bridge re-baselines a book, the sink sends the difference, removals first so that no book in between is crossed or locked: NautilusTrader rejects one that is. Each logical book event takes one `clock`, with one `orderbook_delta` per changed level. A market with no complete book yet gets an empty snapshot, as Kalshi answers a ticker it has no book for, and its levels follow as deltas. The bridge's degraded re-baseline, which carries no levels, empties the book until a whole one arrives.
+
+Two publisher hosts carry each event market, each under its own instrument id. The sink follows one host's book per ticker and switches to the other's when the one it follows stops being whole, or falls silent for 2s while the other publishes; the switch, too, is sent as deltas.
+
+**`seq`** counts every frame on a subscription, `ok` and `unsubscribed` included. A client that falls behind is not disconnected, since NautilusTrader does not reconnect on its own. Its book and trade subscriptions skip one `seq` instead, the gap Kalshi tells clients to answer with `get_snapshot`.
+
+**Refusals use Kalshi's error codes.** The account channels (`fill`, `market_positions`, `user_orders`, `order_group_updates`, `communications`) get code 9, since this feed carries no account. Any other channel gets 8. A perpetual's ticker gets 11. A command over the rate limit gets 27, and the connection stays up.
+
+**What the feed cannot supply.** These fields are placeholders, and a consumer must not read meaning into them:
+
+- `market_id` is the nil UUID.
+- `volume_fp`, `open_interest_fp`, `dollar_volume` and `dollar_open_interest` are zero, and `is_block_trade` is false.
+- `trade_id` is the bridge's 64-bit trade id written as a UUID, not Kalshi's own.
+- `clock` is the sink's own counter, not Kalshi's exchange clock, so it cannot be matched across connections.
+- An empty side of a `ticker` is a zero size, at `0.0000` for the bid and `1.0000` for the ask. NautilusTrader reads it as no quote.
+
+A print whose aggressor is unknown is dropped. `update_interval_ms` is ignored, and updates are real-time.
+
+**Pointing NautilusTrader 2.0.0rc9 at it.** Instruments still load from Kalshi's REST API, so leave `base_url_http` and `environment` at their defaults; only the WebSocket moves. The data client will not connect without a key, and it signs only the WebSocket handshake. Over `ws://`, a real key's signed headers could be replayed against Kalshi while their timestamp is accepted. Give it a throwaway Ed25519 key instead (`openssl genpkey -algorithm ed25519`), with any key id, since the sink verifies nothing:
+
+```rust
+KalshiDataClientConfig { api_key_id: Some("throwaway".into()), private_key: Some(pem.into()), base_url_ws: Some("ws://<host>:8084/trade-api/ws/v2".into()), instrument_ids, ..Default::default() }
+```
+
+Client limits: 64 clients, 600 inbound frames per minute, 4,096 markets per subscription, and a `heartbeat` Ping every 10s with a 60s idle reap. `get_snapshot` is not counted as a frame but per market named, up to 4,096 a minute, so a client can recover every book it holds after a gap. Observability is `dz_kalshi_sink_clients`, `dz_kalshi_sink_messages_total{type}` and `dz_kalshi_sink_dropped_total{reason}`. There is **no TLS**.
 
 ## Metrics (Prometheus)
 

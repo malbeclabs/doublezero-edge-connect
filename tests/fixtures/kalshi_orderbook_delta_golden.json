@@ -1,0 +1,1 @@
+{"type":"orderbook_delta","sid":1,"seq":2,"sending_ts_ms":1700000000150,"msg":{"market_ticker":"KXNFLGAME-26NOV22DALPHI-DAL","market_id":"00000000-0000-0000-0000-000000000000","clock":2,"price_dollars":"0.4400","delta_fp":"-54.00","side":"no","ts_ms":1700000000123}}

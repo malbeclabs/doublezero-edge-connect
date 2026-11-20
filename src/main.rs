@@ -231,6 +231,13 @@ struct Args {
     #[arg(long = "binance-ws-bind", env = "BINANCE_WS_BIND", default_value = "")]
     binance_ws_bind: String,
 
+    /// Bind address for the Kalshi-compatible WebSocket sink, e.g. `0.0.0.0:8084`. Off by default
+    /// (empty disables it). Serves Kalshi's event contracts in Kalshi's own trade-API schema, not
+    /// PROTOCOL.md: point a Kalshi client's WebSocket URL at `ws://<host>:<port>/trade-api/ws/v2`.
+    /// Not subscription-gated. No TLS; terminate at a proxy if exposed.
+    #[arg(long = "kalshi-ws-bind", env = "KALSHI_WS_BIND", default_value = "")]
+    kalshi_ws_bind: String,
+
     /// Prometheus metrics HTTP endpoint bind address (e.g. `127.0.0.1:9090`). Off by default
     /// (opt-in): empty means no endpoint is exposed. Metrics are recorded regardless; this only
     /// controls whether they can be scraped at `GET /metrics`. No TLS — terminate at a proxy.
@@ -787,6 +794,25 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Kalshi-compatible sink: off by default and not subscription-gated, like the one above.
+    let kalshi_sink = if args.kalshi_ws_bind.is_empty() {
+        info!("Kalshi-compatible sink disabled (empty --kalshi-ws-bind)");
+        None
+    } else {
+        match sinks::kalshi::bind(&args.kalshi_ws_bind).await {
+            Ok(listener) => Some(tokio::spawn(sinks::kalshi::serve(
+                listener,
+                tx.clone(),
+                books.clone(),
+                instruments.clone(),
+            ))),
+            Err(e) => {
+                warn!(bind = %args.kalshi_ws_bind, "Kalshi-compatible sink disabled: {e}");
+                None
+            }
+        }
+    };
+
     // Prometheus metrics endpoint: off by default (opt-in via `--metrics-bind`). Recording is always
     // on; this only exposes the registry over HTTP for scraping.
     let metrics_srv = if args.metrics_bind.is_empty() {
@@ -964,6 +990,10 @@ async fn main() -> Result<()> {
             None => std::future::pending().await,
         } } => r??,
         r = async { match binance_sink {
+            Some(handle) => handle.await,
+            None => std::future::pending().await,
+        } } => r??,
+        r = async { match kalshi_sink {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r??,

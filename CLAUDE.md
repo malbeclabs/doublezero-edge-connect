@@ -88,8 +88,9 @@ Modules are grouped by role under `src/`:
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
   (WebSocket, on by default), `api` (read-only `/v1` query API), `metrics` (Prometheus `/metrics`,
   off by default), `admin` (the one mutation path in this crate — see below), `hyperliquid` (the
-  same data in Hyperliquid's own schema, off by default) and `binance` (Binance's quotes and trades in
-  Binance's own schema, off by default). A new feature is a sibling module here + a spawn in `main.rs`.
+  same data in Hyperliquid's own schema, off by default), `binance` (Binance's quotes and trades in
+  Binance's own schema, off by default) and `kalshi` (Kalshi's event contracts in Kalshi's own
+  schema, off by default). A new feature is a sibling module here + a spawn in `main.rs`.
 - **`shred/`** — the Solana **shred forwarder** (peer of `ingest/`/`sinks/`, separate from the
   market-data pipeline — no `FeedMessage`, no WebSocket, no market-data decode). Joins the DoubleZero
   `edge-solana-*` shred multicast groups, combines them, and fans each raw datagram out to local
@@ -1147,6 +1148,31 @@ Modules are grouped by role under `src/`:
   prints, so other feeds' traffic wakes none of them, and each `(kind, framing)` of a message is
   rendered at most once, by the first client that sends it (`Prepared`): N clients cost one render
   and an unsubscribed stream none.
+- **`sinks/kalshi.rs`** — the **Kalshi-compatible** sink (`--kalshi-ws-bind`, off by default, **not**
+  subscription-gated): Source ID 3's event contracts in Kalshi's trade-API WebSocket protocol at
+  `/trade-api/ws/v2`. A rendering like `hyperliquid`'s, documented in `docs/output-sinks.md`, never
+  PROTOCOL.md; Kalshi's docs are the authority and NautilusTrader 2.0.0rc9's data client the
+  acceptance test. ⚠️ **Gated on the definition's `Asset Class` (2, Prediction Binary) at −4/−2**,
+  never on `category`: perps share the Source ID and a renamed category would render them as YES/NO
+  books. ⚠️ **`orderbook_delta` is relative**, so the shared stage (`prepare_loop`) is the single
+  writer of what every client holds: it folds each logical event at its `last` and publishes the net
+  per-level change under one `clock`. A snapshot is copied from the stage under the sink's own mutex,
+  and a client skips a queued change at or below its snapshot's `clock`; committing before
+  broadcasting is what makes that exact. ⚠️ **A replaced book goes out as deltas, removals first**:
+  Kalshi clients apply a snapshot only on subscribe and `get_snapshot`, and Nautilus rejects a crossed
+  or locked book after *each* delta, so any other order fails a re-baseline that moves the spread.
+  ⚠️ **A both-sides clear is whole only if the replay entry is** — the arbiter's degraded re-baseline
+  is a bare clear. ⚠️ **A re-read of the replay entry is ahead of the broadcast**, so from one until
+  the stage has drained what was queued before it (`catching_up`), every close re-reads rather than
+  folds: folding those batches again walks levels back. ⚠️ **Each event market has two keys**: both
+  hosts publish it and each numbers instruments itself, so the edge-connect channel fold cannot merge
+  them. The stage follows one key per ticker and fails over to the other (`FAILOVER_NS`, or a book
+  that is not whole); a second key is never an ambiguity to refuse. ⚠️ **Nothing a client does closes its
+  connection but the idle reap**: Nautilus does not reconnect, so a lagging client gets one skipped
+  `seq` on its book and trade subscriptions and an over-rate command gets code 27. ⚠️ **Every `error`
+  makes Nautilus gap all its books**, and an error on a subscribe fails its `connect()`, which is
+  why `market_lifecycle_v2`, subscribed on every connect, is acknowledged and silent. The signed
+  `KALSHI-ACCESS-*` headers are never read, so never logged (`tests/kalshi_sink_logging.rs`).
 - **`sinks/api.rs`**'s `/v1/products` rows carry `book_complete` (the replay entry's `baselined()`,
   absent for a market with no book), read off the same `BookSnapshot` lookup `feed_kind` already makes.
   It is the one place a market withheld from every new WebSocket subscriber shows without the
@@ -1320,7 +1346,8 @@ Modules are grouped by role under `src/`:
   (output) is *configured* by a non-empty `--ws-bind` (`--ws-bind ""` disables it outright) but only
   *activated* when a market-data feed is subscribed; the public WS input is **off** by
   default (on when `--ws-input-coins` is non-empty) and is **not** subscription-gated, and neither are
-  the Hyperliquid- and Binance-compatible sinks (**off**, on when `--hl-ws-bind`/`--binance-ws-bind` is
+  the Hyperliquid-, Binance- and Kalshi-compatible sinks (**off**, on when
+  `--hl-ws-bind`/`--binance-ws-bind`/`--kalshi-ws-bind` is
   non-empty) — each renders whatever the broadcast carries, so it has no group of its own to be
   subscribed to. README has the
   full activation tables.

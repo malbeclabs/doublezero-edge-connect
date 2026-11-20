@@ -1,0 +1,1 @@
+{"type":"trade","sid":2,"seq":1,"sending_ts_ms":1700000000150,"msg":{"trade_id":"00000000-0000-0000-0123-456789abcdef","market_ticker":"KXNFLGAME-26NOV22DALPHI-DAL","yes_price_dollars":"0.2200","no_price_dollars":"0.7800","count_fp":"12.50","taker_side":"no","taker_outcome_side":"no","taker_book_side":"ask","is_block_trade":false,"ts":1700000000,"ts_ms":1700000000123}}
