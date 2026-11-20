@@ -1288,6 +1288,7 @@ mod tests {
         );
         let i = prepare(&FeedMessage::Instrument(NormalizedInstrument {
             tick_size: 0,
+            asset_class: 0,
             venue: "KALSHI".into(),
             source_name: "KALSHI".into(),
             source_id: 0,
@@ -1542,6 +1543,7 @@ mod tests {
                 ),
                 NormalizedInstrument {
                     tick_size: 0,
+                    asset_class: 0,
                     venue: "HYPERLIQUID".into(),
                     source_name: "HYPERLIQUID".into(),
                     source_id: 0,
@@ -1649,6 +1651,7 @@ mod tests {
                 ),
                 NormalizedInstrument {
                     tick_size: 0,
+                    asset_class: 0,
                     venue: "BINANCE".into(),
                     source_name: "BINANCE".into(),
                     source_id,
@@ -1783,6 +1786,7 @@ mod tests {
                 ),
                 NormalizedInstrument {
                     tick_size: 0,
+                    asset_class: 0,
                     venue: "KALSHI".into(),
                     source_name: "KALSHI".into(),
                     source_id: 0,
@@ -2416,6 +2420,7 @@ mod tests {
             ),
             NormalizedInstrument {
                 tick_size: 0,
+                asset_class: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 0,
@@ -3071,6 +3076,7 @@ mod tests {
             ),
             NormalizedInstrument {
                 tick_size: 0,
+                asset_class: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 0,

@@ -527,6 +527,7 @@ mod tests {
         for &(source_id, symbol, instrument_id) in entries {
             let i = crate::model::NormalizedInstrument {
                 tick_size: 0,
+                asset_class: 0,
                 venue: "SHARED".into(),
                 source_name: "SHARED".into(),
                 source_id,

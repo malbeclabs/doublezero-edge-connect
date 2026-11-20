@@ -110,6 +110,7 @@ mod tests {
             instrument_id: iid,
             source_id: None,
             symbol: format!("SYM{iid}").into(),
+            asset_class: 0,
             price_exponent: -2,
             qty_exponent: -2,
             manifest_seq: seq,

@@ -155,6 +155,39 @@ fn v3_definitions_carry_the_venues_tradable_tick() {
     }
 }
 
+/// `Asset Class` separates Source ID 3's two engines: every sports definition is Prediction Binary
+/// (`2`) at `-4`/`-2`, and every perp is Perpetual Future (`5`). `sinks::kalshi` serves only the
+/// first.
+#[test]
+fn asset_class_separates_kalshi_event_markets_from_perps() {
+    let mut sports = BTreeSet::new();
+    for (_, msgs) in mbp_datagrams(SPORTS_V3) {
+        for m in msgs {
+            if let codec_mbp::Message::InstrumentDefinition(d) = m {
+                sports.insert((d.asset_class, d.price_exponent, d.qty_exponent));
+            }
+        }
+    }
+    assert_eq!(sports, BTreeSet::from([(2, -4, -2)]));
+
+    let mut perps = BTreeSet::new();
+    for (_, msgs) in mbp_datagrams(MBP_PERPS_V3) {
+        for m in msgs {
+            if let codec_mbp::Message::InstrumentDefinition(d) = m {
+                perps.insert(d.asset_class);
+            }
+        }
+    }
+    for (_, msgs) in tob_datagrams(TOB_V3) {
+        for m in msgs {
+            if let codec::Message::InstrumentDefinition(d) = m {
+                perps.insert(d.asset_class);
+            }
+        }
+    }
+    assert_eq!(perps, BTreeSet::from([5]));
+}
+
 /// One decoded `InstrumentDefinition`, tagged with the datagram's `channel_id` (the per-path identity
 /// on these captures).
 struct Def {

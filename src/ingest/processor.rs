@@ -477,6 +477,7 @@ impl TobProcessor {
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
             tick_size: def.tick_size,
+            asset_class: def.asset_class,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -652,6 +653,7 @@ impl DatagramProcessor for TobProcessor {
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
                                 tick_size: d.tick_size,
+                                asset_class: d.asset_class,
                             };
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
@@ -888,6 +890,7 @@ impl MidpointProcessor {
             // The Midpoint feed keeps its own slimmed definition, which has no `Tick Size` field —
             // 0 is the "not stated" the consumer contract already defines for it.
             tick_size: 0,
+            asset_class: 0,
             venue: source.clone(),
             source_name: source.clone(),
             source_id,
@@ -978,6 +981,7 @@ impl DatagramProcessor for MidpointProcessor {
                         let source = venue_arc(source_label(source_id));
                         let inst = NormalizedInstrument {
                             tick_size: 0, // no `Tick Size` on the Midpoint definition — see above
+                            asset_class: 0,
                             venue: source.clone(),
                             source_name: source.clone(),
                             source_id,
@@ -1218,6 +1222,7 @@ impl MboProcessor {
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
             tick_size: def.tick_size,
+            asset_class: def.asset_class,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -1784,6 +1789,7 @@ impl DatagramProcessor for MboProcessor {
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
                                 tick_size: d.tick_size,
+                                asset_class: d.asset_class,
                             };
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
@@ -2505,6 +2511,7 @@ impl MbpProcessor {
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
             tick_size: def.tick_size,
+            asset_class: def.asset_class,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -3294,6 +3301,7 @@ impl DatagramProcessor for MbpProcessor {
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
                                 tick_size: d.tick_size,
+                                asset_class: d.asset_class,
                             };
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
@@ -4329,7 +4337,8 @@ mod tests {
         let sb = symbol.as_bytes();
         sym[..sb.len().min(64)].copy_from_slice(&sb[..sb.len().min(64)]);
         out.extend_from_slice(&sym); // body+6..+70
-        out.extend_from_slice(&[0u8; 17]); // body+70..+87: pad
+        out.extend_from_slice(&[0u8; 16]); // body+70..+86: Leg1, Leg2
+        out.push(2); // body+86: Asset Class, Prediction Binary
         out.push(price_exponent as u8); // body+87
         out.push(qty_exponent as u8); // body+88
         out.extend_from_slice(&[0u8; 35]); // body+89..+124: pad
@@ -6599,6 +6608,7 @@ mod tests {
 
         let base = NormalizedInstrument {
             tick_size: 0,
+            asset_class: 0,
             venue: "TestVenue".into(),
             source_name: "TestVenue".into(),
             source_id: 0,
@@ -7041,6 +7051,7 @@ mod tests {
                 instrument_id: *id,
                 source_id: None,
                 symbol: format!("INST-{id}").into(),
+                asset_class: 0,
                 price_exponent: 0,
                 qty_exponent: 0,
                 manifest_seq: 1,
@@ -7095,13 +7106,13 @@ mod tests {
         let insts: Vec<_> = seen
             .iter()
             .filter_map(|m| match m {
-                FeedMessage::Instrument(i) => Some((i.source_id, i.instrument_id)),
+                FeedMessage::Instrument(i) => Some((i.source_id, i.instrument_id, i.asset_class)),
                 _ => None,
             })
             .collect();
         assert_eq!(
             insts,
-            vec![(1, 41)],
+            vec![(1, 41, 2)],
             "the definition names itself, with no book content at all"
         );
         assert!(

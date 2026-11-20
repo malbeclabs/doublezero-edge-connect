@@ -457,6 +457,7 @@ pub(crate) mod tests {
         b[0..4].copy_from_slice(&d.instrument_id.to_le_bytes());
         let sym = &d.symbol.as_bytes()[..d.symbol.len().min(16)];
         b[4..4 + sym.len()].copy_from_slice(sym); // 16B NUL-padded field
+        b[36] = d.asset_class;
         b[37] = d.price_exponent as u8;
         b[38] = d.qty_exponent as u8;
         b[40..48].copy_from_slice(&d.tick_size.to_le_bytes());
@@ -1121,6 +1122,7 @@ pub(crate) mod tests {
             instrument_id: 41,
             source_id: None,
             symbol: "KXBTCPERP".into(),
+            asset_class: 5,
             price_exponent: -4,
             qty_exponent: -2,
             manifest_seq: 3,
@@ -1242,11 +1244,12 @@ pub(crate) mod tests {
             (
                 d.instrument_id,
                 &*d.symbol,
+                d.asset_class,
                 d.price_exponent,
                 d.qty_exponent,
                 d.manifest_seq
             ),
-            (41, "KXBTCPERP", -4, -2, 3)
+            (41, "KXBTCPERP", 5, -4, -2, 3)
         );
         let Message::ManifestSummary(s) = &m[1] else {
             panic!("{:?}", m[1])

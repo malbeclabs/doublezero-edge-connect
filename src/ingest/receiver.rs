@@ -1720,6 +1720,7 @@ mod tests {
                     price_exponent: 0,
                     qty_exponent: 0,
                     tick_size: 1,
+                    asset_class: 0,
                 },
             );
             {

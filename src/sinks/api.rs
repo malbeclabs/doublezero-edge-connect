@@ -1567,6 +1567,7 @@ mod tests {
     ) -> NormalizedInstrument {
         NormalizedInstrument {
             tick_size: 0,
+            asset_class: 0,
             venue: venue.into(),
             source_name: venue.into(),
             source_id,

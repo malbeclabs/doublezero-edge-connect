@@ -275,6 +275,7 @@ mod tests {
     ) -> NormalizedInstrument {
         NormalizedInstrument {
             tick_size: 0,
+            asset_class: 0,
             venue: "HYPERLIQUID".into(),
             source_name: "HYPERLIQUID".into(),
             source_id: 1,

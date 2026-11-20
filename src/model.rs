@@ -549,6 +549,10 @@ pub struct NormalizedInstrument {
     /// `-2` with a tick of `100`, so it moves in dollars, not cents.
     #[serde(default)]
     pub tick_size: i64,
+    /// The definition's `Asset Class`, `0` where the input has none. Producer-side and never
+    /// serialized: `sinks::kalshi` serves only Prediction Binary (`2`) markets.
+    #[serde(skip)]
+    pub asset_class: u8,
 }
 
 /// A venue-level feed-health status (the PROTOCOL.md `status` candidate extension). Emitted when

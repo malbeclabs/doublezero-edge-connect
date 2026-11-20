@@ -406,6 +406,7 @@ mod tests {
             (phoenix_venue().into(), PHOENIX_CATEGORY.into(), 0u8, 1u32),
             NormalizedInstrument {
                 tick_size: 0,
+                asset_class: 0,
                 venue: phoenix_venue().into(),
                 source_name: phoenix_venue().into(),
                 source_id: PHOENIX_SOURCE_ID,

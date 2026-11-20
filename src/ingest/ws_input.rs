@@ -428,6 +428,7 @@ mod tests {
             (hl_venue().into(), category.into(), 0u8, 1u32),
             NormalizedInstrument {
                 tick_size: 0,
+                asset_class: 0,
                 venue: hl_venue().into(),
                 source_name: hl_venue().into(),
                 source_id: HL_SOURCE_ID,
@@ -518,6 +519,7 @@ mod tests {
             (hl_venue().into(), "hl-perps".into(), 7u8, 1u32),
             NormalizedInstrument {
                 tick_size: 0,
+                asset_class: 0,
                 venue: hl_venue().into(),
                 source_name: hl_venue().into(),
                 source_id: HL_SOURCE_ID,

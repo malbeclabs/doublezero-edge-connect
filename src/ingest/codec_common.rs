@@ -99,6 +99,9 @@ pub struct InstrumentDefinition {
     pub instrument_id: u32,
     pub source_id: Option<u16>,
     pub symbol: Arc<str>,
+    /// `Asset Class`, verbatim: `2` is Prediction Binary and `5` Perpetual Future. A receiver must
+    /// accept any value, so an unknown one is carried rather than refused.
+    pub asset_class: u8,
     pub price_exponent: i8,
     pub qty_exponent: i8,
     /// `Tick Size`: the venue's tradable price increment, in the same fixed point as every price on
@@ -158,6 +161,7 @@ pub fn instrument_definition(
             instrument_id: u32le(b, body)?,
             source_id: None,
             symbol: cstr(b, body + 4, DEF_SYM_LEN_V1)?.into(),
+            asset_class: u8le(b, body + 36)?,
             price_exponent: u8le(b, body + 37)? as i8,
             qty_exponent: u8le(b, body + 38)? as i8,
             tick_size: i64le(b, body + 40)?,
@@ -167,6 +171,7 @@ pub fn instrument_definition(
             instrument_id: u32le(b, body)?,
             source_id: Some(u16le(b, body + 4)?),
             symbol: cstr(b, body + 6, DEF_SYM_LEN_V3)?.into(),
+            asset_class: u8le(b, body + 86)?,
             price_exponent: u8le(b, body + 87)? as i8,
             qty_exponent: u8le(b, body + 88)? as i8,
             tick_size: i64le(b, body + 90)?,
@@ -261,6 +266,8 @@ mod tests {
 
     const TEST_MAGIC: u16 = 0x445A;
     const MSG_INSTRUMENT_DEFINITION: u8 = 0x02;
+    /// Prediction Binary. Non-zero, so a read that lands on the padding before it fails.
+    const ASSET_CLASS: u8 = 2;
 
     /// Build a datagram carrying exactly one application message.
     fn datagram(schema_version: u8, msg_type: u8, body: &[u8]) -> Vec<u8> {
@@ -291,6 +298,7 @@ mod tests {
         let mut b = vec![0u8; 76];
         b[0..4].copy_from_slice(&id.to_le_bytes()); // spec 4: Instrument ID
         b[4..4 + symbol.len()].copy_from_slice(symbol.as_bytes()); // spec 8: Symbol char[16]
+        b[36] = ASSET_CLASS; // spec 40
         b[37] = price_exp as u8; // spec 41
         b[38] = qty_exp as u8; // spec 42
         b[40..48].copy_from_slice(&tick_size.to_le_bytes()); // spec 44: Tick Size
@@ -314,6 +322,7 @@ mod tests {
         b[0..4].copy_from_slice(&id.to_le_bytes()); // spec 4: Instrument ID
         b[4..6].copy_from_slice(&source_id.to_le_bytes()); // spec 8: Source ID
         b[6..6 + symbol.len()].copy_from_slice(symbol.as_bytes()); // spec 10: Symbol char[64]
+        b[86] = ASSET_CLASS; // spec 90
         b[87] = price_exp as u8; // spec 91
         b[88] = qty_exp as u8; // spec 92
         b[90..98].copy_from_slice(&tick_size.to_le_bytes()); // spec 94: Tick Size
@@ -338,6 +347,7 @@ mod tests {
             &*d.symbol, long,
             "the full 64-byte symbol, not a 16-byte prefix"
         );
+        assert_eq!(d.asset_class, ASSET_CLASS);
         assert_eq!(d.price_exponent, -8);
         assert_eq!(d.qty_exponent, -6);
         assert_eq!(d.tick_size, 100);
@@ -357,6 +367,7 @@ mod tests {
         assert_eq!(d.instrument_id, 41);
         assert_eq!(d.source_id, None, "v1 carries no per-instrument Source ID");
         assert_eq!(&*d.symbol, "BTC-USDT");
+        assert_eq!(d.asset_class, ASSET_CLASS);
         assert_eq!(d.price_exponent, -8);
         assert_eq!(d.qty_exponent, -6);
         assert_eq!(d.tick_size, 100);
@@ -462,6 +473,7 @@ mod tests {
 
         assert_eq!(v1.instrument_id, v3.instrument_id);
         assert_eq!(v1.symbol, v3.symbol);
+        assert_eq!(v1.asset_class, v3.asset_class);
         assert_eq!(v1.price_exponent, v3.price_exponent);
         assert_eq!(v1.qty_exponent, v3.qty_exponent);
         assert_eq!(v1.manifest_seq, v3.manifest_seq);

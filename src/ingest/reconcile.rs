@@ -2085,6 +2085,7 @@ mod tests {
             ("KALSHI".into(), "events".into(), 10u8, 1u32),
             crate::model::NormalizedInstrument {
                 tick_size: 0,
+                asset_class: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 3,
@@ -2300,6 +2301,7 @@ mod tests {
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
                 tick_size: 0,
+                asset_class: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 3,
@@ -2391,6 +2393,7 @@ mod tests {
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
                 tick_size: 0,
+                asset_class: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 3,
@@ -2464,6 +2467,7 @@ mod tests {
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
                 tick_size: 0,
+                asset_class: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 3,
@@ -2558,6 +2562,7 @@ mod tests {
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
                 tick_size: 0,
+                asset_class: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 3,
@@ -2682,6 +2687,7 @@ mod tests {
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
                 tick_size: 0,
+                asset_class: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 3,
@@ -2908,6 +2914,7 @@ mod tests {
     ) -> crate::model::NormalizedInstrument {
         crate::model::NormalizedInstrument {
             tick_size: 0,
+            asset_class: 0,
             venue: venue.into(),
             source_name: venue.into(),
             source_id,

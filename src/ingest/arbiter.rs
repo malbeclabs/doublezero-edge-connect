@@ -5360,6 +5360,7 @@ mod tests {
                     price_exponent: -2,
                     qty_exponent: -2,
                     tick_size: 1,
+                    asset_class: 0,
                 },
             );
             a.note_source_path(&market(iid), a_path);
@@ -5835,6 +5836,7 @@ mod tests {
     ) -> FeedMessage {
         FeedMessage::Instrument(crate::model::NormalizedInstrument {
             tick_size: 0,
+            asset_class: 0,
             venue: "HYPERLIQUID".into(),
             source_name: "HYPERLIQUID".into(),
             source_id: 0,
