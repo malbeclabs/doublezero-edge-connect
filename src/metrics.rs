@@ -118,7 +118,8 @@ pub struct Metrics {
     /// Instrument definitions dropped as an exact content repeat of the last one broadcast for the
     /// `(venue, symbol)` - the mirrored publishers' identical refdata bursts collapsing.
     pub instruments_dropped: IntCounterVec,
-    /// A `(publisher, instrument)` already revealed under one wire Source ID named a DIFFERENT one
+    /// A revealed key (`(publisher, instrument)`, plus the channel on MBO/MBP, so one instrument
+    /// counts once per channel) already revealed under one wire Source ID named a DIFFERENT one
     /// on a later message — a real publisher defect (this plan's own fixtures prove one exists), not
     /// a decode issue. Counted, and re-announced under the new id rather than silently kept pinned
     /// to the first one seen, or the new venue would never get a definition anywhere. Labelled by
