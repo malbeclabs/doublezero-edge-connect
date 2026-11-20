@@ -204,7 +204,20 @@ fn decode(datagrams: &[Vec<u8>]) -> (Vec<u64>, Vec<u64>) {
 /// ticks score for the edge, a late public copy gives the edge a lead, and a tick and a print only
 /// the public input delivers score for it. The venue's figures are BTC's alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial] // each waits on the process-wide `dz_ws_input_messages_total`
 async fn a_live_symbol_counts_both_inputs() {
+    race_btc(false).await;
+}
+
+/// A coin that has never traded replays an empty batch, which names no coin: the batch after it
+/// still counts, and so do the edge's trades before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial] // each waits on the process-wide `dz_ws_input_messages_total`
+async fn an_empty_trades_replay_lets_the_next_batch_count() {
+    race_btc(true).await;
+}
+
+async fn race_btc(empty_trades_replay: bool) {
     feeds::init_built_in();
     let (tx, _rx) = broadcast::channel(4096);
     let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, TRADE_DEDUP_WINDOW)));
@@ -274,13 +287,16 @@ async fn a_live_symbol_counts_both_inputs() {
             .with_label_values(&[HL, kind])
             .get()
     };
-    let replayed = (emitted("quote"), emitted("trade"));
+    let replayed = emitted("quote");
+    if empty_trades_replay {
+        mock.send_raw(r#"{"channel":"trades","data":[]}"#.to_string());
+    } else {
+        mock.send_trade("BTC", "B", 1.0, 1.0, low_ms - 1_000, 1);
+    }
+    // Last, so once it is emitted the input has read the trades replay too.
     mock.send_bbo("BTC", low_ms - 1_000, 1.0, 1.0, 2.0, 1.0);
-    mock.send_trade("BTC", "B", 1.0, 1.0, low_ms - 1_000, 1);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while (emitted("quote") == replayed.0 || emitted("trade") == replayed.1)
-        && tokio::time::Instant::now() < deadline
-    {
+    while emitted("quote") == replayed && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // The input marks each live right after emitting its frame.

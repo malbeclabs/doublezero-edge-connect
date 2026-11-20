@@ -82,9 +82,22 @@ pub struct Subscription {
 /// What a text frame meant for the subscriptions. Any market data it carried is already emitted.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Frame {
-    Ack { symbol: String, kind: Kind },
-    Refused { symbol: String },
-    Data { symbol: String, kind: Kind },
+    Ack {
+        symbol: String,
+        kind: Kind,
+    },
+    Refused {
+        symbol: String,
+    },
+    Data {
+        symbol: String,
+        kind: Kind,
+    },
+    /// A batch with nothing in it, so naming no symbol: on a replaying venue, the replay of the
+    /// subscription acked last, which the venue sends straight after its ack.
+    EmptyBatch {
+        kind: Kind,
+    },
     Other,
 }
 
@@ -246,6 +259,8 @@ struct Sequencer {
     replays: bool,
     /// Whether a subscription went unanswered past `ACK_TIMEOUT` this session.
     timed_out: bool,
+    /// The subscription acked last this session, whose replay an empty batch of its kind is.
+    last_acked: Option<usize>,
     /// Drops of the connection with the name's subscription in flight.
     strikes: HashMap<String, u8>,
     next: usize,
@@ -268,6 +283,7 @@ impl Sequencer {
             by_name,
             replays,
             timed_out: false,
+            last_acked: None,
             strikes: HashMap::new(),
             next: 0,
             waiting: None,
@@ -279,6 +295,7 @@ impl Sequencer {
         self.next = 0;
         self.waiting = None;
         self.timed_out = false;
+        self.last_acked = None;
     }
 
     /// The next subscribe frame, once nothing awaits an answer.
@@ -319,15 +336,19 @@ impl Sequencer {
                     };
                     self.set(i, state);
                     self.strikes.remove(&symbol);
+                    self.last_acked = Some(i);
                 }
                 self.answered(i);
             }
             Frame::Refused { symbol } => self.refuse(&symbol),
             Frame::Data { symbol, kind } => {
                 if let Some(i) = self.find(&symbol, kind) {
-                    if self.states[i] == SubState::Acked {
-                        self.set(i, SubState::Live);
-                    }
+                    self.replayed(i);
+                }
+            }
+            Frame::EmptyBatch { kind } => {
+                if let Some(i) = self.last_acked.filter(|&i| self.subs[i].kind == kind) {
+                    self.replayed(i);
                 }
             }
             Frame::Other => {}
@@ -376,6 +397,13 @@ impl Sequencer {
         if self.states[i] != state {
             self.states[i] = state;
             self.changed.push(i);
+        }
+    }
+
+    /// The venue's replay for subscription `i` has passed, so it counts from here.
+    fn replayed(&mut self, i: usize) {
+        if self.states[i] == SubState::Acked {
+            self.set(i, SubState::Live);
         }
     }
 
@@ -607,6 +635,28 @@ mod tests {
         assert_eq!(seq.states[0], SubState::Acked);
         seq.on_frame(data("BTC", Kind::Quotes));
         assert_eq!(seq.states[0], SubState::Live);
+    }
+
+    /// A replay with nothing in it names no symbol, so it completes the subscription acked last,
+    /// and the next batch counts rather than being taken for the replay.
+    #[test]
+    fn an_empty_replay_completes_the_subscription_acked_last() {
+        let now = Instant::now();
+        let mut seq = Sequencer::new(subs(&["BTC", "ETH"], &Kind::ALL), true, "V");
+        seq.start_session();
+        seq.next_frame(now);
+        seq.on_frame(ack("BTC", Kind::Quotes));
+        seq.on_frame(data("BTC", Kind::Quotes));
+        seq.next_frame(now);
+        seq.on_frame(ack("BTC", Kind::Trades));
+        seq.on_frame(Frame::EmptyBatch { kind: Kind::Quotes });
+        assert_eq!(seq.states[1], SubState::Acked, "not a replay of its kind");
+        seq.on_frame(Frame::EmptyBatch { kind: Kind::Trades });
+        assert_eq!(seq.states[..2], [SubState::Live, SubState::Live]);
+        seq.next_frame(now);
+        seq.on_frame(ack("ETH", Kind::Quotes));
+        seq.on_frame(Frame::EmptyBatch { kind: Kind::Trades });
+        assert_eq!(seq.states[2..], [SubState::Acked, SubState::Pending]);
     }
 
     #[test]

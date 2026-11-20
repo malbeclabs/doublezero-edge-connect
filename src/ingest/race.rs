@@ -159,6 +159,8 @@ impl Figures {
 struct First {
     side: usize,
     at_ns: u64,
+    /// The venue's time for the tick or trade: what forgetting is judged by.
+    venue_ns: u64,
     paired: bool,
 }
 
@@ -167,12 +169,17 @@ struct First {
 struct Firsts {
     seen: HashMap<u64, First>,
     order: VecDeque<u64>,
+    /// The newest venue time of any key forgotten. A key unknown here at or before it may have been
+    /// seen and forgotten, so it is skipped: paired afresh, a late copy could pair the wrong way
+    /// round or score a tick twice. Venue time, not the key, because trade ids follow no order.
+    forgotten_through: Option<u64>,
+    newest_ns: Option<u64>,
 }
 
 impl Firsts {
     /// `(winner, lead_ns)` when this is the first copy from the input that has not yet delivered
     /// `key`.
-    fn pair(&mut self, key: u64, side: usize, at_ns: u64) -> Option<(usize, u64)> {
+    fn pair(&mut self, key: u64, venue_ns: u64, side: usize, at_ns: u64) -> Option<(usize, u64)> {
         if let Some(f) = self.seen.get_mut(&key) {
             if f.paired || f.side == side {
                 return None;
@@ -180,21 +187,33 @@ impl Firsts {
             f.paired = true;
             return Some((f.side, at_ns.saturating_sub(f.at_ns)));
         }
+        if self.forgotten_through.is_some_and(|t| venue_ns <= t) {
+            return None;
+        }
+        self.newest_ns = self.newest_ns.max(Some(venue_ns));
         self.seen.insert(
             key,
             First {
                 side,
                 at_ns,
+                venue_ns,
                 paired: false,
             },
         );
         self.order.push_back(key);
         if self.order.len() > PAIRING_CAP {
-            if let Some(old) = self.order.pop_front() {
-                self.seen.remove(&old);
+            if let Some(old) = self.order.pop_front().and_then(|k| self.seen.remove(&k)) {
+                self.forgotten_through = self.forgotten_through.max(Some(old.venue_ns));
             }
         }
         None
+    }
+
+    /// Forget every key, as eviction forgets one.
+    fn forget_all(&mut self) {
+        self.seen.clear();
+        self.order.clear();
+        self.forgotten_through = self.forgotten_through.max(self.newest_ns);
     }
 }
 
@@ -206,11 +225,11 @@ struct Race {
 }
 
 impl Race {
-    /// One copy of `key` from `side`, arriving at `at_ns` (`0` is "not stamped"); `won` when the
-    /// arbiter credited it with the tick or trade.
-    fn observe(&mut self, key: u64, side: usize, at_ns: u64, won: bool) {
+    /// One copy of `key`, at venue time `venue_ns`, from `side`, arriving at `at_ns` (`0` is "not
+    /// stamped"); `won` when the arbiter credited it with the tick or trade.
+    fn observe(&mut self, key: u64, venue_ns: u64, side: usize, at_ns: u64, won: bool) {
         if at_ns != 0 {
-            if let Some((winner, lead)) = self.firsts.pair(key, side, at_ns) {
+            if let Some((winner, lead)) = self.firsts.pair(key, venue_ns, side, at_ns) {
                 self.figures.lead[winner].record(lead);
             }
         }
@@ -289,7 +308,7 @@ impl RaceBoard {
         if let Some(race) = self.race(source_id, symbol, kind) {
             if race.state == SubState::Live && state != SubState::Live {
                 // A copy from before the gap must not pair with one after it.
-                race.firsts = Firsts::default();
+                race.firsts.forget_all();
             }
             race.state = state;
         }
@@ -312,14 +331,14 @@ impl RaceBoard {
     /// A quote that reached the staleness floor from `side`; `opened` when it opened its tick.
     pub fn on_quote(&mut self, q: &NormalizedQuote, side: usize, opened: bool) {
         if let Some(race) = self.live(q.source_id, &q.symbol, Kind::Quotes) {
-            race.observe(q.source_ts_ns, side, q.recv_ts_ns, opened);
+            race.observe(q.source_ts_ns, q.source_ts_ns, side, q.recv_ts_ns, opened);
         }
     }
 
     /// A trade that reached the `trade_id` window from `side`; `admitted` when its copy went out.
     pub fn on_trade(&mut self, t: &NormalizedTrade, side: usize, admitted: bool) {
         if let Some(race) = self.live(t.source_id, &t.symbol, Kind::Trades) {
-            race.observe(t.trade_id, side, t.recv_ts_ns, admitted);
+            race.observe(t.trade_id, t.source_ts_ns, side, t.recv_ts_ns, admitted);
         }
     }
 
@@ -573,7 +592,53 @@ mod tests {
         b.set_state(SRC, "BTC", Kind::Quotes, SubState::Pending);
         b.set_state(SRC, "BTC", Kind::Quotes, SubState::Live);
         b.on_quote(&quote("BTC", 1_000, 9_000), PUBLIC, false);
-        assert_eq!(figures(&b, "BTC", Kind::Quotes).lead[EDGE].count, 0);
+        b.on_quote(&quote("BTC", 1_000, 9_100), EDGE, false); // a slower edge mirror
+        let f = figures(&b, "BTC", Kind::Quotes);
+        assert_eq!((f.lead[EDGE].count, f.lead[PUBLIC].count), (0, 0));
+        b.on_quote(&quote("BTC", 2_000, 9_200), EDGE, true);
+        b.on_quote(&quote("BTC", 2_000, 9_300), PUBLIC, false);
+        assert_eq!(figures(&b, "BTC", Kind::Quotes).lead[EDGE].count, 1);
+    }
+
+    /// Past the pairing window a tick is skipped, never paired afresh: a late public copy then a
+    /// slower edge mirror must not read as a public lead, nor a paired tick score again.
+    #[test]
+    fn a_tick_past_the_pairing_window_is_skipped() {
+        let mut b = board();
+        b.on_quote(&quote("BTC", 1_000, 100), EDGE, true);
+        b.on_quote(&quote("BTC", 2_000, 200), EDGE, true);
+        b.on_quote(&quote("BTC", 2_000, 300), PUBLIC, false);
+        for tick in 3..3 + PAIRING_CAP as u64 {
+            b.on_quote(&quote("BTC", tick * 1_000, 400), EDGE, true);
+        }
+        b.on_quote(&quote("BTC", 1_000, 9_000), PUBLIC, false);
+        b.on_quote(&quote("BTC", 1_000, 9_100), EDGE, false);
+        b.on_quote(&quote("BTC", 2_000, 9_000), EDGE, false);
+        b.on_quote(&quote("BTC", 2_000, 9_100), PUBLIC, false);
+        let f = figures(&b, "BTC", Kind::Quotes);
+        assert_eq!((f.lead[EDGE].count, f.lead[PUBLIC].count), (1, 0));
+    }
+
+    /// The same for trades, whose ids follow no order: here each is above both evicted ones.
+    #[test]
+    fn a_trade_past_the_pairing_window_is_skipped_whatever_its_id() {
+        let mut b = board();
+        let t = |id: u64, venue_ns: u64, recv_ts_ns: u64| NormalizedTrade {
+            source_ts_ns: venue_ns,
+            ..trade("BTC", id, recv_ts_ns)
+        };
+        b.on_trade(&t(900, 1, 100), EDGE, true);
+        b.on_trade(&t(5, 2, 200), EDGE, true);
+        b.on_trade(&t(5, 2, 300), PUBLIC, false);
+        for n in 0..PAIRING_CAP as u64 {
+            b.on_trade(&t(1_000_000 - n, 3 + n, 400), EDGE, true);
+        }
+        b.on_trade(&t(900, 1, 9_000), PUBLIC, false);
+        b.on_trade(&t(900, 1, 9_100), EDGE, false);
+        b.on_trade(&t(5, 2, 9_000), EDGE, false);
+        b.on_trade(&t(5, 2, 9_100), PUBLIC, false);
+        let f = figures(&b, "BTC", Kind::Trades);
+        assert_eq!((f.lead[EDGE].count, f.lead[PUBLIC].count), (1, 0));
     }
 
     #[test]

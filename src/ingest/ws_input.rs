@@ -226,16 +226,16 @@ fn handle_text(txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnaps
         }
         "trades" => {
             if let Ok(trades) = serde_json::from_value::<Vec<TradeData>>(env.data) {
-                let symbol = trades.first().map(|t| t.coin.clone());
+                let Some(symbol) = trades.first().map(|t| t.coin.clone()) else {
+                    return Frame::EmptyBatch { kind: Kind::Trades };
+                };
                 for t in trades {
                     emit_trade(t, arbiter, instruments);
                 }
-                if let Some(symbol) = symbol {
-                    return Frame::Data {
-                        symbol,
-                        kind: Kind::Trades,
-                    };
-                }
+                return Frame::Data {
+                    symbol,
+                    kind: Kind::Trades,
+                };
             }
         }
         "subscriptionResponse" => {
@@ -676,6 +676,18 @@ mod tests {
             rx.try_recv().is_err(),
             "no business message from control/garbage frames"
         );
+    }
+
+    /// An empty `trades` batch names no coin, so only the sequencer can say whose replay it is.
+    #[test]
+    fn an_empty_trades_batch_names_no_coin() {
+        let (arbiter, mut rx) = arbiter_with_rx();
+        let instruments = instruments_with("BTC");
+        assert_eq!(
+            handle_text(r#"{"channel":"trades","data":[]}"#, &arbiter, &instruments),
+            Frame::EmptyBatch { kind: Kind::Trades }
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     /// The Hyperliquid venue builds two subscribe frames (bbo + trades) per coin, in coin order.
