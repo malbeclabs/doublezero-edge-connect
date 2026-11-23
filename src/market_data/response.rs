@@ -61,13 +61,17 @@ impl From<Freshness> for CachePolicy {
     }
 }
 
-/// The `Cache-Control` value for a policy, in the CDN's shared-cache form (`s-maxage`), so
-/// browsers do not cache.
+/// The `Cache-Control` value for a policy. `s-maxage` binds only the CDN; `max-age=0` makes a
+/// browser revalidate, since without it a browser may heuristically reuse a `404` or `410`.
 pub fn cache_control(p: CachePolicy) -> &'static str {
     match p {
-        CachePolicy::Fresh => "public, s-maxage=1, stale-while-revalidate=5, stale-if-error=5",
-        CachePolicy::Stale => "public, s-maxage=1, stale-while-revalidate=0, stale-if-error=0",
-        CachePolicy::Negative => "public, s-maxage=60",
+        CachePolicy::Fresh => {
+            "public, max-age=0, s-maxage=1, stale-while-revalidate=5, stale-if-error=5"
+        }
+        CachePolicy::Stale => {
+            "public, max-age=0, s-maxage=1, stale-while-revalidate=0, stale-if-error=0"
+        }
+        CachePolicy::Negative => "public, max-age=0, s-maxage=60",
         CachePolicy::NoStore => "no-store",
     }
 }
@@ -420,7 +424,7 @@ mod tests {
     fn fresh_cache_control() {
         assert_eq!(
             cache_control(CachePolicy::Fresh),
-            "public, s-maxage=1, stale-while-revalidate=5, stale-if-error=5"
+            "public, max-age=0, s-maxage=1, stale-while-revalidate=5, stale-if-error=5"
         );
     }
 
@@ -428,13 +432,27 @@ mod tests {
     fn stale_cache_control() {
         assert_eq!(
             cache_control(CachePolicy::Stale),
-            "public, s-maxage=1, stale-while-revalidate=0, stale-if-error=0"
+            "public, max-age=0, s-maxage=1, stale-while-revalidate=0, stale-if-error=0"
         );
     }
 
     #[test]
     fn negative_cache_control() {
-        assert_eq!(cache_control(CachePolicy::Negative), "public, s-maxage=60");
+        assert_eq!(
+            cache_control(CachePolicy::Negative),
+            "public, max-age=0, s-maxage=60"
+        );
+    }
+
+    #[test]
+    fn every_public_policy_makes_browsers_revalidate() {
+        for p in [
+            CachePolicy::Fresh,
+            CachePolicy::Stale,
+            CachePolicy::Negative,
+        ] {
+            assert!(cache_control(p).contains("max-age=0,"), "{p:?}");
+        }
     }
 
     #[test]
