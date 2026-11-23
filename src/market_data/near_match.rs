@@ -139,7 +139,6 @@ mod tests {
     use std::cell::Cell;
 
     thread_local! {
-        /// Edit-distance cells computed on this thread.
         pub(super) static CELLS: Cell<usize> = const { Cell::new(0) };
     }
 
