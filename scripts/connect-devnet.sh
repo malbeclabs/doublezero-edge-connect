@@ -493,8 +493,8 @@ fi
 ws_disabled() { [ "${WS_BIND+set}" = set ] && [ -z "${WS_BIND}" ]; }
 # The WS port: WS_BIND's trailing :port when set non-empty, else the default WS_PORT.
 ws_port() { if [ -n "${WS_BIND:-}" ]; then printf '%s' "${WS_BIND##*:}"; else printf '%s' "$WS_PORT"; fi; }
-# The WS address: WS_BIND's host when set non-empty, else the bridge's loopback default.
-ws_addr() { if [ -n "${WS_BIND:-}" ]; then printf '%s' "${WS_BIND%:*}"; else printf '127.0.0.1'; fi; }
+# The WS address: WS_BIND's host when it names one, else the bridge's loopback default.
+ws_addr() { case "${WS_BIND:-}" in *:*) printf '%s' "${WS_BIND%:*}" ;; *) printf '127.0.0.1' ;; esac; }
 
 # Is a TCP port already bound on this host? Prefer ss, fall back to netstat; if neither exists we
 # can't tell (rc 2 -> skip). A ':'/'.' immediately before the port anchors the match so e.g. 8081
@@ -903,6 +903,10 @@ if [ "$CONNECT_STATE" = connected ] && [ -n "${KALSHI_WS_BIND:-}" ]; then
     *"sink disabled"*) warn "The Kalshi-compatible sink is NOT serving (KALSHI_WS_BIND=$KALSHI_WS_BIND): ${kalshi_log#*sink disabled: }" ;;
     *) warn "Could not confirm the Kalshi-compatible sink on $KALSHI_WS_BIND: neither its bind nor a bind failure is in the bridge log (RUST_LOG may hide them). Check: sudo docker logs $DZ_NAME | grep Kalshi" ;;
   esac
+fi
+# A re-run without WS_BIND leaves an engine on another host without data; say why.
+if [ "$CONNECT_STATE" = connected ] && [ -z "${WS_BIND+set}" ]; then
+  info "The WebSocket is loopback-only; rerun with WS_BIND=0.0.0.0:8081 to serve engines on other hosts (no TLS or authentication: firewall the port)."
 fi
 echo
 info "Manage with:"
