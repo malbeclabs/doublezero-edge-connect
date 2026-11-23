@@ -255,7 +255,7 @@ pub fn common_headers(path: &str, status: u16) -> &'static [(&'static str, &'sta
 }
 
 /// An RFC 9457 problem. `detail` is one factual sentence that names no symbol; symbols travel only
-/// in structured extensions.
+/// in structured extensions. The server that builds problems carries the test for that rule.
 #[derive(Debug, Clone)]
 pub struct Problem {
     pub kind: ProblemKind,
@@ -289,10 +289,12 @@ impl Problem {
         member("status", &Value::from(self.kind.status()));
         member("detail", &Value::from(self.detail.as_str()));
         member("code", &Value::from(self.kind.slug()));
-        for (key, value) in &self.extensions {
-            debug_assert!(
-                !["type", "title", "status", "detail", "code"].contains(key),
-                "extension {key} would repeat a core member"
+        for (i, (key, value)) in self.extensions.iter().enumerate() {
+            // Checked in release builds too: parsers disagree on which copy of a repeated member wins.
+            assert!(
+                !["type", "title", "status", "detail", "code"].contains(key)
+                    && !self.extensions[..i].iter().any(|(k, _)| k == key),
+                "extension {key} would repeat a member"
             );
             member(key, value);
         }
@@ -606,5 +608,27 @@ mod tests {
         let mut p = problem(ProblemKind::InternalError);
         p.detail = "a \"quoted\"\r\nline".into();
         assert_eq!(parse(&p, "")["detail"], "a \"quoted\"\r\nline");
+    }
+
+    #[test]
+    #[should_panic(expected = "would repeat a member")]
+    fn repeated_extension_key_panics() {
+        Problem {
+            kind: ProblemKind::ALL[0],
+            detail: String::new(),
+            extensions: vec![("hints", json!([])), ("hints", json!([]))],
+        }
+        .to_json("");
+    }
+
+    #[test]
+    #[should_panic(expected = "would repeat a member")]
+    fn extension_repeating_a_core_member_panics() {
+        Problem {
+            kind: ProblemKind::ALL[0],
+            detail: String::new(),
+            extensions: vec![("code", json!("x"))],
+        }
+        .to_json("");
     }
 }

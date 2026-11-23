@@ -83,20 +83,34 @@ pub fn near_matches<'a>(query: &str, sorted: &[&'a str]) -> Vec<&'a str> {
 /// Case-insensitive optimal-string-alignment distance between `q` (at most [`MAX_QUERY`] bytes)
 /// and `s`, or `None` once it must exceed [`MAX_DISTANCE`]. Rows are indexed by `q`'s bytes, so
 /// their length is bounded by the query, not by the symbol.
+///
+/// Only the band `|i - j| <= MAX_DISTANCE` is computed: a cell outside it is already over the
+/// limit, and without the band a query sharing a long prefix with every symbol never trips the
+/// early exit and pays the whole table per symbol.
 fn distance_within(q: &[u8], s: &[u8], rows: &mut [Vec<usize>; 3]) -> Option<usize> {
+    // Any value over the limit stands for "too far"; it stays over it after `+ 1`.
+    const FAR: usize = MAX_DISTANCE + 1;
     if q.len().abs_diff(s.len()) > MAX_DISTANCE {
         return None;
     }
     let lower = |b: u8| b.to_ascii_lowercase();
     let n = q.len();
     let [two_back, prev, cur] = rows;
-    for (j, v) in prev.iter_mut().enumerate().take(n + 1) {
+    for (j, v) in prev.iter_mut().enumerate().take(n.min(FAR) + 1) {
         *v = j;
     }
     for i in 1..=s.len() {
-        cur[0] = i;
-        let mut row_min = i;
-        for j in 1..=n {
+        let lo = i.saturating_sub(MAX_DISTANCE).max(1);
+        let hi = (i + MAX_DISTANCE).min(n);
+        // The cells either side of the band are read by this row and the next.
+        cur[lo - 1] = if lo == 1 { i.min(FAR) } else { FAR };
+        if hi < n {
+            cur[hi + 1] = FAR;
+        }
+        let mut row_min = cur[lo - 1];
+        for j in lo..=hi {
+            #[cfg(test)]
+            tests::CELLS.with(|c| c.set(c.get() + 1));
             let cost = usize::from(lower(s[i - 1]) != lower(q[j - 1]));
             let mut d = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
             if i > 1
@@ -106,8 +120,8 @@ fn distance_within(q: &[u8], s: &[u8], rows: &mut [Vec<usize>; 3]) -> Option<usi
             {
                 d = d.min(two_back[j - 2] + 1);
             }
-            cur[j] = d;
-            row_min = row_min.min(d);
+            cur[j] = d.min(FAR);
+            row_min = row_min.min(cur[j]);
         }
         // No later row can drop below this one's minimum, transpositions included.
         if row_min > MAX_DISTANCE {
@@ -122,6 +136,12 @@ fn distance_within(q: &[u8], s: &[u8], rows: &mut [Vec<usize>; 3]) -> Option<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Edit-distance cells computed on this thread.
+        pub(super) static CELLS: Cell<usize> = const { Cell::new(0) };
+    }
 
     fn venue(names: &[&'static str]) -> Vec<&'static str> {
         let mut v = names.to_vec();
@@ -243,7 +263,27 @@ mod tests {
             d[n][m]
         }
         let words = [
-            "", "a", "ab", "ba", "abc", "acb", "bca", "abcd", "badc", "xyz", "abxd", "dcba",
+            "",
+            "a",
+            "ab",
+            "ba",
+            "abc",
+            "acb",
+            "bca",
+            "abcd",
+            "badc",
+            "xyz",
+            "abxd",
+            "dcba",
+            "abcdefgh",
+            "abcdefhg",
+            "abcdxfgh",
+            "abcdefg",
+            "abcdefghij",
+            "bacdefgh",
+            "hgfedcba",
+            "abcdefghi",
+            "xbcdefgy",
         ];
         let mut rows = [
             vec![0; MAX_QUERY + 1],
@@ -261,5 +301,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn distance_scan_cost_is_bounded_per_symbol() {
+        // The worst case: a near-full-length query sharing a long prefix with every symbol on a
+        // full venue, so the early exit fires late or not at all. The full table is ~12x the bound.
+        let names: Vec<String> = (0..DISTANCE_SCAN_MAX)
+            .map(|i| format!("{}{i:05}", "K".repeat(MAX_QUERY - 5)))
+            .collect();
+        let v: Vec<&str> = names.iter().map(String::as_str).collect();
+        let query = format!("{}X0000", "K".repeat(MAX_QUERY - 6));
+        CELLS.with(|c| c.set(0));
+        let hints = near_matches(&query, &v);
+        assert!(!hints.is_empty());
+        let per_symbol = (MAX_QUERY + MAX_DISTANCE) * (2 * MAX_DISTANCE + 1);
+        let cells = CELLS.with(Cell::get);
+        assert!(
+            cells <= DISTANCE_SCAN_MAX * per_symbol,
+            "{cells} cells for {DISTANCE_SCAN_MAX} symbols"
+        );
     }
 }
