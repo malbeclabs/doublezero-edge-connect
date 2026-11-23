@@ -1123,7 +1123,7 @@ Modules are grouped by role under `src/`:
   clients and the Python client a Python `TradingNode` runs. The **path picks the engine**, `/usdsm`
   Source ID 6 and `/spot` 8, with no default because both list `BTCUSDT`; `/ws` or the bare path sends
   bare events (Nautilus's futures client uses its base URL verbatim) and `/stream` wraps them (its spot
-  and Python clients append `/stream`). Four traps, each checked against that source:
+  and Python clients append `/stream`). Below the engine the paths are Binance's own, for CCXT, python-binance and Binance's SDKs: streams named after `/ws`, and USD-M's `/public`, `/market` and `/private`, which split the three streams as Binance does (`Category`). Four traps, each checked against that source:
   ⚠️ **prices and quantities render at the instrument's declared precision, trailing zeros kept** —
   from the wire integers (`QuoteWire`, and `TradeWire` on a trade), never the scaled `f64`s, which
   round past ~15 significant digits, nor the instrument catalog, which can already hold a later

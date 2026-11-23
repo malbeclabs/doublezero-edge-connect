@@ -38,7 +38,7 @@ use tokio_tungstenite::{
 use tracing::{info, warn};
 
 use super::{
-    http::parse_query_params,
+    http::{parse_query_params, percent_decode},
     hyperliquid::{
         finish_close, inbound_allowed, inbound_limits, json, ms_or_now, ClientGuard,
         CLOSE_HANDSHAKE_TIMEOUT, HANDSHAKE_TIMEOUT, HEARTBEAT, IDLE_TIMEOUT, MAX_CLIENTS,
@@ -87,11 +87,48 @@ enum Framing {
     Combined,
 }
 
+/// How Binance splits USD-M's streams between paths. `All` is every unsplit path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Category {
+    #[default]
+    All,
+    Public,
+    Market,
+    Private,
+}
+
+impl Category {
+    fn serves(self, kind: Kind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Public => matches!(kind, Kind::BookTicker | Kind::Trade),
+            Self::Market => kind == Kind::AggTrade,
+            Self::Private => false,
+        }
+    }
+
+    /// What a refusal says this path serves.
+    fn offer(self) -> String {
+        let streams = match self {
+            Self::All => {
+                "this sink serves <symbol>@bookTicker, <symbol>@aggTrade and <symbol>@trade"
+            }
+            Self::Public => "/public serves <symbol>@bookTicker and <symbol>@trade",
+            Self::Market => "/market serves <symbol>@aggTrade",
+            Self::Private => {
+                return "/private serves account data, which this sink has none of".into()
+            }
+        };
+        format!("{streams}, at most {MAX_STREAMS} per connection")
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Route {
     engine: Engine,
     framing: Framing,
-    /// Streams named in the URL (`?streams=a/b`), subscribed without a `SUBSCRIBE`.
+    category: Category,
+    /// Streams named in the URL (`/ws/a/b` or `?streams=a/b`), subscribed without a `SUBSCRIBE`.
     streams: Vec<String>,
 }
 
@@ -100,20 +137,45 @@ struct Route {
 /// A stream this sink cannot serve is refused in-band rather than here: Nautilus's Python client
 /// names its first stream in the URL, and a failed handshake leaves that client waiting for good.
 fn route(path: &str, query: Option<&str>) -> Result<Route, (StatusCode, &'static str)> {
+    let not_found = Err((StatusCode::NOT_FOUND, NOT_FOUND));
     let path = path.trim_end_matches('/');
-    let (engine, endpoint) = if let Some(rest) = path.strip_prefix("/usdsm") {
+    let (engine, rest) = if let Some(rest) = path.strip_prefix("/usdsm") {
         (Engine::UsdM, rest)
     } else if let Some(rest) = path.strip_prefix("/spot") {
         (Engine::Spot, rest)
     } else {
-        return Err((StatusCode::NOT_FOUND, NOT_FOUND));
+        return not_found;
     };
-    let framing = match endpoint {
-        "" | "/ws" => Framing::Raw,
-        "/stream" => Framing::Combined,
-        _ => return Err((StatusCode::NOT_FOUND, NOT_FOUND)),
+    let (category, endpoint) = match engine {
+        Engine::UsdM => [
+            ("/public", Category::Public),
+            ("/market", Category::Market),
+            // Serves nothing, but Binance's USD-M SDK gives up unless it connects.
+            ("/private", Category::Private),
+        ]
+        .into_iter()
+        .find_map(|(prefix, category)| Some((category, rest.strip_prefix(prefix)?)))
+        .unwrap_or((Category::All, rest)),
+        Engine::Spot => (Category::All, rest),
     };
     let mut streams = Vec::new();
+    let framing = match endpoint {
+        "" if category == Category::All => Framing::Raw,
+        "/stream" => Framing::Combined,
+        _ => match endpoint.strip_prefix("/ws") {
+            Some(named) if named.is_empty() || named.starts_with('/') => {
+                streams.extend(
+                    named
+                        .split('/')
+                        // CCXT appends a connection index, which Binance ignores.
+                        .filter(|s| !s.is_empty() && !s.bytes().all(|b| b.is_ascii_digit()))
+                        .map(percent_decode),
+                );
+                Framing::Raw
+            }
+            _ => return not_found,
+        },
+    };
     for (key, names) in parse_query_params(query.unwrap_or_default()) {
         // Binance also takes `timeUnit`; ignoring it would serve milliseconds to a client expecting
         // microseconds.
@@ -133,6 +195,7 @@ fn route(path: &str, query: Option<&str>) -> Result<Route, (StatusCode, &'static
     Ok(Route {
         engine,
         framing,
+        category,
         streams,
     })
 }
@@ -167,17 +230,20 @@ fn parse_stream(stream: &str) -> Option<(String, Kind)> {
     (!symbol.is_empty() && symbol.len() <= MAX_SYMBOL_LEN).then(|| (symbol.to_uppercase(), kind))
 }
 
-/// One connection's streams: the symbols subscribed for each kind.
+/// One connection's streams: the symbols subscribed for each kind its path serves.
 #[derive(Default)]
-struct Subs([HashSet<String>; 3]);
+struct Subs {
+    category: Category,
+    symbols: [HashSet<String>; 3],
+}
 
 impl Subs {
     fn has(&self, kind: Kind, symbol: &str) -> bool {
-        self.0[kind as usize].contains(symbol)
+        self.symbols[kind as usize].contains(symbol)
     }
 
     fn len(&self) -> usize {
-        self.0.iter().map(HashSet::len).sum()
+        self.symbols.iter().map(HashSet::len).sum()
     }
 
     /// Add or remove each named stream, returning the ones a subscribe asked for and this sink
@@ -191,10 +257,13 @@ impl Subs {
         for s in streams {
             match s.as_str().and_then(parse_stream) {
                 Some((symbol, kind)) if !add => {
-                    self.0[kind as usize].remove(&symbol);
+                    self.symbols[kind as usize].remove(&symbol);
                 }
-                Some((symbol, kind)) if self.has(kind, &symbol) || self.len() < MAX_STREAMS => {
-                    self.0[kind as usize].insert(symbol);
+                Some((symbol, kind))
+                    if self.category.serves(kind)
+                        && (self.has(kind, &symbol) || self.len() < MAX_STREAMS) =>
+                {
+                    self.symbols[kind as usize].insert(symbol);
                 }
                 _ if !add => {}
                 _ => refused.push(s.as_str().map_or_else(|| s.to_string(), str::to_string)),
@@ -232,10 +301,10 @@ fn refusal(code: i64, msg: &str) -> WsMessage {
     text(json(Refusal { code, msg }))
 }
 
-fn refused_streams(refused: &[String]) -> WsMessage {
+fn refused_streams(category: Category, refused: &[String]) -> WsMessage {
     let msg = format!(
-        "Invalid request: this sink serves <symbol>@bookTicker, <symbol>@aggTrade and \
-         <symbol>@trade, at most {MAX_STREAMS} per connection; refused: {}",
+        "Invalid request: {}; refused: {}",
+        category.offer(),
         refused.join(", ")
     );
     refusal(2, &msg)
@@ -268,7 +337,7 @@ fn control(frame: &str, subs: &mut Subs) -> Vec<WsMessage> {
         out.push(ack(request.get("id").cloned().unwrap_or_default()));
     }
     if !refused.is_empty() {
-        out.push(refused_streams(&refused));
+        out.push(refused_streams(subs.category, &refused));
     }
     out
 }
@@ -637,15 +706,24 @@ async fn serve_client(stream: TcpStream, prepared: broadcast::Sender<Arc<Prepare
         Route {
             engine,
             framing,
+            category,
             streams,
         },
     ) = accept(stream).await?;
     let (mut write, mut read) = ws.split();
-    let mut subs = Subs::default();
+    let mut subs = Subs {
+        category,
+        ..Subs::default()
+    };
     let named: Vec<Value> = streams.into_iter().map(Value::String).collect();
     let refused = subs.apply(&named, true);
     if !refused.is_empty() {
-        send(&mut write, refused_streams(&refused), IDLE_TIMEOUT).await?;
+        send(
+            &mut write,
+            refused_streams(category, &refused),
+            IDLE_TIMEOUT,
+        )
+        .await?;
     }
     // Only now, so nothing broadcast during the handshake reaches the client as if it were live.
     let mut rx = prepared.subscribe();
@@ -898,6 +976,7 @@ mod tests {
                 Ok(Route {
                     engine,
                     framing,
+                    category: Category::All,
                     streams: vec![]
                 }),
                 "{path}"
@@ -905,18 +984,83 @@ mod tests {
         }
     }
 
+    /// The paths CCXT, python-binance and Binance's own SDK build for USD-M.
+    #[test]
+    fn a_usdsm_category_path_names_its_category() {
+        for (path, category, framing) in [
+            ("/usdsm/public/ws", Category::Public, Framing::Raw),
+            ("/usdsm/public/stream", Category::Public, Framing::Combined),
+            ("/usdsm/market/ws/", Category::Market, Framing::Raw),
+            ("/usdsm/market/stream", Category::Market, Framing::Combined),
+            (
+                "/usdsm/private/stream",
+                Category::Private,
+                Framing::Combined,
+            ),
+        ] {
+            assert_eq!(
+                route(path, None),
+                Ok(Route {
+                    engine: Engine::UsdM,
+                    framing,
+                    category,
+                    streams: vec![]
+                }),
+                "{path}"
+            );
+        }
+    }
+
+    /// python-binance's `/ws/<stream>`, and Binance's `/`-separated list.
+    #[test]
+    fn streams_named_in_the_path_are_subscribed() {
+        for (path, streams) in [
+            ("/spot/ws/btcusdt@bookTicker", &["btcusdt@bookTicker"][..]),
+            (
+                "/usdsm/public/ws/btcusdt@bookTicker/btcusdt%40trade",
+                &["btcusdt@bookTicker", "btcusdt@trade"],
+            ),
+            ("/usdsm/ws/btcusdt@depth", &["btcusdt@depth"]),
+        ] {
+            assert_eq!(route(path, None).unwrap().streams, streams, "{path}");
+        }
+    }
+
+    #[test]
+    fn ccxts_connection_index_names_no_stream() {
+        for path in ["/spot/ws/0", "/usdsm/public/ws/12", "/usdsm/market/ws/3"] {
+            let r = route(path, None).unwrap();
+            assert_eq!(r.framing, Framing::Raw, "{path}");
+            assert!(r.streams.is_empty(), "{path}");
+        }
+    }
+
+    /// Binance answers each of these with a 404: spot has no categories, and a category needs `/ws`
+    /// or `/stream`.
+    #[test]
+    fn paths_binance_does_not_serve_are_not_found() {
+        for path in [
+            "/spot/public/ws",
+            "/spot/market/stream",
+            "/spot/private/ws",
+            "/usdsm/public",
+            "/usdsm/market/",
+            "/usdsm/stream/0",
+            "/usdsm/public/stream/0",
+            "/usdsm/wsx",
+            "/usdsm/publicx/ws",
+        ] {
+            let Err((status, _)) = route(path, None) else {
+                panic!("{path} must be refused")
+            };
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
     /// Both engines list `BTCUSDT`, so a path that names neither is refused rather than defaulted.
     #[test]
     fn a_path_naming_no_engine_is_not_found() {
-        for path in [
-            "/",
-            "",
-            "/ws",
-            "/stream",
-            "/usdsmx",
-            "/spot/ws/btcusdt@trade",
-            "/coinm",
-        ] {
+        for path in ["/", "", "/ws", "/stream", "/usdsmx", "/coinm"] {
             let Err((status, body)) = route(path, None) else {
                 panic!("{path} must be refused")
             };
@@ -1094,6 +1238,53 @@ mod tests {
             ["extra@trade"]
         );
         assert_eq!(s.len(), MAX_STREAMS);
+    }
+
+    #[test]
+    fn a_category_path_refuses_another_categorys_streams() {
+        let named = ["btcusdt@bookTicker", "btcusdt@aggTrade", "btcusdt@trade"];
+        for (category, refused) in [
+            (Category::All, &[][..]),
+            (Category::Public, &["btcusdt@aggTrade"]),
+            (Category::Market, &["btcusdt@bookTicker", "btcusdt@trade"]),
+            (Category::Private, &named),
+        ] {
+            let mut s = Subs {
+                category,
+                ..Subs::default()
+            };
+            assert_eq!(
+                s.apply(&named.map(Value::from), true),
+                refused,
+                "{category:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_category_paths_refusal_names_what_it_serves() {
+        for (category, msg) in [
+            (
+                Category::Public,
+                "Invalid request: /public serves <symbol>@bookTicker and <symbol>@trade, at most \
+                 1024 per connection; refused: btcusdt@aggTrade",
+            ),
+            (
+                Category::Private,
+                "Invalid request: /private serves account data, which this sink has none of; \
+                 refused: btcusdt@aggTrade",
+            ),
+        ] {
+            let mut s = Subs {
+                category,
+                ..Subs::default()
+            };
+            let out = control(
+                r#"{"method":"SUBSCRIBE","params":["btcusdt@aggTrade"],"id":1}"#,
+                &mut s,
+            );
+            assert_eq!(text_of(&out[0])["msg"], msg);
+        }
     }
 
     /// Nautilus's Rust clients unsubscribe their refused `@depth` stream on stop, which must not
@@ -1409,6 +1600,28 @@ mod tests {
             (Some("bookTicker"), Some("61825.40"))
         );
         assert!(next_text(&mut ws, QUIET).await.is_none());
+        srv.abort();
+    }
+
+    /// CCXT's form: a connection index in the path, which draws no refusal ahead of the ack.
+    #[tokio::test]
+    async fn a_ccxt_client_is_acknowledged_and_receives_its_quotes() {
+        let (tx, addr, srv) = spawn().await;
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/usdsm/public/ws/0"))
+                .await
+                .unwrap();
+        ws.send(text(
+            r#"{"method":"SUBSCRIBE","params":["btcusdt@bookTicker"],"id":1}"#.into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            next_text(&mut ws, WAIT).await.unwrap(),
+            serde_json::json!({"result": null, "id": 1})
+        );
+        let _ = tx.send(Arc::new(FeedMessage::Quote(usdsm_quote())));
+        assert_eq!(next_text(&mut ws, WAIT).await.unwrap()["e"], "bookTicker");
         srv.abort();
     }
 

@@ -60,6 +60,21 @@ no `l4Book` subscription, so nothing in Nautilus will ever ask for one, and its 
 order id `0`. Order-level is available to a client that asks for `l4Book` — our own adapter, or
 Nautilus once someone extends it. "Hyperliquid-compatible" does not mean "Nautilus gets L3".
 
+**Pointing hyperliquid-python-sdk at it.** `Info` derives its WebSocket URL from its REST `base_url`, and loads Hyperliquid's metadata over REST when it starts, so it cannot be pointed here whole. Keep it on Hyperliquid's API with `skip_ws=True`, and give it a `WebsocketManager` of its own, which connects to `ws://<host>:8082/ws`:
+
+```python
+from hyperliquid.info import Info
+from hyperliquid.utils import constants
+from hyperliquid.websocket_manager import WebsocketManager
+
+info = Info(constants.MAINNET_API_URL, skip_ws=True)
+info.ws_manager = WebsocketManager("http://<host>:8082")
+info.ws_manager.start()
+info.subscribe({"type": "bbo", "coin": "BTC"}, print)
+```
+
+`info.subscribe` still maps names to coins from the metadata `Info` loaded. `bbo`, `trades` and `l2Book` work; the SDK has no `l4Book` subscription.
+
 **What the wire cannot supply.** Hyperliquid's schema describes a venue that also owns the account
 model; our input is an order book. A trade's `users` and `hash`, an order's `user`, `timestamp` and
 its `triggerCondition`/`orderType`/`tif`/`cloid` block, and `l4Book`'s `height` are emitted as null or
@@ -127,15 +142,20 @@ Serves the Binance feeds' quotes and trades in **Binance's own market-stream sch
 
 Like the Hyperliquid sink, it is a rendering, not a second protocol. Nothing about it is in PROTOCOL.md, it is not subscription-gated, and a bind failure disables it with a warning.
 
-**The path picks the matching engine.** Both engines list symbols such as `BTCUSDT`, so there is no default path; any other path gets a 404 naming these two.
+**The path picks the matching engine.** Both engines list symbols such as `BTCUSDT`, so there is no default path. Below the engine, the paths are Binance's own, and any other path gets a 404, as it would from Binance.
 
 | Path | Engine | Framing |
 |---|---|---|
 | `/usdsm` or `/usdsm/ws` | USD-margined perpetuals (Source ID 6, `edge-binance-usdsm-tob`) | Bare events, like Binance's `/ws` |
 | `/usdsm/stream` | The same | `{"stream":…,"data":…}`, like Binance's `/stream` |
+| `/usdsm/public/ws` or `/usdsm/public/stream` | The same, `bookTicker` and `trade` only | As above |
+| `/usdsm/market/ws` or `/usdsm/market/stream` | The same, `aggTrade` only | As above |
+| `/usdsm/private/ws` or `/usdsm/private/stream` | No stream: Binance serves account data there | As above |
 | `/spot`, `/spot/ws` or `/spot/stream` | Spot (Source ID 8, `edge-binance-spot-tob`) | As above |
 
-Name streams in a `SUBSCRIBE` (`{"method":"SUBSCRIBE","params":["btcusdt@bookTicker"],"id":1}`, acknowledged with `{"result":null,"id":1}`) or in the URL (`/spot/stream?streams=btcusdt@bookTicker/btcusdt@trade`). Either path serves three streams, at most 1,024 per connection:
+`/public`, `/market` and `/private` split USD-M's streams as Binance does. A stream subscribed on the wrong one is refused here, where Binance would acknowledge it and send nothing. Spot has no such split.
+
+Name streams in a `SUBSCRIBE` (`{"method":"SUBSCRIBE","params":["btcusdt@bookTicker"],"id":1}`, acknowledged with `{"result":null,"id":1}`), after `/ws` in the path (`/spot/ws/btcusdt@bookTicker/btcusdt@trade`), or in the query (`/spot/stream?streams=btcusdt@bookTicker/btcusdt@trade`). A numeric segment after `/ws`, which CCXT adds as a connection index, names no stream and is ignored, as Binance ignores it. Each engine serves three streams, at most 1,024 per connection:
 
 | Stream | Frame |
 |---|---|
@@ -172,6 +192,29 @@ BinanceDataClientConfig { product_type: BinanceProductType::Spot, spot_market_da
 ```
 
 Give each client its engine's base path, nothing more: the Rust futures client reads bare events and silently drops wrapped ones from `/usdsm/stream`, and the Python client appends `/stream` itself.
+
+**Pointing CCXT at it.** CCXT takes its WebSocket URLs from `urls`. Override them on an instance kept for market data: the same URL also carries the account's user-data stream, which this sink cannot serve, and its listen key would cross the network in clear text. Markets still load from Binance's REST API.
+
+```python
+import ccxt.pro as ccxtpro
+
+usdm = ccxtpro.binanceusdm({"urls": {"api": {"ws": {"linear": "ws://<host>:8083/usdsm/ws"}}}})
+spot = ccxtpro.binance({"urls": {"api": {"ws": {"spot": "ws://<host>:8083/spot/ws"}}}})
+```
+
+Keep the `/ws`: CCXT rewrites it to `/public/ws` or `/market/ws` for each stream. `watchTrades` (`@trade`, or `@aggTrade` with `params={"name": "aggTrade"}`) and `watchBidsAsks` given its symbols (`@bookTicker`) work. `watchTicker` and `watchTickers` read the 24-hour `@ticker` and `@miniTicker`, `watchOrderBook` needs depth and `watchOHLCV` klines, so none of them works: CCXT ignores the sink's refusal and waits without data.
+
+**Pointing python-binance at it.** `BinanceSocketManager` builds every URL from two attributes. Set them on a manager kept for market data, since its `user_socket` and `futures_user_socket` read them too, and leave the client's `time_unit` unset, which the sink refuses:
+
+```python
+bm = BinanceSocketManager(client)
+bm.STREAM_URL = "ws://<host>:8083/spot/"
+bm.FSTREAM_URL = "ws://<host>:8083/usdsm/"
+```
+
+Spot's `trade_socket`, `aggtrade_socket`, `symbol_book_ticker_socket` and `multiplex_socket` work, as do USD-M's `aggtrade_futures_socket`, `symbol_ticker_futures_socket` (which is `@bookTicker`) and `futures_multiplex_socket`. That last one defaults to `/market`, so pass `category="public"` for `@bookTicker` or `@trade`.
+
+**Binance's own SDKs** take `ConfigurationWebSocketStreams(stream_url="ws://<host>:8083/usdsm")`, or `/spot`. The USD-M client opens `/public/stream`, `/market/stream` and `/private/stream` at connect and gives up if any of them fails, which is why `/private` is accepted. `binance-sdk-spot` 13.7.0 subscribes to nothing, against Binance itself too: its stream calls look for a connection it never opened.
 
 Client limits are the Hyperliquid sink's: 64 clients, 600 inbound frames per minute, and a 20s heartbeat with a 60s idle reap. Every inbound frame counts against that limit, whatever its kind. A client that falls behind misses messages and is counted rather than disconnected, since every frame is a whole quote or one print; one that stops reading for 60s is disconnected. Observability is `dz_binance_sink_clients`, `dz_binance_sink_messages_total{stream}` and `dz_binance_sink_dropped_total{reason}`. There is **no TLS**.
 
