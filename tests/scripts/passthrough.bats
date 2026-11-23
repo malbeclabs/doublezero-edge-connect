@@ -165,6 +165,18 @@ run_on_host() {
   done
 }
 
+@test "WS_BIND unset: the summary says the WebSocket is loopback-only; set, it does not (all scripts)" {
+  for s in "${SCRIPTS[@]}"; do
+    local out="$BATS_TEST_TMPDIR/$s.out"
+    ( common_env; export DZ_INSTALL_CLI=0 DZ_SUBSCRIPTION_REFRESH_SECS=0; unset WS_BIND
+      bash "$SCRIPTS_DIR/$s.sh" ) >"$out" 2>&1 || { echo "# $s exited $?"; sed 's/^/#   /' "$out"; false; }
+    grep -q 'loopback-only; rerun with WS_BIND=0.0.0.0:8081' "$out" || { echo "# $s, unset:"; sed 's/^/#   /' "$out"; false; }
+    ( common_env; export DZ_INSTALL_CLI=0 DZ_SUBSCRIPTION_REFRESH_SECS=0 WS_BIND=127.0.0.1:8081
+      bash "$SCRIPTS_DIR/$s.sh" ) >"$out" 2>&1 || { echo "# $s exited $?"; sed 's/^/#   /' "$out"; false; }
+    ! grep -q 'loopback-only' "$out" || { echo "# $s, set:"; sed 's/^/#   /' "$out"; false; }
+  done
+}
+
 @test "IPv6 listed first: each URL names this host's address in its bind's family (all scripts)" {
   for s in "${SCRIPTS[@]}"; do
     local out="$BATS_TEST_TMPDIR/$s.out"
