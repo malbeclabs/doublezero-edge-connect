@@ -107,9 +107,10 @@ ENV RUST_LOG=warn,doublezero_edge_connect=info
 ENV DZ_FEED_REGISTRY_URL=https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json
 
 # Documentational: host networking ignores published ports (EXPOSE opens nothing by itself), but
-# this records the surfaces a default config can listen on. Always-on, at loopback: 8081 (WS,
-# --ws-bind) and 9099 (query API, --api-bind). Off unless configured: 9090 (metrics, --metrics-bind, empty
-# default) and 9098 (admin, --admin-bind, empty default — no authentication; bind loopback only).
+# this records the surfaces a default config can listen on, all at loopback. From start: 9098
+# (admin, --admin-bind; no authentication, keep it on loopback). Once a market-data feed is
+# subscribed: 8081 (WS, --ws-bind) and 9099 (query API, --api-bind). Off unless configured: 9090
+# (metrics, --metrics-bind).
 EXPOSE 8081 9099 9090 9098
 
 ENTRYPOINT ["bridge-entrypoint.sh"]
