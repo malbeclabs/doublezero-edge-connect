@@ -21,9 +21,8 @@ const MAX_DISTANCE: usize = 2;
 /// Symbols are ASCII, so a non-ASCII or over-long query cannot be near one and gets no hints;
 /// refusing it up front also means nothing here ever slices inside a character.
 ///
-/// Above [`DISTANCE_SCAN_MAX`] names only the three binary searches run, so a mixed-case symbol
-/// (`xyz:TSLA`) is found from a query in neither its case nor all-upper or all-lower (`XYZ:tsla`)
-/// only on a smaller venue.
+/// Above [`DISTANCE_SCAN_MAX`] names only the binary searches run, so a mixed-case symbol
+/// (`xyz:TSLA`) is missed for a query like `XYZ:tsla`.
 pub fn near_matches<'a>(query: &str, sorted: &[&'a str]) -> Vec<&'a str> {
     if query.is_empty() || query.len() > MAX_QUERY || !query.is_ascii() {
         return Vec::new();
@@ -170,7 +169,6 @@ mod tests {
     #[test]
     fn ties_break_by_distance_then_length_then_bytes() {
         let v = venue(&["ABCD", "ABXY", "ABCDE", "ABCDEF", "ABDC", "XBCD"]);
-        // Exact first, then the prefix match, then distance 1 by bytes, then distance 2.
         assert_eq!(
             near_matches("abcd", &v),
             vec!["ABCD", "ABCDE", "ABCDEF", "ABDC", "XBCD"]
