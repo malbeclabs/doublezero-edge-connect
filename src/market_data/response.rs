@@ -183,16 +183,23 @@ impl ProblemKind {
 
     /// The HTTP reason phrase, which RFC 9457 §4.2.1 makes the `title` of an `about:blank` problem.
     pub fn status_phrase(self) -> &'static str {
-        match self.status() {
-            400 => "Bad Request",
-            404 => "Not Found",
-            405 => "Method Not Allowed",
-            408 => "Request Timeout",
-            409 => "Conflict",
-            410 => "Gone",
-            429 => "Too Many Requests",
-            503 => "Service Unavailable",
-            _ => "Internal Server Error",
+        match self {
+            ProblemKind::UnknownParameter
+            | ProblemKind::RepeatedParameter
+            | ProblemKind::InvalidParameter
+            | ProblemKind::InstrumentRequired
+            | ProblemKind::InvalidVenue
+            | ProblemKind::BodyNotAllowed => "Bad Request",
+            ProblemKind::UnknownVenue
+            | ProblemKind::UnknownInstrument
+            | ProblemKind::UnknownRoute => "Not Found",
+            ProblemKind::MethodNotAllowed => "Method Not Allowed",
+            ProblemKind::RequestTimeout => "Request Timeout",
+            ProblemKind::AmbiguousInstrument => "Conflict",
+            ProblemKind::Retired => "Gone",
+            ProblemKind::Overloaded => "Too Many Requests",
+            ProblemKind::InternalError => "Internal Server Error",
+            ProblemKind::NotWarm | ProblemKind::NotReady => "Service Unavailable",
         }
     }
 
@@ -283,6 +290,10 @@ impl Problem {
         member("detail", &Value::from(self.detail.as_str()));
         member("code", &Value::from(self.kind.slug()));
         for (key, value) in &self.extensions {
+            debug_assert!(
+                !["type", "title", "status", "detail", "code"].contains(key),
+                "extension {key} would repeat a core member"
+            );
             member(key, value);
         }
         out.push(b'}');
@@ -334,8 +345,56 @@ mod tests {
         assert_eq!(slugs.len(), ProblemKind::ALL.len());
     }
 
+    /// Fails to compile when a variant is added, as a reminder to add it to `ALL` too.
     #[test]
-    fn slugs_match_the_native_endpoints() {
+    fn all_lists_every_kind() {
+        let index = |k: ProblemKind| match k {
+            ProblemKind::UnknownParameter => 0,
+            ProblemKind::RepeatedParameter => 1,
+            ProblemKind::InvalidParameter => 2,
+            ProblemKind::InstrumentRequired => 3,
+            ProblemKind::InvalidVenue => 4,
+            ProblemKind::UnknownVenue => 5,
+            ProblemKind::UnknownInstrument => 6,
+            ProblemKind::AmbiguousInstrument => 7,
+            ProblemKind::Retired => 8,
+            ProblemKind::NotWarm => 9,
+            ProblemKind::NotReady => 10,
+            ProblemKind::Overloaded => 11,
+            ProblemKind::UnknownRoute => 12,
+            ProblemKind::MethodNotAllowed => 13,
+            ProblemKind::RequestTimeout => 14,
+            ProblemKind::BodyNotAllowed => 15,
+            ProblemKind::InternalError => 16,
+        };
+        for (i, k) in ProblemKind::ALL.into_iter().enumerate() {
+            assert_eq!(index(k), i);
+        }
+    }
+
+    #[test]
+    fn status_phrase_matches_the_status() {
+        for k in ProblemKind::ALL {
+            let want = match k.status() {
+                400 => "Bad Request",
+                404 => "Not Found",
+                405 => "Method Not Allowed",
+                408 => "Request Timeout",
+                409 => "Conflict",
+                410 => "Gone",
+                429 => "Too Many Requests",
+                500 => "Internal Server Error",
+                503 => "Service Unavailable",
+                other => panic!("no phrase for {other}"),
+            };
+            assert_eq!(k.status_phrase(), want, "{}", k.slug());
+        }
+    }
+
+    /// Pins the slugs already published for the quote endpoints, which clients and the docs page
+    /// anchor on, against a rename. Nothing else in the crate uses them yet.
+    #[test]
+    fn published_endpoint_slugs_are_unchanged() {
         let native = [
             "unknown-parameter",
             "repeated-parameter",

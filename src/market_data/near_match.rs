@@ -20,6 +20,10 @@ const MAX_DISTANCE: usize = 2;
 ///
 /// Symbols are ASCII, so a non-ASCII or over-long query cannot be near one and gets no hints;
 /// refusing it up front also means nothing here ever slices inside a character.
+///
+/// Above [`DISTANCE_SCAN_MAX`] names only the three binary searches run, so a mixed-case symbol
+/// (`xyz:TSLA`) is found from a query in neither its case nor all-upper or all-lower (`XYZ:tsla`)
+/// only on a smaller venue.
 pub fn near_matches<'a>(query: &str, sorted: &[&'a str]) -> Vec<&'a str> {
     if query.is_empty() || query.len() > MAX_QUERY || !query.is_ascii() {
         return Vec::new();
@@ -28,11 +32,15 @@ pub fn near_matches<'a>(query: &str, sorted: &[&'a str]) -> Vec<&'a str> {
     // (tier, distance, length, symbol): tier 0 exact, 1 prefix, 2 distance.
     let mut found: Vec<(u8, usize, usize, &'a str)> = Vec::new();
 
-    for prefix in [
+    let variants = [
         query.to_owned(),
         query.to_ascii_uppercase(),
         query.to_ascii_lowercase(),
-    ] {
+    ];
+    for (i, prefix) in variants.iter().enumerate() {
+        if variants[..i].contains(prefix) {
+            continue;
+        }
         let start = sorted.partition_point(|s| s.as_bytes() < prefix.as_bytes());
         for &s in sorted[start..]
             .iter()
