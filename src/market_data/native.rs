@@ -524,7 +524,6 @@ mod tests {
         assert_eq!(f.status, Status::Live);
         let f = Freshness::of(false, true, false, 9, 5_000, 10);
         assert_eq!(f.status, Status::Stale);
-        // Never live: `live_at` is null, and the verdict is stale.
         let f = Freshness::of(false, true, false, 0, 5_000, 10);
         assert_eq!(f.status, Status::Stale);
         assert_eq!(f.to_json()["live_at"], Value::Null);
