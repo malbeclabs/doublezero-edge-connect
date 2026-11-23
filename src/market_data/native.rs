@@ -20,7 +20,8 @@ use crate::{
 /// One catalog entry named by its full key, `<source_id>:<category>:<channel>:<instrument_id>`.
 /// The category is part of it because one Source ID can carry several universes whose
 /// `(channel, instrument_id)` pairs and symbols collide.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Ordered field by field, which is key order with each number compared as a number.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NativeId {
     pub source_id: u16,
     pub category: Arc<str>,
@@ -116,17 +117,18 @@ fn status_str(s: Status) -> &'static str {
 
 /// One response's freshness verdict and the values it was judged from, so a caller with its own
 /// clock can judge it again.
+/// Built only through [`FreshnessReport::of`], so no status skips its precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Freshness {
-    pub status: Status,
+pub struct FreshnessReport {
+    status: Status,
     /// The channel's last confirmation of life, `0` if never.
-    pub live_at_ns: u64,
-    pub threshold_ms: u32,
+    live_at_ns: u64,
+    threshold_ms: u32,
     /// The request time the status was judged at.
-    pub built_at_ns: u64,
+    built_at_ns: u64,
 }
 
-impl Freshness {
+impl FreshnessReport {
     /// The status is [`Status::of`]'s; staleness never comes from `as_of` alone.
     pub fn of(
         halted: bool,
@@ -136,12 +138,16 @@ impl Freshness {
         threshold_ms: u32,
         now_ns: u64,
     ) -> Self {
-        Freshness {
+        FreshnessReport {
             status: Status::of(halted, receiver_up, confirmed),
             live_at_ns,
             threshold_ms,
             built_at_ns: now_ns,
         }
+    }
+
+    pub fn status(&self) -> Status {
+        self.status
     }
 
     fn to_json(self) -> Value {
@@ -155,7 +161,10 @@ impl Freshness {
 }
 
 /// `value` as a fixed-point decimal string at `exponent`'s precision, never scientific notation.
+/// `value` must be finite: `NaN` and the infinities have no decimal form. Decoded wire values
+/// always are, being integers scaled by a power of ten.
 pub fn decimal(value: f64, exponent: i8) -> String {
+    debug_assert!(value.is_finite(), "decimal({value}) has no decimal form");
     // `unsigned_abs`, not negation: an exponent of `i8::MIN` comes off the wire unchecked.
     let decimals = exponent.min(0).unsigned_abs() as usize;
     format!("{value:.decimals$}")
@@ -273,7 +282,7 @@ pub fn quote_body(
     inst: &InstrumentView,
     quote: Option<(&Bbo, u64)>,
     trade: Option<&TradeEntry>,
-    freshness: &Freshness,
+    freshness: &FreshnessReport,
     links: &Links,
 ) -> Value {
     let level = |side: Option<(f64, f64)>| {
@@ -290,7 +299,7 @@ pub fn quote_body(
         Some((q, source_ts_ns)) => json!({
             "bid": level(q.bid),
             "ask": level(q.ask),
-            "as_of": rfc3339_ns(q.as_of_ns),
+            "as_of": opt_time(q.as_of_ns),
             "source_time": opt_time(source_ts_ns),
             "source": source_name(q.source),
             "empty_reason": (q.bid.is_none() || q.ask.is_none()).then_some("one_sided"),
@@ -313,7 +322,7 @@ pub fn quote_body(
                 Side::Sell => Some("sell"),
                 Side::Unknown => None,
             },
-            "as_of": rfc3339_ns(t.as_of_ns),
+            "as_of": opt_time(t.as_of_ns),
             "source_time": opt_time(t.source_ts_ns),
         })
     });
@@ -384,11 +393,13 @@ pub fn markets_body(
     })
 }
 
-/// The ambiguous-symbol problem: every candidate, each with a quote link by its own id, and the
-/// attribution.
+/// The ambiguous-symbol problem: every candidate in key order, each with a quote link by its own
+/// id, and the attribution.
 pub fn ambiguous_instrument(venue: &str, candidates: &[InstrumentView], links: &Links) -> Problem {
-    let candidates: Vec<Value> = candidates
-        .iter()
+    let mut sorted: Vec<&InstrumentView> = candidates.iter().collect();
+    sorted.sort_by(|a, b| a.id.cmp(&b.id));
+    let candidates: Vec<Value> = sorted
+        .into_iter()
         .map(|c| {
             json!({
                 "instrument": c.to_json(),
@@ -438,8 +449,8 @@ mod tests {
         }
     }
 
-    fn live() -> Freshness {
-        Freshness::of(false, true, true, 2_000, 5_000, 3_000)
+    fn live() -> FreshnessReport {
+        FreshnessReport::of(false, true, true, 2_000, 5_000, 3_000)
     }
 
     fn bbo(bid: Option<(f64, f64)>, ask: Option<(f64, f64)>) -> Bbo {
@@ -520,12 +531,12 @@ mod tests {
     #[test]
     fn stale_when_not_confirmed() {
         // The verdict follows the channel's confirmation, whatever the value's own age.
-        let f = Freshness::of(false, true, true, 9, 5_000, 10);
-        assert_eq!(f.status, Status::Live);
-        let f = Freshness::of(false, true, false, 9, 5_000, 10);
-        assert_eq!(f.status, Status::Stale);
-        let f = Freshness::of(false, true, false, 0, 5_000, 10);
-        assert_eq!(f.status, Status::Stale);
+        let f = FreshnessReport::of(false, true, true, 9, 5_000, 10);
+        assert_eq!(f.status(), Status::Live);
+        let f = FreshnessReport::of(false, true, false, 9, 5_000, 10);
+        assert_eq!(f.status(), Status::Stale);
+        let f = FreshnessReport::of(false, true, false, 0, 5_000, 10);
+        assert_eq!(f.status(), Status::Stale);
         assert_eq!(f.to_json()["live_at"], Value::Null);
         assert_eq!(f.to_json()["status"], "stale");
         assert_eq!(f.built_at_ns, 10);
@@ -533,7 +544,7 @@ mod tests {
 
     #[test]
     fn freshness_json_fields() {
-        let f = Freshness::of(false, false, true, 1_000_000_001, 5_000, 2_000_000_000);
+        let f = FreshnessReport::of(false, false, true, 1_000_000_001, 5_000, 2_000_000_000);
         assert_eq!(
             f.to_json(),
             json!({
@@ -653,7 +664,7 @@ mod tests {
 
     #[test]
     fn quote_body_no_quote_yet() {
-        let stale = Freshness::of(false, true, false, 0, 5_000, 3_000);
+        let stale = FreshnessReport::of(false, true, false, 0, 5_000, 3_000);
         for q in [None, Some(bbo(None, None))] {
             let body = quote_body(
                 "hyperliquid",
@@ -676,7 +687,7 @@ mod tests {
 
     #[test]
     fn quote_body_halted() {
-        let halted = Freshness::of(true, true, true, 2_000, 5_000, 3_000);
+        let halted = FreshnessReport::of(true, true, true, 2_000, 5_000, 3_000);
         let t = trade(Side::Buy);
         let body = quote_body(
             "hyperliquid",
@@ -913,5 +924,48 @@ mod tests {
         }
         assert_eq!(body["attribution"]["venue"], "hyperliquid");
         assert_eq!(body.as_object().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn candidates_are_in_key_order_whatever_the_callers() {
+        let at = |category: &str, channel: u8| {
+            let mut i = inst("BTC", 3);
+            i.id.category = category.into();
+            i.id.channel = channel;
+            i
+        };
+        let given = [at("xyz-perps", 0), at("hl-perps", 10), at("hl-perps", 9)];
+        let body: Value = serde_json::from_slice(
+            &ambiguous_instrument("hyperliquid", &given, &links()).to_json(""),
+        )
+        .unwrap();
+        let ids: Vec<&str> = body["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["instrument"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["1:hl-perps:9:3", "1:hl-perps:10:3", "1:xyz-perps:0:3"]
+        );
+    }
+
+    #[test]
+    fn a_zero_as_of_is_null_not_1970() {
+        let mut q = bbo(Some((1.0, 1.0)), None);
+        q.as_of_ns = 0;
+        let mut t = trade(Side::Buy);
+        t.as_of_ns = 0;
+        let body = quote_body(
+            "hyperliquid",
+            &inst("BTC", 3),
+            Some((&q, 0)),
+            Some(&t),
+            &live(),
+            &links(),
+        );
+        assert_eq!(body["quote"]["as_of"], Value::Null);
+        assert_eq!(body["last_trade"]["as_of"], Value::Null);
     }
 }

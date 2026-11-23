@@ -132,7 +132,7 @@ Modules are grouped by role under `src/`:
   `native`: the native response bodies, built on `response`'s types — the one problem catalog;
   extend it there rather than adding a second type. The
   `<source_id>:<category>:<channel>:<instrument_id>` id is accepted in its one canonical spelling
-  only; `Freshness`; decimal and RFC 3339 formatting; the quote, markets and ambiguous-instrument
+  only; `FreshnessReport`; decimal and RFC 3339 formatting; the quote, markets and ambiguous-instrument
   bodies and their links. Links come only from configured URLs, never from a request, so a body
   depends on nothing outside the cache key; `detail` never carries feed text. `sinks::api` renders
   its decimals through `native::decimal`, so the two surfaces format alike.
