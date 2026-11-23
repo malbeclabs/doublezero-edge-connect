@@ -78,11 +78,11 @@ no extra flags; switch modes (and pass any other shred config) inline at install
 
 ```bash
 # From source — default dedup-only, just point it at a destination:
-./target/release/doublezero-edge-connect --iface doublezero1 --ws-bind 0.0.0.0:8081 \
+./target/release/doublezero-edge-connect --iface doublezero1 \
   --shred-forward 127.0.0.1:20000
 
 # Switch to sigverify (needs an RPC); or turn dedup off with --shred-dedup-mode none:
-./target/release/doublezero-edge-connect --iface doublezero1 --ws-bind 0.0.0.0:8081 \
+./target/release/doublezero-edge-connect --iface doublezero1 \
   --shred-dedup-mode sigverify --shred-rpc-url https://api.mainnet-beta.solana.com
 
 # Via the installer one-liner the same config is passed as env vars before the pipe:

@@ -10,7 +10,7 @@
 # access secret, runs the edge-connect bridge container
 # (ghcr.io/malbeclabs/doublezero-edge-connect:testnet), runs
 # `doublezero connect multicast`, and then serves normalized DZ Edge quotes over a
-# WebSocket (:8081). The image bundles doublezerod + the doublezero CLI (it is built
+# WebSocket (127.0.0.1:8081). The image bundles doublezerod + the doublezero CLI (it is built
 # on the thin client image), so this one container both joins the network and runs
 # the bridge.
 #
@@ -32,7 +32,7 @@
 # Any other bridge env var set in the environment is relayed straight to the container
 # (WS_*, HL_WS_BIND, BINANCE_WS_BIND, KALSHI_WS_BIND, DZ_IFACE, DZ_SHRED_*, METRICS_BIND, DZ_CHANNELS, DZ_ADMIN_BIND, DZ_FEED_REGISTRY[_URL],
 # RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
-#   WS_BIND=0.0.0.0:9000 curl -fsSL https://get.doublezero.xyz/connect-testnet | bash
+#   WS_BIND=0.0.0.0:8081 curl -fsSL https://get.doublezero.xyz/connect-testnet | bash   # serve engines on other hosts
 #
 # Two of those need a second look before you set them:
 #   DZ_FEED_REGISTRY=<path>  is read INSIDE the container. This script requires an absolute path
@@ -481,13 +481,15 @@ fi
 # A taken WS port would make the bridge fail to bind that listener. The bridge now degrades
 # gracefully (it logs a warning and runs without the sink — the DoubleZero tunnel is unaffected),
 # but catch the conflict here too so the operator can pick another port or disable the sink up
-# front instead of silently losing the WS output. Also defines ws_disabled/ws_port, reused by the
+# front instead of silently losing the WS output. Also defines ws_disabled/ws_port/ws_addr, reused by the
 # env passthrough and the final status print.
 
 # The WS sink is disabled when WS_BIND is set-but-empty (WS_BIND="").
 ws_disabled() { [ "${WS_BIND+set}" = set ] && [ -z "${WS_BIND}" ]; }
 # The WS port: WS_BIND's trailing :port when set non-empty, else the default WS_PORT.
 ws_port() { if [ -n "${WS_BIND:-}" ]; then printf '%s' "${WS_BIND##*:}"; else printf '%s' "$WS_PORT"; fi; }
+# The WS address: WS_BIND's host when set non-empty, else the bridge's loopback default.
+ws_addr() { if [ -n "${WS_BIND:-}" ]; then printf '%s' "${WS_BIND%:*}"; else printf '127.0.0.1'; fi; }
 
 # Is a TCP port already bound on this host? Prefer ss, fall back to netstat; if neither exists we
 # can't tell (rc 2 -> skip). A ':'/'.' immediately before the port anchors the match so e.g. 8081
@@ -522,8 +524,8 @@ preflight_ws_port() {
   if [ -r "$TTY" ] && [ "$DZ_ASSUME_YES" != 1 ]; then
     local choice; choice="$(ask 'WS port in use — [p] pick another port, [d] disable the sink (clean: no sink, no bind error), [c] continue anyway (bridge starts but the sink fails to bind; fine only if you do not use it)' 'd')"
     case "$choice" in
-      p|P) local np; np="$(ask 'New WS port' '8181')"; WS_BIND="0.0.0.0:${np}"; WS_PORT="$np"
-           info "WS sink will use 0.0.0.0:${np}."; preflight_ws_port ;;   # re-check the new choice
+      p|P) local np; np="$(ask 'New WS port' '8181')"; WS_BIND="$(ws_addr):${np}"; WS_PORT="$np"
+           info "WS sink will use ${WS_BIND}."; preflight_ws_port ;;   # re-check the new choice
       d|D) WS_BIND=""; info "WS sink disabled (WS_BIND=\"\")." ;;
       *)   warn "Continuing; the bridge starts without the WS sink (the tunnel is unaffected)." ;;
     esac
@@ -769,7 +771,7 @@ url_host() {
 }
 # Reflect any WS_BIND override in the printed URL (take the port after the last colon).
 [ -n "${WS_BIND:-}" ]  && WS_PORT="${WS_BIND##*:}"
-ws_host="$(url_host "${WS_BIND:+${WS_BIND%:*}}")"
+ws_host="$(url_host "$(ws_addr)")"
 echo
 # Brief pause so the freshly-connected tunnel settles before we read status.
 spin_sleep 5 "Waiting for the tunnel to settle"

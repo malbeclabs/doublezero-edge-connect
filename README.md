@@ -16,7 +16,7 @@ timestamps for end-to-end measurement.
 
 ```
 DZ Edge sources ──multicast──▶  doublezero-edge-connect  ──WebSocket (JSON)──▶  your engine
-  (binary, 2 ports/venue)         (decode · normalize)        ws://host:8081      (any WS+JSON engine)
+  (binary, 2 ports/venue)         (decode · normalize)        ws://127.0.0.1:8081 (any WS+JSON engine)
 ```
 
 The binary multicast, the two-port split, and the manifest/precision handshake all stay on this
@@ -29,7 +29,7 @@ specified in **[PROTOCOL.md](PROTOCOL.md)**.
 
 One command prepares the host and runs the bridge container (it bundles `doublezerod` + the
 `doublezero` CLI), joins the DoubleZero network, and serves normalized quotes over a WebSocket on
-`:8081`. Pick the one-liner for your environment:
+`127.0.0.1:8081` (`WS_BIND=0.0.0.0:8081` serves engines on other hosts). Pick the one-liner for your environment:
 
 ```bash
 # mainnet-beta (default)
@@ -158,7 +158,10 @@ Examples:
 DZ_SECRET=DZ_… curl -fsSL https://get.doublezero.xyz/connect-testnet | bash
 
 # Verbose logging + a non-default WebSocket port:
-RUST_LOG=debug WS_BIND=0.0.0.0:9000 curl -fsSL https://get.doublezero.xyz/connect | bash
+RUST_LOG=debug WS_BIND=127.0.0.1:9000 curl -fsSL https://get.doublezero.xyz/connect | bash
+
+# Serve the WebSocket to engines on other hosts (no TLS or authentication: firewall the port):
+WS_BIND=0.0.0.0:8081 curl -fsSL https://get.doublezero.xyz/connect | bash
 
 # Shred forwarder with sigverify (dedup-only is the default and needs no vars):
 DZ_SECRET=DZ_… DZ_SHRED_DEDUP_MODE=sigverify DZ_SHRED_RPC_URL=https://api.mainnet-beta.solana.com \
@@ -245,7 +248,7 @@ failed and it fell back — the string says which.
 ## Consume Edge Feeds
 _For Edge Feeds (not solana-shreds)_
 
-Open a WebSocket to `ws://<host>:8081` and read JSON. You receive only the venues you're authorized
+Open a WebSocket to `ws://127.0.0.1:8081` on the bridge's host and read JSON. The sink binds loopback by default because it has no TLS or authentication; for an engine on another host, set `WS_BIND=0.0.0.0:8081` and firewall the port. You receive only the venues you're authorized
 for; an optional `subscribe` control frame narrows the feed further:
 
 ```json

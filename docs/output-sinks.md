@@ -7,7 +7,7 @@ sink can't stall ingest. Every flag also reads from the env var shown.
 
 | Sink | Default | Enable / disable | Config flags (env) |
 |------|---------|------------------|--------------------|
-| **WebSocket** (`sinks::ws`) | **on when subscribed** | configured unless `--ws-bind` is empty (`--ws-bind ""` disables it); *activated* only when ≥1 market-data feed is subscribed | `--ws-bind` (`WS_BIND`, default `0.0.0.0:8081`) + the `--ws-*` limits |
+| **WebSocket** (`sinks::ws`) | **on when subscribed** | configured unless `--ws-bind` is empty (`--ws-bind ""` disables it); *activated* only when ≥1 market-data feed is subscribed | `--ws-bind` (`WS_BIND`, default `127.0.0.1:8081`) + the `--ws-*` limits |
 | **Query API** (`sinks::api`) | **on when subscribed** | configured unless `--api-bind` is empty (`--api-bind ""` disables it); *activated* only when ≥1 market-data feed is subscribed — same condition as the WebSocket sink | `--api-bind` (`DZ_API_BIND`, default `127.0.0.1:9099`) |
 | **Hyperliquid-compatible** (`sinks::hyperliquid`) | **off** | on when `--hl-ws-bind` is non-empty; **not** subscription-gated | `--hl-ws-bind` (`HL_WS_BIND`, default empty) |
 | **Binance-compatible** (`sinks::binance`) | **off** | on when `--binance-ws-bind` is non-empty; **not** subscription-gated | `--binance-ws-bind` (`BINANCE_WS_BIND`, default empty) |
@@ -252,6 +252,8 @@ replays the instrument snapshot (precision first) then the latest depth per symb
 quotes/trades/midpoints/depth, with optional per-client subscribe/unsubscribe filtering (by `venue`,
 `symbol`, `channel` and message `type`, with a replay scoped to each new subscription) and
 heartbeat/limit enforcement.
+
+It binds loopback (`127.0.0.1:8081`) by default. It has no TLS or authentication, and the container runs host networking, so a wildcard bind is reachable off the host and serves your feeds to anyone who connects. For an engine on another host, set `--ws-bind 0.0.0.0:8081` (`WS_BIND`) and firewall the port.
 
 > **Note:** when running via the installer one-liner, set these as env vars before the pipe (or
 > with `docker run -e`). `WS_BIND=""` (disable the sink) **does** go through the installer —

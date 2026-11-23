@@ -86,9 +86,10 @@ struct Args {
     #[arg(long, env = "DZ_RECV_BUF", default_value_t = 8_388_608)]
     recv_buf: usize,
 
-    /// WebSocket server bind address for consumers to connect to. The WS sink is on by default;
-    /// pass an empty value (`--ws-bind ""`) to disable it.
-    #[arg(long, env = "WS_BIND", default_value = "0.0.0.0:8081")]
+    /// WebSocket server bind address for consumers to connect to. On by default at loopback, since
+    /// it has no TLS or authentication; `0.0.0.0:8081` serves engines on other hosts. Pass an empty
+    /// value (`--ws-bind ""`) to disable it.
+    #[arg(long, env = "WS_BIND", default_value = "127.0.0.1:8081")]
     ws_bind: String,
 
     /// Server heartbeat (WS Ping) interval in seconds.
@@ -1067,6 +1068,12 @@ mod tests {
             !bind.starts_with("0.0.0.0"),
             "admin surface must never default to a wildcard bind, got {bind:?}"
         );
+    }
+
+    /// The installers print `ws://127.0.0.1:8081` for an unset `WS_BIND`.
+    #[test]
+    fn the_ws_sink_defaults_to_loopback() {
+        assert_eq!(Args::parse_from(["x"]).ws_bind, "127.0.0.1:8081");
     }
 
     // The identity that maps 1:1 to a spawned receiver (the reconciler's `FeedKey`). Includes the

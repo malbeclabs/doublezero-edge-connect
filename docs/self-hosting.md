@@ -15,10 +15,12 @@ cargo build --release
 cargo test                 # codec round-trip + refdata subscriber state machine
 cargo clippy --all-targets
 
-./target/release/doublezero-edge-connect --iface doublezero1 --ws-bind 0.0.0.0:8081
+./target/release/doublezero-edge-connect --iface doublezero1
 # narrow to specific venues with --feed (repeatable):
 ./target/release/doublezero-edge-connect --feed Hyperliquid --iface doublezero1
 ```
+
+The WebSocket binds `127.0.0.1:8081` by default, since it has no TLS or authentication. `--ws-bind 0.0.0.0:8081` serves engines on other hosts.
 
 A larger kernel receive buffer is recommended for bursty feeds:
 `sudo sysctl -w net.core.rmem_max=268435456`.
@@ -35,7 +37,7 @@ docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun \
 ```
 
 Any of the bridge's env vars (see [Configure](../README.md#configure-override-the-one-liner))
-can be passed with `-e`.
+can be passed with `-e`. The WebSocket listens on the host's loopback, `127.0.0.1:8081`, by default; `-e WS_BIND=0.0.0.0:8081` serves engines on other hosts.
 
 For a long-lived, detached deployment, cap the container log on disk so it can't fill the host, and
 raise the stop timeout so `docker stop` doesn't `SIGKILL` the entrypoint mid-`doublezero disconnect`

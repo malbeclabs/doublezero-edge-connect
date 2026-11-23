@@ -36,7 +36,7 @@ cargo clippy --all-targets
 
 # Run against the built-in DZ Edge feeds (all of them by default):
 sudo sysctl -w net.core.rmem_max=268435456   # allow a large SO_RCVBUF (recommended)
-./target/release/doublezero-edge-connect --iface doublezero1 --ws-bind 0.0.0.0:8081
+./target/release/doublezero-edge-connect --iface doublezero1
 ./target/release/doublezero-edge-connect --feed Hyperliquid   # only specific venues
 ```
 
@@ -86,7 +86,7 @@ Modules are grouped by role under `src/`:
   `codec_midpoint`, `codec_mbo`, `codec_mbp`). Intra-pipeline references use `crate::ingest::*`; this half knows
   nothing about how the data is re-served.
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
-  (WebSocket, on by default), `api` (read-only `/v1` query API), `metrics` (Prometheus `/metrics`,
+  (WebSocket, on by default at loopback), `api` (read-only `/v1` query API), `metrics` (Prometheus `/metrics`,
   off by default), `admin` (the one mutation path in this crate — see below), `hyperliquid` (the
   same data in Hyperliquid's own schema, off by default), `binance` (Binance's quotes and trades in
   Binance's own schema, off by default) and `kalshi` (Kalshi's event contracts in Kalshi's own
@@ -957,8 +957,8 @@ Modules are grouped by role under `src/`:
   wraparound-safe u16 sequence comparison (`is_later`). One instance tracks **one publisher** — the
   per-publisher map lives in `processor.rs` (`PerPublisher`), keeping this state machine
   single-publisher and unit-testable.
-- **`sinks/ws.rs`** — fans the broadcast out to clients (on by default; disable with an empty
-  `--ws-bind`). **Serializes each message once, not per client:** a single serializer task reads the
+- **`sinks/ws.rs`** — fans the broadcast out to clients (on by default at `127.0.0.1:8081`, loopback
+  because it has no authentication; disable with an empty `--ws-bind`). **Serializes each message once, not per client:** a single serializer task reads the
   `Arc<FeedMessage>` backbone, stamps one shared `ws_send_ts_ns`, renders the JSON once, and
   re-broadcasts a ready-to-write `Arc<PreparedFrame>`; each client task only filters and writes a cheap
   `Utf8Bytes` clone (so N clients cost one serialization, and `ws_send_ts_ns` is one instant shared by

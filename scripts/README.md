@@ -3,7 +3,7 @@
 The one-liner installers for `doublezero-edge-connect`. Each is a self-contained
 `curl … | bash` script served from `https://get.doublezero.xyz/`. They prep the host, run the
 bridge container (which bundles `doublezerod` + the `doublezero` CLI), join the DoubleZero
-network, and then serve normalized quotes over a WebSocket (`:8081`).
+network, and then serve normalized quotes over a WebSocket (`127.0.0.1:8081`).
 
 | Script | Environment | One-liner |
 |--------|-------------|-----------|
@@ -96,7 +96,11 @@ DZ_SECRET=DZ_… DZ_GHCR_TOKEN=ghp_… \
   curl -fsSL https://get.doublezero.xyz/connect-devnet | bash
 
 # More verbose logging + a non-default WebSocket port
-RUST_LOG=debug WS_BIND=0.0.0.0:9000 \
+RUST_LOG=debug WS_BIND=127.0.0.1:9000 \
+  curl -fsSL https://get.doublezero.xyz/connect | bash
+
+# Serve the WebSocket to engines on other hosts (no TLS or authentication: firewall the port)
+WS_BIND=0.0.0.0:8081 \
   curl -fsSL https://get.doublezero.xyz/connect | bash
 
 # Shred forwarder with sigverify (dedup-only is the default and needs no vars)
@@ -114,7 +118,7 @@ sudo docker stop doublezero-edge-connect && sudo docker rm doublezero-edge-conne
 ```
 
 The bridge serves:
-- **WebSocket** `ws://<host>:8081` — normalized quotes (see [PROTOCOL.md](../PROTOCOL.md)).
+- **WebSocket** `ws://127.0.0.1:8081` — normalized quotes (see [PROTOCOL.md](../PROTOCOL.md)). Loopback only; `WS_BIND=0.0.0.0:8081` serves engines on other hosts.
 
 ## Requirements & caveats
 
@@ -128,7 +132,7 @@ The bridge serves:
   policy drops it. Also admit that interface, e.g. `sudo ufw allow in on doublezero1` (or place
   `doublezero1` in a firewalld trusted zone). The installer warns about this when it detects an
   active ufw/firewalld.
-- **WebSocket port.** The bridge serves the WS sink on `:8081` by default. If that port is already
+- **WebSocket port.** The bridge serves the WS sink on `127.0.0.1:8081` by default. If that port is already
   in use the installer's preflight flags it and (interactively) offers to pick another port,
   disable the sink (`WS_BIND=""`), or continue; a bind failure is non-fatal either way (the tunnel
   is unaffected).

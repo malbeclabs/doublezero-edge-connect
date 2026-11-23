@@ -27,7 +27,7 @@ value_for() {
     DZ_FEED_REGISTRY) echo "$REGISTRY_FILE" ;;
     DZ_ADMIN_BIND) echo "127.0.0.1:9099" ;;
     DZ_SUBSCRIPTION_REFRESH_SECS) echo "1" ;;
-    WS_BIND) echo "0.0.0.0:8081" ;;
+    WS_BIND) echo "127.0.0.1:8081" ;;
     *) echo "v-$1" ;;
   esac
 }
@@ -150,8 +150,19 @@ run_on_host() {
   local extra="$BATS_TEST_TMPDIR/listening.log"
   printf 'INFO doublezero_edge_connect::sinks::hyperliquid: Hyperliquid-compatible WebSocket sink listening bind=0.0.0.0:8082\n' >"$extra"
   printf 'INFO doublezero_edge_connect::sinks::binance: Binance-compatible WebSocket sink listening bind=[::]:8083\n' >>"$extra"
-  ( common_env; export DZ_INSTALL_CLI=0 HL_WS_BIND=0.0.0.0:8082 BINANCE_WS_BIND='[::]:8083' DZ_SUBSCRIPTION_REFRESH_SECS=0 DZ_TEST_DOCKER_LOG_EXTRA="$extra"
+  ( common_env; export DZ_INSTALL_CLI=0 WS_BIND=0.0.0.0:8081 HL_WS_BIND=0.0.0.0:8082 BINANCE_WS_BIND='[::]:8083' DZ_SUBSCRIPTION_REFRESH_SECS=0 DZ_TEST_DOCKER_LOG_EXTRA="$extra"
     bash "$SCRIPTS_DIR/$1.sh" ) >"$2" 2>&1 || { echo "# $1 exited $?"; sed 's/^/#   /' "$2"; false; }
+}
+
+@test "WS_BIND unset: the WebSocket URL is loopback, not this host's address (all scripts)" {
+  printf '#!/usr/bin/env bash\necho "203.0.113.9"\n' >"$STUB_BIN/hostname"
+  chmod +x "$STUB_BIN/hostname"
+  for s in "${SCRIPTS[@]}"; do
+    local out="$BATS_TEST_TMPDIR/$s.out"
+    ( common_env; export DZ_INSTALL_CLI=0 DZ_SUBSCRIPTION_REFRESH_SECS=0; unset WS_BIND
+      bash "$SCRIPTS_DIR/$s.sh" ) >"$out" 2>&1 || { echo "# $s exited $?"; sed 's/^/#   /' "$out"; false; }
+    grep -q 'WebSocket *: ws://127.0.0.1:8081 ' "$out" || { echo "# $s:"; sed 's/^/#   /' "$out"; false; }
+  done
 }
 
 @test "IPv6 listed first: each URL names this host's address in its bind's family (all scripts)" {
