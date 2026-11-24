@@ -24,6 +24,7 @@ const MAX_DISTANCE: usize = 2;
 /// Above [`DISTANCE_SCAN_MAX`] names only the binary searches run, so a mixed-case symbol
 /// (`xyz:TSLA`) is missed for a query like `XYZ:tsla`.
 pub fn near_matches<'a>(query: &str, sorted: &[&'a str]) -> Vec<&'a str> {
+    debug_assert!(sorted.is_sorted(), "the prefix searches need byte order");
     if query.is_empty() || query.len() > MAX_QUERY || !query.is_ascii() {
         return Vec::new();
     }
@@ -58,7 +59,12 @@ pub fn near_matches<'a>(query: &str, sorted: &[&'a str]) -> Vec<&'a str> {
             vec![0; MAX_QUERY + 1],
         ];
         for &s in sorted {
-            if let Some(d) = distance_within(q, s.as_bytes(), &mut rows) {
+            // The case variants above miss a mixed-case prefix (`xyz:T` for `xyz:TSLA`).
+            let b = s.as_bytes();
+            if b.len() >= q.len() && b[..q.len()].eq_ignore_ascii_case(q) {
+                let tier = if b.len() == q.len() { 0 } else { 1 };
+                found.push((tier, 0, s.len(), s));
+            } else if let Some(d) = distance_within(q, b, &mut rows) {
                 let tier = if d == 0 { 0 } else { 2 };
                 found.push((tier, d, s.len(), s));
             }
@@ -168,6 +174,9 @@ mod tests {
             assert_eq!(&h[..2], &["BTC", "BTCUSD"], "{q}");
         }
         assert_eq!(near_matches("XYZ:", &v), vec!["xyz:TSLA"]);
+        for q in ["xyz:t", "XYZ:T"] {
+            assert_eq!(near_matches(q, &v), vec!["xyz:TSLA"], "{q}");
+        }
     }
 
     #[test]

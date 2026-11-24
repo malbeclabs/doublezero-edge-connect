@@ -210,7 +210,9 @@ impl ProblemKind {
     /// Only an answer fixed by the cache key and the snapshot is cached. A `400` never is: one can
     /// come from a request part outside the key, and cached under the shared key it would take that
     /// quote offline for every caller. A `404` from the server itself (no such route) is not a
-    /// lookup answer either.
+    /// lookup answer either. A cached `UnknownInstrument` stands for [`NEGATIVE_TTL_S`], so a
+    /// server without its reference data must answer `NotWarm`, and a newly listed instrument can
+    /// read as unknown for that long.
     pub fn cache_policy(self) -> CachePolicy {
         match self {
             ProblemKind::UnknownVenue
@@ -397,8 +399,8 @@ mod tests {
         }
     }
 
-    /// Pins the slugs already published for the quote endpoints, which clients and the docs page
-    /// anchor on, against a rename. Nothing else in the crate uses them yet.
+    /// Pins the slugs clients and the docs page will anchor on against a rename. Nothing else in
+    /// the crate uses them yet.
     #[test]
     fn published_endpoint_slugs_are_unchanged() {
         let native = [

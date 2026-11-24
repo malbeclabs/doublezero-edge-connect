@@ -120,6 +120,15 @@ Modules are grouped by role under `src/`:
     no leader → forward (fail open, no record); else verify → valid forwards + records, invalid
     drops but leaves the key open. Eviction is a cheap slot range-drop trailing the tip by
     `--shred-dedup-window-slots`.
+- **`market_data/`** — response semantics for the public quote server, as **pure functions** no
+  route calls yet. Top-level rather than under `sinks/` because the quote server and `sinks::api`
+  will both render through it. `response`: quote `Freshness`, the `Cache-Control` per `CachePolicy` (`max-age=0`
+  on every public policy, since `s-maxage` binds only the CDN and a browser would otherwise reuse a
+  lookup's `404`), the RFC 9457 `ProblemKind` catalog and the fixed origin headers. Only lookup
+  answers are cached, never a `400`, which can come from a request part outside the CDN key; every
+  header value is a `&'static str`, so no feed or request text reaches a header. `near_match`:
+  "did you mean" hints at a bounded cost per request — the edit distance is banded to
+  `|i - j| <= 2`, because a query sharing a long prefix with every symbol never trips the early exit.
 - **root** — `model` (shared wire types/clocks/snapshots) and `main`.
 
 - **`ingest/registry.rs` + `ingest/registry.json`** — the feed registry as **data**. The rows are a
