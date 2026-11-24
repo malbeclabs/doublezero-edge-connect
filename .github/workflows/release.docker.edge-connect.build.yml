@@ -95,8 +95,10 @@ jobs:
         shell: bash
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # Map the variant to target image, base image, moving tag, and whether it
-      # owns :latest. Single source of truth, shared with the poll workflow.
+      # Map the variant to target image, base image, moving tag, whether it
+      # owns :latest, and the Cloudsmith repo its doublezero client is installed
+      # from (empty = keep the base image's client). Single source of truth,
+      # shared with the poll workflow.
       - name: Resolve variant config
         id: cfg
         shell: bash
@@ -106,14 +108,17 @@ jobs:
             testnet)
               image="ghcr.io/${owner}/doublezero-edge-connect"
               base="ghcr.io/${owner}/doublezero:testnet"
+              client_repo="doublezero-testnet"
               moving="testnet"; latest="false" ;;
             mainnet-beta)
               image="ghcr.io/${owner}/doublezero-edge-connect"
               base="ghcr.io/${owner}/doublezero:mainnet-beta"
+              client_repo=""
               moving="mainnet-beta"; latest="true" ;;
             devnet)
               image="ghcr.io/${owner}/doublezero-edge-connect-devnet"
               base="ghcr.io/${owner}/doublezero-devnet:latest"
+              client_repo=""
               moving="latest"; latest="false" ;;
             *)
               echo "unknown env '${{ inputs.env }}'"; exit 1 ;;
@@ -123,6 +128,7 @@ jobs:
             echo "base=$base"
             echo "moving=$moving"
             echo "latest=$latest"
+            echo "client_repo=$client_repo"
           } >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
@@ -143,6 +149,24 @@ jobs:
           [ -n "$digest" ] || { echo "could not resolve digest for ${{ steps.cfg.outputs.base }}"; exit 1; }
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Base ${{ steps.cfg.outputs.base }} -> $digest"
+
+      # Pin the exact client deb the variant installs, so the build is
+      # reproducible and the poll can compare it against the repo's latest
+      # (recorded as the io.doublezero.client.version label). Resolved inside the
+      # pinned base, which already carries that repo's apt list, so the candidate
+      # comes from the same distro and codename the Dockerfile installs into.
+      - name: Resolve client version
+        id: client
+        if: steps.cfg.outputs.client_repo != ''
+        shell: bash
+        run: |
+          version="$(docker run --rm --entrypoint bash '${{ steps.cfg.outputs.base }}@${{ steps.base.outputs.digest }}' -c '
+            set -e
+            apt-get update -qq >/dev/null
+            apt-cache policy doublezero | awk "/Candidate:/ {print \$2}"')"
+          case "$version" in ""|"(none)") echo "could not resolve doublezero in ${{ steps.cfg.outputs.client_repo }}"; exit 1 ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Client ${{ steps.cfg.outputs.client_repo }} -> doublezero=$version"
 
       # Tag list: always moving + sha-<short>, plus :latest for the variant that
       # owns it — on every build, not only a release, because :latest is
@@ -192,3 +216,5 @@ jobs:
             DZ_BASE_DIGEST=${{ steps.base.outputs.digest }}
             BUILD_VERSION=${{ inputs.version != '' && inputs.version || steps.sha.outputs.sha }}
             BUILD_COMMIT=${{ steps.sha.outputs.sha }}
+            DZ_CLIENT_REPO=${{ steps.cfg.outputs.client_repo }}
+            DZ_CLIENT_VERSION=${{ steps.client.outputs.version }}

@@ -59,21 +59,36 @@ ARG DZ_BASE_IMAGE
 ARG DZ_BASE_DIGEST=
 ARG BUILD_VERSION=dev
 ARG BUILD_COMMIT=unknown
+# DZ_CLIENT_REPO installs the doublezero client from that Cloudsmith repo over the base's copy,
+# because the base is republished only by hand. The base must already list that repo. Empty keeps
+# the base's client.
+# DZ_CLIENT_VERSION pins the deb; empty takes the repo's latest.
+ARG DZ_CLIENT_REPO=
+ARG DZ_CLIENT_VERSION=
 LABEL org.opencontainers.image.source="https://github.com/malbeclabs/doublezero-edge-connect" \
       org.opencontainers.image.title="doublezero-edge-connect" \
       org.opencontainers.image.description="DoubleZero Edge multicast Top-of-Book -> normalized WebSocket bridge" \
       org.opencontainers.image.base.name="${DZ_BASE_IMAGE}" \
       org.opencontainers.image.base.digest="${DZ_BASE_DIGEST}" \
       org.opencontainers.image.version="${BUILD_VERSION}" \
-      org.opencontainers.image.revision="${BUILD_COMMIT}"
+      org.opencontainers.image.revision="${BUILD_COMMIT}" \
+      io.doublezero.client.repo="${DZ_CLIENT_REPO}" \
+      io.doublezero.client.version="${DZ_CLIENT_VERSION}"
 # iproute2 provides `ip`, which the receiver uses to resolve an interface NAME
 # (e.g. doublezero1) to its IPv4 for join_multicast_v4. Without it, `--iface <name>`
 # silently falls back to 0.0.0.0 (resolve_interface_ip in src/receiver.rs); passing an IPv4
 # literal to --iface would work without it, but the default is a name, so we install it.
 # No TLS at the bridge itself — terminate at a reverse proxy if you must expose it.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends iproute2 ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends iproute2 ca-certificates; \
+    if [ -n "${DZ_CLIENT_REPO}" ]; then \
+      # --allow-downgrades: the pinned version can be older than the base's client.
+      apt-get install -y --no-install-recommends --allow-downgrades \
+        "doublezero${DZ_CLIENT_VERSION:+=$DZ_CLIENT_VERSION}"; \
+      dpkg-query -W doublezero; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
 
 # Runs as root (the image's default user): the base entrypoint starts the
 # `doublezerod` daemon, which manages the DoubleZero tunnel/routing and needs

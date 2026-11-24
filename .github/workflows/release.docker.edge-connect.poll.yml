@@ -4,6 +4,12 @@ name: release.docker.edge-connect.poll
 # edge-connect variant. No webhook/PAT in the doublezero repo — we compare the
 # current base digest against the digest recorded in the last published
 # edge-connect image (org.opencontainers.image.base.digest label).
+#
+# A variant that installs its client from Cloudsmith (testnet; see the build
+# workflow's variant config) is also stale when that repo's latest doublezero
+# deb differs from the image's io.doublezero.client.version label. Its base
+# digest no longer moves when the client does, so the digest check alone would
+# never rebuild it.
 on:
   schedule:
     - cron: "23 5 * * *" # daily 05:23 UTC
@@ -38,10 +44,12 @@ jobs:
           owner='${{ github.repository_owner }}'
           stale=()
           for envname in testnet mainnet-beta devnet; do
+            client_repo=""
             case "$envname" in
               testnet)
                 image="ghcr.io/${owner}/doublezero-edge-connect"
-                base="ghcr.io/${owner}/doublezero:testnet"; moving="testnet" ;;
+                base="ghcr.io/${owner}/doublezero:testnet"; moving="testnet"
+                client_repo="doublezero-testnet" ;;
               mainnet-beta)
                 image="ghcr.io/${owner}/doublezero-edge-connect"
                 base="ghcr.io/${owner}/doublezero:mainnet-beta"; moving="mainnet-beta" ;;
@@ -58,6 +66,20 @@ jobs:
             echo "$envname: base=$current recorded=${recorded:-<none>}"
             if [ "$current" != "$recorded" ]; then
               stale+=("$envname")
+              continue
+            fi
+            if [ -n "$client_repo" ]; then
+              latest_client="$(docker run --rm --entrypoint bash "${base}@${current}" -c '
+                set -e
+                apt-get update -qq >/dev/null
+                apt-cache policy doublezero | awk "/Candidate:/ {print \$2}"' || true)"
+              recorded_client="$(docker buildx imagetools inspect --format '{{ index .Image.Config.Labels "io.doublezero.client.version" }}' "${image}:${moving}" 2>/dev/null || true)"
+              echo "$envname: client latest=${latest_client:-<unresolved>} recorded=${recorded_client:-<none>}"
+              case "$latest_client" in
+                ""|"(none)") echo "WARN: cannot resolve doublezero in $client_repo; skipping client check" ;;
+                "$recorded_client") ;;
+                *) stale+=("$envname") ;;
+              esac
             fi
           done
           if [ "${#stale[@]}" -gt 0 ]; then
