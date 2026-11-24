@@ -12,8 +12,11 @@
 # disconnect from DoubleZero cleanly on `docker stop` before tearing things down.
 set -euo pipefail
 
-BASE_ENTRYPOINT=/usr/local/bin/docker-entrypoint.sh
+BASE_ENTRYPOINT="${BASE_ENTRYPOINT:-/usr/local/bin/docker-entrypoint.sh}"
 DZ_SOCK="${DZ_SOCK:-/run/doublezerod/doublezerod.sock}"
+
+# The previous run's socket fails doublezerod's bind but passes both waits; no daemon is up yet.
+rm -f "$DZ_SOCK"
 
 # Run the base entrypoint with no args: it starts doublezerod, writes the CLI
 # config, prints `doublezero status`, then `wait`s on the daemon (keeping it up).

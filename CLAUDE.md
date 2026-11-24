@@ -235,8 +235,9 @@ Modules are grouped by role under `src/`:
   Hyperliquid is two universes on four groups — `hl-perps` (`edge-hyper-hl-tob`/`-mbo`, the native
   perps) and `xyz-perps` (`edge-hyper-xyz-*`, the XYZ builder DEX) — each row one port block shared
   by three publishers; it replaced the one `tiredsolid` group of eleven blocks. Neither row declares
-  a `source_id`: `sources/spec.md` says ID 1 is still stamped on the builder DEXes too until its
-  publishers filter, so declaring 7 on `xyz-perps` would be a claim the wire does not make yet. A third **Kalshi** row
+  a `source_id`, although the wire now separates them: on 2026-11-24 a mainnet-beta host's
+  `/v1/products` listed all 76 `xyz:` markets under ID 7 and all 121 native ones under ID 1, with no
+  symbol under both. A third **Kalshi** row
   (`edge-kalshi-sports-mbp`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
   under the same Source ID — hence its own `category` (`events`: sport is one kind of event
   market and the row carries more than sport, while the group `code` stays the ledger's
@@ -1059,8 +1060,10 @@ Modules are grouped by role under `src/`:
   **not** subscription-gated): the same broadcast re-served in *Hyperliquid's* schema so an existing
   Hyperliquid client needs only a URL change. A **rendering, not a second pipeline** — no ingest state,
   no dedup identity, no arbitration input — so it is documented in `docs/output-sinks.md` and **never**
-  in PROTOCOL.md, which is the contract for our own protocol only. Scoped to `SOURCE_ID = 1`
-  (`coin` is our `symbol`), with `bind()` split from `serve()` like `ws`'s. Three channels off the
+  in PROTOCOL.md, which is the contract for our own protocol only. Scoped to every Source ID named
+  like ID 1 (`renders`), so the XYZ builder DEX's 7 too, as Hyperliquid serves it on one socket
+  (`coin` is our `symbol`; a builder DEX's carry its `dex:` prefix), with `bind()` split from
+  `serve()` like `ws`'s. Three channels off the
   order-keyed `BookAccumulator` in the shared `BookSnapshot`: `l2Book` (snapshot-per-update from
   `price_fold()` — whose per-level order count is the whole reason the accumulator is order-keyed;
   honours `nSigFigs`/`mantissa`/`nLevels`), `l4Book` (the publisher's

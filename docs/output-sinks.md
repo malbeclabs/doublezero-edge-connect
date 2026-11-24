@@ -41,7 +41,7 @@ It has no TLS or authentication, so a wildcard bind serves your feeds to anyone 
 It is a **rendering, not a second protocol**: it holds no book of its own, adds no deduplication and
 influences no arbitration, reading the same internal broadcast the normalized sink reads. Nothing
 about it belongs in PROTOCOL.md, which is the contract for our own protocol. Scoped to the
-Hyperliquid venue — `coin` is our `symbol`, and no other venue is rendered. Not subscription-gated
+Hyperliquid venue, its builder-DEX markets such as `xyz:CL` included — `coin` is our `symbol`, and no other venue is rendered. Not subscription-gated
 (it has no multicast group of its own to be subscribed to); like the normalized sink, a bind failure
 disables it with a warning rather than taking the process down.
 
@@ -111,7 +111,7 @@ must be told to discard.
 **A `coin` is not an identity.** The wire symbol is a truncated label and two markets can share one, so
 a **book** subscription that resolves to more than one is refused, and each one that is served is
 pinned to the market it was bootstrapped from. `trades` and `bbo` are not covered: neither carries a
-book to pin against, so two markets sharing a coin still merge under one name.
+book to pin against, so two markets sharing a coin still merge under one name. That includes one market published under two Hyperliquid Source IDs at once, which reaches both channels twice.
 
 Client limits are fixed rather than configurable (64 clients, 256 subscriptions each, 600 inbound
 control frames per minute, a 20s heartbeat with a 60s idle reap). Both a text control frame and a

@@ -796,10 +796,9 @@ fn build(text: &str, origin: &str) -> Result<Loaded, RegistryError> {
 /// gives its venue name several Source IDs — the rows whose engines `FeedHealth` cannot tell apart,
 /// so one engine streaming masks another's outage under the shared name.
 ///
-/// Reported, not refused (#187): the hosted Hyperliquid rows are such rows today, and declaring 7 on
-/// `xyz-perps` would contradict a wire that still stamps 1 on the builder DEX too. Refusing them is
-/// the follow-up once the publishers stamp one id per engine and their fragments declare it — and
-/// infra's validator has to refuse them first.
+/// Reported, not refused (#187): the hosted Hyperliquid rows are such rows today. Refusing them is the
+/// follow-up once their fragments declare a `source_id` — and infra's validator has to refuse them
+/// first.
 fn undeclared_shared_rows(
     rows: &[Feed],
     table: &[SourceAssignment],
