@@ -164,14 +164,17 @@ jobs:
         id: client
         if: steps.cfg.outputs.client_repo != ''
         shell: bash
+        env:
+          PINNED_BASE: ${{ steps.cfg.outputs.base }}@${{ steps.base.outputs.digest }}
+          CLIENT_REPO: ${{ steps.cfg.outputs.client_repo }}
         run: |
-          version="$(docker run --rm --entrypoint bash '${{ steps.cfg.outputs.base }}@${{ steps.base.outputs.digest }}' -c '
+          version="$(docker run --rm --entrypoint bash "$PINNED_BASE" -c '
             set -e
             apt-get update -qq >/dev/null
             apt-cache policy doublezero | awk "/Candidate:/ {print \$2}"')"
-          case "$version" in ""|"(none)") echo "could not resolve doublezero in ${{ steps.cfg.outputs.client_repo }}"; exit 1 ;; esac
+          case "$version" in ""|"(none)") echo "could not resolve doublezero in $CLIENT_REPO"; exit 1 ;; esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Client ${{ steps.cfg.outputs.client_repo }} -> doublezero=$version"
+          echo "Client $CLIENT_REPO -> doublezero=$version"
 
       # Tag list: always moving + sha-<short>, plus :latest for the variant that
       # owns it — on every build, not only a release, because :latest is
