@@ -46,10 +46,6 @@ jobs:
         run: |
           disabled=(
             # Releases
-            release.docker.edge-connect.build.yml
-            release.docker.edge-connect.dispatch.yml
-            release.docker.edge-connect.poll.yml
-            release.docker.edge-connect.yml
             release.edge-cli.yml
             release.shred-proxy.yml
           )

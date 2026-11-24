@@ -3,13 +3,14 @@ name: release.docker.edge-connect
 # Builds and publishes the three doublezero-edge-connect variants to GHCR.
 # See docs/superpowers/specs/2026-06-12-edge-connect-image-variants-design.md.
 #   push to main      -> moving tags (:testnet, :mainnet-beta = :latest, devnet :latest) + :sha-
-#   tag vX.Y.Z        -> the same, plus pinned :<env>-X.Y.Z (devnet :X.Y.Z)
-#   workflow_dispatch -> moving tags (manual)
+#   workflow_dispatch -> the same, on main only; with a version X.Y.Z, plus pinned
+#                        :<env>-X.Y.Z (devnet :X.Y.Z)
 #   pull_request      -> build-only smoke test (mainnet-beta, no push)
+# Releases are dispatched on main, never triggered by a tag, so every publish builds
+# a commit that reached main.
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     paths:
       - Dockerfile
@@ -17,15 +18,21 @@ on:
       - .github/workflows/release.docker.edge-connect.build.yml
       - .github/workflows/release.docker.edge-connect.yml
       - .github/workflows/release.docker.edge-connect.poll.yml
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version X.Y.Z (blank = moving tags only)"
+        required: false
+        default: ""
+        type: string
 
 # Least-privilege default; the publish/smoke jobs widen this per job as needed.
 permissions:
   contents: read
 
 jobs:
-  # Resolve the release version once: the vX.Y.Z tag with leading v stripped, or
-  # empty for non-tag builds (which then publish moving tags only).
+  # Validate the release version once: the dispatch's version input, or empty for
+  # every other run (which then publishes moving tags only).
   version:
     runs-on: ubuntu-latest
     outputs:
@@ -33,25 +40,27 @@ jobs:
     steps:
       - id: v
         shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          ref='${{ github.ref }}'
-          if [[ "$ref" == refs/tags/v* ]]; then
-            echo "version=${ref#refs/tags/v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=" >> "$GITHUB_OUTPUT"
+          semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          if [ -n "$VERSION" ] && ! [[ "$VERSION" =~ $semver ]]; then
+            echo "::error::version must be X.Y.Z or X.Y.Z-prerelease"
+            exit 1
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-  # main / tag / dispatch: build and push all three variants.
+  # Push to main, or a dispatch on main: build and push all three variants.
   publish:
     needs: version
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
       packages: write
     strategy:
       matrix:
         env: [testnet, mainnet-beta, devnet]
-    uses: ./.github/workflows/release.docker.edge-connect.build.yml
+    uses: $/.github/workflows/release.docker.edge-connect.build.yml
     with:
       env: ${{ matrix.env }}
       push: true
@@ -66,7 +75,7 @@ jobs:
     permissions:
       contents: read
       packages: read
-    uses: ./.github/workflows/release.docker.edge-connect.build.yml
+    uses: $/.github/workflows/release.docker.edge-connect.build.yml
     with:
       env: mainnet-beta
       push: false

@@ -60,7 +60,7 @@ matching `doublezero` base image:
 | testnet | `ghcr.io/malbeclabs/doublezero-edge-connect` | `:testnet` |
 | devnet (private) | `ghcr.io/malbeclabs/doublezero-edge-connect-devnet` | `:latest` |
 
-Release tags (`vX.Y.Z`) additionally publish pinned `:<env>-X.Y.Z` tags; every build also gets
+Versioned releases additionally publish pinned `:<env>-X.Y.Z` tags; every build also gets
 a `:sha-<commit>` tag for precise pinning.
 
 The testnet image replaces the base's `doublezero` client with the latest one in the

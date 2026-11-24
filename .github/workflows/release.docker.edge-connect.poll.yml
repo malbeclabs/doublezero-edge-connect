@@ -30,11 +30,13 @@ jobs:
     outputs:
       stale: ${{ steps.scan.outputs.stale }}
     steps:
-      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      # docker/login-action is not on the org's action allowlist.
+      - name: Log in to GHCR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -94,14 +96,14 @@ jobs:
   # an edge-connect release, so no pinned version tag).
   rebuild:
     needs: check
-    if: needs.check.outputs.stale != '[]'
+    if: needs.check.outputs.stale != '[]' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
       packages: write
     strategy:
       matrix:
         env: ${{ fromJSON(needs.check.outputs.stale) }}
-    uses: ./.github/workflows/release.docker.edge-connect.build.yml
+    uses: $/.github/workflows/release.docker.edge-connect.build.yml
     with:
       env: ${{ matrix.env }}
       push: true
