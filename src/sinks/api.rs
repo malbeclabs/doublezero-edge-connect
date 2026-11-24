@@ -657,8 +657,8 @@ fn ticker(state: &ApiState, inst: &NormalizedInstrument) -> Response {
         "best_bid": bid.map(|(p, _)| decimal_string(p, inst.price_exponent)),
         "best_ask": ask.map(|(p, _)| decimal_string(p, inst.price_exponent)),
     });
-    if let Some((_, _, source)) = best {
-        tag_source(&mut body, source);
+    if let Some((_, _, origin)) = best {
+        tag_origin(&mut body, origin);
     }
     ok_json(body)
 }
@@ -666,9 +666,8 @@ fn ticker(state: &ApiState, inst: &NormalizedInstrument) -> Response {
 /// One side's best (price, size), or absent when nothing is derivable for it.
 type Level = Option<(f64, f64)>;
 
-/// Where a best-levels answer came from.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum LevelsSource {
+enum LevelsOrigin {
     Book,
     /// The quote map's top-of-book quote, with our receive time of it.
     Quote {
@@ -676,16 +675,16 @@ enum LevelsSource {
     },
 }
 
-/// [`best_levels`] when a book answers, else the quote map's entry for the same identity. `None`
-/// when neither answers.
+/// [`best_levels`] when a book has a level on either side, else the quote map's entry for the same
+/// identity; the two are never mixed. `None` when neither answers.
 fn book_or_quote(
     state: &ApiState,
     inst: &NormalizedInstrument,
     ambiguous: bool,
-) -> Option<(Level, Level, LevelsSource)> {
+) -> Option<(Level, Level, LevelsOrigin)> {
     match best_levels(state, inst, ambiguous) {
         (None, None) => {}
-        (bid, ask) => return Some((bid, ask, LevelsSource::Book)),
+        (bid, ask) => return Some((bid, ask, LevelsOrigin::Book)),
     }
     let map = state.quote_map.as_ref()?;
     // Keyed by identity, unlike `depth`, so an ambiguous symbol still answers here.
@@ -699,18 +698,18 @@ fn book_or_quote(
     Some((
         quote.bid,
         quote.ask,
-        LevelsSource::Quote {
+        LevelsOrigin::Quote {
             as_of_ns: quote.as_of_ns,
         },
     ))
 }
 
-/// Adds `source`, and for a quote `as_of_ns`, to a best-levels answer.
-fn tag_source(v: &mut Value, source: LevelsSource) {
-    match source {
-        LevelsSource::Book => v["source"] = json!("book"),
-        LevelsSource::Quote { as_of_ns } => {
-            v["source"] = json!("quote");
+/// Adds `origin`, and for a quote `as_of_ns`, to a best-levels answer.
+fn tag_origin(v: &mut Value, origin: LevelsOrigin) {
+    match origin {
+        LevelsOrigin::Book => v["origin"] = json!("book"),
+        LevelsOrigin::Quote { as_of_ns } => {
+            v["origin"] = json!("quote");
             v["as_of_ns"] = json!(as_of_ns.to_string());
         }
     }
@@ -720,8 +719,8 @@ fn tag_source(v: &mut Value, source: LevelsSource) {
 /// actually has — the market-by-price accumulator's current top level if one exists (regardless of
 /// `baselined()`: reporting only the touched top level as "the best available" does not claim
 /// completeness the way replaying the whole book as a re-baseline would), else the market-by-order
-/// depth snapshot's top level. `None` for a side/venue with neither; [`book_or_quote`] then tries
-/// the quote map.
+/// depth snapshot's top level. `None` for a side with neither; [`book_or_quote`] falls back to the
+/// quote map only when both are.
 ///
 /// Reads `BookAccumulator::{best_bid, best_ask}` rather than `to_book()` — this only ever needs the
 /// inside market, and materializing the market's entire level set (plus a `to_book` timestamp
@@ -1080,7 +1079,7 @@ fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
             .copied()
             .unwrap_or(1)
             > 1;
-        let Some((bid, ask, source)) = book_or_quote(state, i, depth_ambiguous) else {
+        let Some((bid, ask, origin)) = book_or_quote(state, i, depth_ambiguous) else {
             // Nothing derivable for this identity; omitting it is honest, a zeroed/fabricated level
             // would not be.
             continue;
@@ -1091,7 +1090,7 @@ fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
             "bids": bid.map(|(p, s)| vec![json!([decimal_string(p, i.price_exponent), decimal_string(s, i.qty_exponent)])]).unwrap_or_default(),
             "asks": ask.map(|(p, s)| vec![json!([decimal_string(p, i.price_exponent), decimal_string(s, i.qty_exponent)])]).unwrap_or_default(),
         });
-        tag_source(&mut pricebook, source);
+        tag_origin(&mut pricebook, origin);
         pricebooks.push(pricebook);
     }
     ok_json(json!({ "pricebooks": pricebooks }))
@@ -2878,8 +2877,7 @@ mod tests {
         }
     }
 
-    /// The quote map is keyed by identity, so where an ambiguous symbol's `depth` is refused each
-    /// instrument still answers from its own quote.
+    /// The map is keyed by identity, so an ambiguous symbol still answers from its own quote.
     #[test]
     fn an_ambiguous_symbol_answers_from_its_own_quote_rather_than_the_depth() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
@@ -2928,7 +2926,7 @@ mod tests {
                 Some((
                     Some((bid, 1.0)),
                     Some((ask, 2.0)),
-                    LevelsSource::Quote {
+                    LevelsOrigin::Quote {
                         as_of_ns: u64::from(id)
                     }
                 )),
@@ -3917,7 +3915,7 @@ mod tests {
     }
 
     /// Binance `BTCUSDT` and `ETHUSDT` (quoting no bid) on a top-of-book feed alone, and Kalshi
-    /// `KXBTCPERP` and Hyperliquid `BTC` with a book and a quote at other prices.
+    /// `KXBTCPERP` (a bid-only book) and Hyperliquid `BTC` with a book and a quote at other prices.
     async fn spawn_quoted_products(quote_map: bool) -> String {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         let btc = inst_in("spot", 8, "BINANCE", "BTCUSDT", 0, 1, -2, -5);
@@ -3948,7 +3946,6 @@ mod tests {
                     order_id: 0,
                 },
                 level_update(BookSide::Bid, 0.61, 10.0),
-                level_update(BookSide::Ask, 0.63, 20.0),
             ],
             true,
         ));
@@ -3996,8 +3993,7 @@ mod tests {
         .await
     }
 
-    /// A top-of-book-only product answers from the quote map, with `as_of_ns`; a product with a
-    /// book answers from it although it has a quote too.
+    /// A product with a book answers from the book even with a quote held for it.
     #[tokio::test]
     async fn the_quote_map_answers_a_product_no_book_covers() {
         let base = spawn_quoted_products(true).await;
@@ -4005,16 +4001,19 @@ mod tests {
         let body = get_ok(format!("{base}/v1/products/BINANCE:BTCUSDT/ticker")).await;
         assert_eq!(body["best_bid"], "100.50", "{body}");
         assert_eq!(body["best_ask"], "100.60", "{body}");
-        assert_eq!(body["source"], "quote", "{body}");
+        assert_eq!(body["origin"], "quote", "{body}");
         assert_eq!(body["as_of_ns"], "1234", "{body}");
         for (id, bid, ask) in [
-            ("KALSHI:KXBTCPERP", "0.6100", "0.6300"),
-            ("HYPERLIQUID:BTC", "100.00", "101.00"),
+            ("KALSHI:KXBTCPERP", json!("0.6100"), json!(null)),
+            ("HYPERLIQUID:BTC", json!("100.00"), json!("101.00")),
         ] {
             let body = get_ok(format!("{base}/v1/products/{id}/ticker")).await;
             assert_eq!(body["best_bid"], bid, "{body}");
-            assert_eq!(body["best_ask"], ask, "{body}");
-            assert_eq!(body["source"], "book", "{body}");
+            assert_eq!(
+                body["best_ask"], ask,
+                "the quote never fills a side the book lacks: {body}"
+            );
+            assert_eq!(body["origin"], "book", "{body}");
             assert!(body.get("as_of_ns").is_none(), "{body}");
         }
 
@@ -4029,7 +4028,7 @@ mod tests {
         let btc = entry("BINANCE:BTCUSDT");
         assert_eq!(btc["bids"], json!([["100.50", "1.00000"]]), "{body}");
         assert_eq!(btc["asks"], json!([["100.60", "2.00000"]]), "{body}");
-        assert_eq!(btc["source"], "quote", "{body}");
+        assert_eq!(btc["origin"], "quote", "{body}");
         assert_eq!(btc["as_of_ns"], "1234", "{body}");
         let eth = entry("BINANCE:ETHUSDT");
         assert_eq!(
@@ -4044,12 +4043,13 @@ mod tests {
             ("HYPERLIQUID:BTC", "100.00"),
         ] {
             assert_eq!(entry(id)["bids"][0][0], bid, "{body}");
-            assert_eq!(entry(id)["source"], "book", "{body}");
+            assert_eq!(entry(id)["origin"], "book", "{body}");
             assert!(entry(id).get("as_of_ns").is_none(), "{body}");
         }
+        assert_eq!(entry("KALSHI:KXBTCPERP")["asks"], json!([]), "{body}");
     }
 
-    /// With the map off, a book's answer gains only `source`.
+    /// With the map off, a book's answer gains only `origin`.
     #[tokio::test]
     async fn without_the_quote_map_a_top_of_book_only_product_has_no_bid_or_ask() {
         let base = spawn_quoted_products(false).await;
@@ -4059,7 +4059,7 @@ mod tests {
             body["best_bid"].is_null() && body["best_ask"].is_null(),
             "{body}"
         );
-        assert!(body.get("source").is_none(), "{body}");
+        assert!(body.get("origin").is_none(), "{body}");
         assert!(body.get("as_of_ns").is_none(), "{body}");
 
         let body = get_ok(format!("{base}/v1/best_bid_ask")).await;
@@ -4071,7 +4071,7 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, ["HYPERLIQUID:BTC", "KALSHI:KXBTCPERP"], "{body}");
         for p in pricebooks {
-            assert_eq!(p["source"], "book", "{body}");
+            assert_eq!(p["origin"], "book", "{body}");
             assert!(p.get("as_of_ns").is_none(), "{body}");
         }
     }
@@ -4090,7 +4090,7 @@ mod tests {
             .map(|p| {
                 (
                     p["product_id"].as_str().unwrap(),
-                    p["source"].as_str().unwrap(),
+                    p["origin"].as_str().unwrap(),
                 )
             })
             .collect();
@@ -4102,8 +4102,7 @@ mod tests {
         );
     }
 
-    /// Binance's two engines both list `BTCUSDT`. With the quote map on, the bare id is still refused
-    /// on both routes, and each suffixed id answers its own engine's quote.
+    /// Binance's two engines both list `BTCUSDT`.
     #[tokio::test]
     async fn an_ambiguous_symbol_is_refused_and_each_identity_answers_its_own_quote() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
@@ -4146,7 +4145,7 @@ mod tests {
         for (suffix, bid, as_of_ns) in [("%230.1", "100.10", "6"), ("%230.2", "100.30", "8")] {
             let body = get_ok(format!("{base}/v1/products/BINANCE:BTCUSDT{suffix}/ticker")).await;
             assert_eq!(body["best_bid"], bid, "{body}");
-            assert_eq!(body["source"], "quote", "{body}");
+            assert_eq!(body["origin"], "quote", "{body}");
             assert_eq!(body["as_of_ns"], as_of_ns, "{body}");
         }
     }
