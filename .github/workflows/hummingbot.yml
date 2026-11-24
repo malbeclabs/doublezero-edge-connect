@@ -1,0 +1,43 @@
+name: hummingbot
+
+# The Hummingbot adapter replaces a private Hummingbot method, so a Hummingbot release can break it
+# without touching this repo. Each supported release's published image runs the adapter's tests and
+# an end-to-end V2 script against a stub edge-connect; the weekly run catches an image re-pushed under its tag.
+on:
+  pull_request:
+    paths:
+      - "integrations/hummingbot/**"
+      - "PROTOCOL.md"
+      - ".github/workflows/hummingbot.yml"
+  schedule:
+    - cron: "41 6 * * 1" # Mondays 06:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hummingbot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The supported Hummingbot releases. Add an image here to cover another one.
+        image:
+          - hummingbot/hummingbot:version-2.18.0
+    env:
+      IMAGE: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pull Hummingbot
+        run: docker pull "$IMAGE"
+      - name: Unit tests
+        run: |
+          docker run --rm -v "$PWD/integrations/hummingbot:/work" -w /work \
+            -e PYTHONPATH=/home/hummingbot -e PYTHONDONTWRITEBYTECODE=1 \
+            "$IMAGE" python -m pytest -p no:cacheprovider
+      - name: End to end
+        run: integrations/hummingbot/e2e/run.sh "$IMAGE"
