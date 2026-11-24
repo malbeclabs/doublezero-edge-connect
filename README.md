@@ -266,6 +266,8 @@ Already have a **Binance** client, such as NautilusTrader's or CCXT's? A sink se
 
 Already have a **Kalshi** client, such as NautilusTrader's? A sink serves Kalshi's event contracts in Kalshi's own trade-API schema (`orderbook_delta`, `ticker`, `trade`) at `ws://127.0.0.1:8084/trade-api/ws/v2`. On by default at loopback: `KALSHI_WS_BIND=0.0.0.0:8084` serves a client on another host (no TLS or authentication: firewall the port), and `KALSHI_WS_BIND=""` turns it off. See [Output sinks](docs/output-sinks.md#kalshi-compatible-sink) for the client configuration and what the feed cannot supply.
 
+Already have **Hummingbot**? Its connectors' URLs are fixed, so [`integrations/hummingbot`](integrations/hummingbot/) feeds them from this WebSocket instead: copy one folder into Hummingbot's `scripts/` and call `use_doublezero(["hyperliquid_perpetual"])` at the top of a V2 script. The connector then reads its order books and trades from the bridge, while orders, account streams and funding stay on Hyperliquid.
+
 ## Query market data (the `doublezero-edge` CLI)
 
 Prefer polling a candle or the current book over consuming the WebSocket feed? The bridge also

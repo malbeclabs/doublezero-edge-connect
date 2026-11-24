@@ -79,6 +79,8 @@ info.subscribe({"type": "bbo", "coin": "BTC"}, print)
 
 `info.subscribe` still maps names to coins from the metadata `Info` loaded. `bbo`, `trades` and `l2Book` work; the SDK has no `l4Book` subscription.
 
+**Hummingbot: use the adapter, not this sink.** Hummingbot's connector URLs are hard-coded, and its perpetual connector takes funding and mark price from `activeAssetCtx`, which this sink does not serve; Hummingbot ignores the refusal, so both stay at their startup values. It also reads a trade's `hash`, zero here, as the trade ID. [`integrations/hummingbot`](../integrations/hummingbot/) instead swaps the connector's order-book data source for one that reads the normalized WebSocket, and leaves funding, orders and account streams on Hyperliquid.
+
 **What the wire cannot supply.** Hyperliquid's schema describes a venue that also owns the account
 model; our input is an order book. A trade's `users` and `hash`, an order's `user`, `timestamp` and
 its `triggerCondition`/`orderType`/`tif`/`cloid` block, and `l4Book`'s `height` are emitted as null or

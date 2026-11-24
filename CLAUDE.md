@@ -121,6 +121,7 @@ Modules are grouped by role under `src/`:
     drops but leaves the key open. Eviction is a cheap slot range-drop trailing the tip by
     `--shred-dedup-window-slots`.
 - **root** — `model` (shared wire types/clocks/snapshots) and `main`.
+- **`integrations/hummingbot/`** — a Python adapter outside the crate, a consumer of PROTOCOL.md like any other. `use_doublezero` replaces a Hummingbot connector class's private `_create_order_book_data_source` when a V2 script is imported, which Hummingbot does before it builds connectors, so that connector's books and trades come from the normalized WebSocket. ⚠️ Only a pair's first book may reach Hummingbot as a `SNAPSHOT`: its tracker replays its last 32 diffs over every later snapshot whatever their update ids (`OrderBookMessage.__lt__` makes the `bisect` return 0), so re-baselines go out as diffs and the hourly REST snapshot is never requested. Because it depends on a private method, `.github/workflows/hummingbot.yml` runs its tests and an end-to-end script in each supported Hummingbot release's image.
 
 - **`ingest/registry.rs` + `ingest/registry.json`** — the feed registry as **data**. The rows are a
   JSON document resolved once at startup from one of three sources in precedence order —
