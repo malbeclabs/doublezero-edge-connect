@@ -736,7 +736,8 @@ pub fn bind_multicast(
 /// Mirrors the edge-feed-spec datagram-header semantics: the Sequence Number is "monotonically
 /// increasing per channel ... Resets to 0 when `Reset Count` changes", and "Subscribers detect a
 /// reset by comparing [`Reset Count`] against their last-seen value". Everything but
-/// [`Stale`](SeqCheck::Stale) is processed.
+/// [`Stale`](SeqCheck::Stale) is processed, except that top-of-book also drops a
+/// [`Duplicate`](SeqCheck::Duplicate).
 ///
 /// We deliberately do *not* flag forward gaps: on the live feed the publisher's channel-0
 /// sequence is effectively global/multiplexed across venues and groups, so any single multicast
@@ -746,9 +747,11 @@ pub fn bind_multicast(
 pub enum SeqCheck {
     /// First datagram seen on this channel.
     First,
-    /// Sequence at or above the last seen within the era (forward progress or a duplicate of
-    /// the last). Accepted.
+    /// Sequence above the last seen within the era. Accepted.
     Ok,
+    /// Sequence equal to the last seen within the era: that datagram redelivered, since a publisher
+    /// numbers every datagram.
+    Duplicate,
     /// `Reset Count` changed: the publisher reset the channel and the sequence restarts. Accepted.
     Reset,
     /// Sequence below the last seen within the same reset era - a reordered or duplicated
@@ -837,8 +840,13 @@ impl SeqTracker {
             return SeqCheck::Stale; // do not advance: keep the anchor on the freshest sequence
         }
         if !self.bounded || sequence - entry.sequence <= MAX_SEQ_ADVANCE {
+            let duplicate = sequence == entry.sequence;
             *entry = anchor(sequence);
-            return SeqCheck::Ok; // forward progress or a duplicate of the last sequence
+            return if duplicate {
+                SeqCheck::Duplicate
+            } else {
+                SeqCheck::Ok
+            };
         }
         let since = match entry.bounded {
             Some((since, latest)) if sequence.abs_diff(latest) <= MAX_SEQ_ADVANCE => since,
@@ -2006,10 +2014,11 @@ mod tests {
 
     #[test]
     fn duplicate_of_last_is_not_stale() {
-        // Equal sequence is a duplicate full-state update (idempotent); only strictly-lower is stale.
+        // An equal sequence is the last datagram redelivered; only strictly-lower is stale.
         let mut s = SeqTracker::default();
         assert_eq!(s.check(0, 0, 7, 0), SeqCheck::First);
-        assert_eq!(s.check(0, 0, 7, 0), SeqCheck::Ok);
+        assert_eq!(s.check(0, 0, 7, 0), SeqCheck::Duplicate);
+        assert_eq!(s.check(0, 0, 8, 0), SeqCheck::Ok);
     }
 
     #[test]

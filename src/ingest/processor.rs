@@ -82,7 +82,7 @@ impl WarnRateLimit {
 /// feed's lifetime), so the children are bound lazily on first use.
 #[derive(Default)]
 struct SeqEvents {
-    children: Option<[prometheus::IntCounter; 6]>,
+    children: Option<[prometheus::IntCounter; 7]>,
 }
 
 impl SeqEvents {
@@ -95,6 +95,7 @@ impl SeqEvents {
             SeqCheck::Stale => 3,
             SeqCheck::Bounded => 4,
             SeqCheck::Reseat => 5,
+            SeqCheck::Duplicate => 6,
         }
     }
 
@@ -111,6 +112,7 @@ impl SeqEvents {
                 child("stale"),
                 child("bounded"),
                 child("reseat"),
+                child("duplicate"),
             ]
         });
         children[Self::index(check)].inc();
@@ -549,11 +551,12 @@ impl DatagramProcessor for TobProcessor {
         }
 
         // Per edge-feed-spec, the datagram Sequence Number is monotonically increasing per channel and
-        // a `Reset Count` change signals a publisher reset. On the quote feed we drop only the stale
-        // (out-of-order/replayed) datagrams - those whose sequence is below the last seen within the
-        // same reset era - so an old datagram can never overwrite a fresher top-of-book. Forward
-        // jumps are accepted without comment (the channel-0 sequence is global across groups, so
-        // per-group gaps are expected, not loss).
+        // a `Reset Count` change signals a publisher reset. On the quote feed we drop a datagram whose
+        // sequence is below the last seen within the same reset era (out-of-order/replayed), so an old
+        // datagram can never overwrite a fresher top-of-book, or equal to it (redelivered), since the
+        // arbiter's floor collapses only a repeat of the last quote it emitted. Forward jumps are
+        // accepted without comment (the channel-0 sequence is global across groups, so per-group gaps
+        // are expected, not loss).
         let quotes_fresh = if handle_quotes {
             let check = self.seq.check(
                 ctx.publisher,
@@ -563,12 +566,13 @@ impl DatagramProcessor for TobProcessor {
             );
             self.seq_events.record(ctx.venue, ctx.category, &check);
             match check {
-                SeqCheck::Stale => {
+                SeqCheck::Stale | SeqCheck::Duplicate => {
                     debug!(
                         venue = ctx.venue,
                         channel = header.channel_id,
                         sequence = header.sequence,
-                        "dropping stale/out-of-order quote datagram (sequence below last seen)"
+                        ?check,
+                        "dropping a stale or redelivered quote datagram"
                     );
                     false
                 }
@@ -3784,8 +3788,8 @@ impl DatagramProcessor for MbpProcessor {
                         let committed = self.last_batch.get(&key).copied();
                         // ⚠️ **A boundary at or below the slot this channel has already committed
                         // is not a boundary.** Two ways it arrives: the wire redelivers a datagram
-                        // (routine on multicast, and `SeqTracker` accepts `sequence == last` as
-                        // ordinary forward progress, so the freshness gate above does not see it),
+                        // (routine on multicast, and the freshness gate above passes a
+                        // `SeqCheck::Duplicate`),
                         // or one names a slot the channel has passed. Neither ends an event —
                         // closing on it commits every buffering consumer mid-event, which is what
                         // walked 30 markets back five slots in one second on the live feed — and
@@ -4954,6 +4958,33 @@ mod tests {
         assert_eq!(Some(q.channel), announced, "the announced channel");
         assert_eq!(q.channel, 5);
         assert_eq!(&*q.category, "testcategory");
+    }
+
+    /// A redelivered datagram is dropped at the sequence check: the arbiter collapses only a repeat
+    /// of the last quote, so this one's two quotes for one instrument would go out again.
+    #[test]
+    fn tob_a_redelivered_datagram_emits_its_quotes_once() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = TobProcessor::new(tape(false));
+        let ctx = |role| make_ctx(&arbiter, &instruments, role);
+        proc.on_datagram(
+            &tob_datagram(
+                0,
+                &[
+                    enc_manifest_summary(1, 1),
+                    enc_instrument_def(41, "MARKET-X", 1),
+                ],
+            ),
+            &ctx(PortRole::Refdata),
+        );
+        let mut lower = enc_tob_quote(41, 1, 1_000);
+        lower[20..28].copy_from_slice(&99i64.to_le_bytes()); // bid_price_raw
+        let datagram = tob_datagram(1, &[enc_tob_quote(41, 1, 1_000), lower]);
+        for _ in 0..2 {
+            proc.on_datagram(&datagram, &ctx(PortRole::Mktdata));
+        }
+        let bids: Vec<f64> = drain_quotes(&mut rx).iter().map(|q| q.bid).collect();
+        assert_eq!(bids, vec![100.0, 99.0]);
     }
 
     /// One instrument served by a top-of-book row and a market-by-price row on one channel lands at
@@ -8884,7 +8915,7 @@ mod tests {
     /// and closes no event. Measured on the live feed: 30 markets took an empty closing batch
     /// stamped five slots behind their own previous one, each committing a buffering consumer
     /// mid-event. An exact duplicate takes the same path — the wire redelivers datagrams and
-    /// `SeqTracker` accepts `sequence == last` as ordinary forward progress.
+    /// this processor's freshness gate passes a `SeqCheck::Duplicate`.
     #[test]
     fn mbp_a_superseded_boundary_closes_nothing_and_moves_no_slot() {
         let venue = "MbpSlotRegression";

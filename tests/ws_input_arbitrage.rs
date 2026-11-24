@@ -36,10 +36,7 @@ fn refdata() -> Vec<Vec<u8>> {
     )
 }
 fn mktdata() -> Vec<Vec<u8>> {
-    replay::split_datagrams(
-        &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
-        replay::TOB_MAGIC,
-    )
+    replay::tob_golden_mktdata()
 }
 
 /// Every distinct `source_ts` carried by the edge mktdata golden's quotes, ascending. These are the

@@ -27,6 +27,8 @@ records in first-seen order: ChannelReset → InstrumentDefinition → ManifestS
 records were reordered to ChannelReset → ManifestSummary → InstrumentDefinition. Datagram bytes are
 unmodified; only record order changed.
 
+**`tob_marketdata.bin` sequence numbers:** the generator stamps `0` on every datagram, which the bridge drops after the first as redelivered. Replay it through `replay::tob_golden_mktdata`, which numbers the datagrams in order; the file itself is unmodified.
+
 The **MBO trio** (`mbo_refdata.bin` / `mbo_snapshot.bin` / `mbo_mktdata.bin`) is a real two-sided
 recorder capture — see "MBO fixtures (real two-sided capture)" below. It replaces the earlier
 hand-crafted empty-anchor snapshot from PR #2; no manual reorder or hand-crafting applies.

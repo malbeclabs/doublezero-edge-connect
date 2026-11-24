@@ -257,10 +257,7 @@ async fn race_btc(empty_trades_replay: bool) {
     assert_eq!(venue(&race, HL)["public_input"]["reconnects"], 2, "{race}");
 
     // The edge defines BTC with its first quote; the rest of its feed waits until BTC is live.
-    let mktdata = replay::split_datagrams(
-        &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
-        replay::TOB_MAGIC,
-    );
+    let mktdata = replay::tob_golden_mktdata();
     let reveal = 1 + mktdata
         .iter()
         .position(|d| !decode(std::slice::from_ref(d)).0.is_empty())
