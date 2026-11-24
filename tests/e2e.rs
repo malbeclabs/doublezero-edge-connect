@@ -136,8 +136,8 @@ async fn tob_single_publisher_contract() {
 
     let quotes = ws_client::by_type(&msgs, "quote");
     // The quote dedup is a per-(venue, symbol) source_ts staleness floor keyed on raw BBO content: it
-    // keeps every distinct (source_ts, content) at a non-decreasing floor and drops only strictly-
-    // older replays and exact duplicates. A single publisher delivers each of its samples once with
+    // keeps each leader change at a non-decreasing floor and drops only strictly-older replays and a
+    // repeat of the leader's last quote. A single publisher delivers each of its samples once with
     // non-decreasing source_ts, so none are stale and none are exact duplicates — all 41 are emitted.
     assert_eq!(
         quotes.len(),

@@ -79,7 +79,7 @@ pub struct Metrics {
     /// one of its publishers reads `dz_receiver_up == 0`; that is the wedged-mirror signal.
     pub receiver_up: IntGaugeVec,
     /// Datagram-sequence classifications per feed row (`venue`, `category`), by `kind`
-    /// (first/ok/reset/stale).
+    /// (first/ok/duplicate/reset/stale).
     pub seq_events: IntCounterVec,
 
     // --- Arbiter emit stage (labelled by `venue`) ---
@@ -100,7 +100,8 @@ pub struct Metrics {
     /// copy usually) and is a dedup diagnostic, not a win rate. `source_ts == 0` sentinel quotes
     /// bypass the floor and are not counted.
     pub quote_ticks_won: IntCounterVec,
-    /// Quotes dropped by the staleness floor (stale tick, non-leader, or exact repeat — collapsed).
+    /// Quotes dropped by the staleness floor (stale tick, non-leader, or a repeat of the leader's last
+    /// quote — collapsed).
     pub quotes_dropped: IntCounterVec,
     /// Trades admitted by the windowed dedup, attributed to the winning `publisher` (edge/public) —
     /// the trade-side mirror of [`quotes_admitted`].
@@ -610,7 +611,7 @@ impl Metrics {
             seq_events: counter_vec(
                 &registry,
                 "dz_seq_events_total",
-                "Datagram-sequence classifications per feed (first/ok/reset/stale)",
+                "Datagram-sequence classifications per feed (first/ok/duplicate/reset/stale)",
                 &["venue", "category", "kind"],
             ),
             emit: counter_vec(

@@ -5,7 +5,7 @@
 //! per-(venue, symbol) `source_ts` latch-to-leader floor: within one `source_ts` tick only the
 //! leader (first publisher to open it) is emitted — a slower publisher's samples at the same tick
 //! arrive in a delay-corrupted order and are dropped — and a strictly-older BBO (stale laggard) plus
-//! the leader's exact `(source_ts, content)` repeats are dropped too. So the emitted `source_ts` is
+//! the leader's repeat of its last content are dropped too. So the emitted `source_ts` is
 //! non-decreasing — not strictly increasing — per symbol, and within a tick the series is one
 //! publisher's coherent subsequence.
 
@@ -272,7 +272,7 @@ fn assert_quote_source_ts_non_decreasing(msgs: &[Value]) {
 fn two_publishers_latch_to_leader_no_stale_or_dupes() {
     let recs = read_combined("tests/fixtures/tob_btc_dual.combined.bin");
     let msgs = replay(&recs);
-    // No two emitted quotes share the oracle's business identity (exact duplicates dropped).
+    // No emitted quote repeats the one before it for its symbol (exact duplicates dropped).
     assertions::no_business_duplicates(&msgs);
     assertions::quotes_well_formed(&msgs);
     // Latch-to-leader floor: per (venue, symbol) the emitted source_ts is non-decreasing — a lagging
@@ -334,7 +334,7 @@ fn per_symbol_dedup_is_independent() {
 
     let raw = raw_quotes_by_symbol(&recs);
     let emitted = emitted_quotes_by_symbol(&msgs);
-    // Each symbol emits the leader's distinct intra-tick changes: well below raw (non-leader samples,
+    // Each symbol emits the leader's intra-tick changes: well below raw (non-leader samples,
     // stale laggard replays, and exact dups dropped) but well above a strict one-per-tick watermark.
     // The exact per-symbol counts aren't pinned here (the single-symbol test above pins BTC); this
     // test pins the cross-symbol *independence* property below.
@@ -390,7 +390,9 @@ fn per_symbol_dedup_is_independent() {
 /// The literal duplicate-multicast-packet case for quotes: replay one publisher's feed, then
 /// replay it again with **every mktdata datagram delivered twice** (byte-for-byte, same datagram
 /// sequence — exactly what a redundant multicast delivery looks like). The emitted quote set must be
-/// identical: the sequence gate drops the copy as `SeqCheck::Duplicate`.
+/// identical. This pins the outcome, not the gate: every captured datagram carries one quote per
+/// instrument, which the floor collapses anyway (`tob_a_redelivered_datagram_emits_its_quotes_once`
+/// pins the gate).
 #[test]
 fn duplicate_multicast_quote_packet_collapses() {
     let recs = read_combined("tests/fixtures/tob_btc_dual.combined.bin");
@@ -468,9 +470,8 @@ fn duplicate_packet_from_second_publisher_collapses() {
 }
 
 /// The duplicate-packet case for trades: replay the single-publisher TOB golden, then replay it with
-/// every mktdata datagram delivered again afterwards. The sequence gate drops each copy as stale or
-/// redelivered, so the emitted trade set is unchanged. Guarded so a trade-less fixture fails loud
-/// rather than passing vacuously.
+/// every mktdata datagram delivered again afterwards: the emitted trade set must be unchanged.
+/// Guarded so a trade-less fixture fails loud rather than passing vacuously.
 #[test]
 fn duplicate_multicast_trade_packet_collapses() {
     let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
