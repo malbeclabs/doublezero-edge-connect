@@ -41,7 +41,7 @@ It has no TLS or authentication, so a wildcard bind serves your feeds to anyone 
 It is a **rendering, not a second protocol**: it holds no book of its own, adds no deduplication and
 influences no arbitration, reading the same internal broadcast the normalized sink reads. Nothing
 about it belongs in PROTOCOL.md, which is the contract for our own protocol. Scoped to the
-Hyperliquid venue — `coin` is our `symbol`, and no other venue is rendered. Not subscription-gated
+Hyperliquid venue, its builder-DEX markets such as `xyz:CL` included — `coin` is our `symbol`, and no other venue is rendered. Not subscription-gated
 (it has no multicast group of its own to be subscribed to); like the normalized sink, a bind failure
 disables it with a warning rather than taking the process down.
 

@@ -42,11 +42,14 @@ use crate::{
     },
 };
 
-/// The one Source ID this sink renders. Hyperliquid's schema names an instrument by `coin`, which is
-/// our `symbol`; a message from another source has no `coin` to be and is dropped before any
-/// rendering. Matched on the ID, not the name: several IDs may share a name, and another ID is a
-/// different engine.
-use crate::ingest::sources::HYPERLIQUID_SOURCE_ID as SOURCE_ID;
+use crate::ingest::sources::{source_name, HYPERLIQUID_SOURCE_ID};
+
+/// Every Source ID named like Hyperliquid's own, as Hyperliquid serves its builder DEXes beside its
+/// perps; their `coin`s (our `symbol`) carry a `dex:` prefix, so the two do not collide.
+fn renders(source_id: u16) -> bool {
+    let hyperliquid = source_name(HYPERLIQUID_SOURCE_ID);
+    hyperliquid.is_some() && source_name(source_id) == hyperliquid
+}
 
 /// `nLevels` when the subscription omits it, and the ceiling it is clamped to — both from the
 /// publisher's `types/subscription.rs`.
@@ -543,7 +546,7 @@ fn raw_diff(c: &crate::model::BookChange, published: Option<f64>) -> RawDiff {
 /// channel last sent for the market, read **before** the batch is folded into it. `None` when the
 /// batch carries no order-level change at all.
 fn render_l4book_diff(b: &NormalizedBook, coin: &str, published: &MarketOrders) -> Option<String> {
-    if b.source_id != SOURCE_ID || b.symbol.as_ref() != coin {
+    if b.symbol.as_ref() != coin || !renders(b.source_id) {
         return None;
     }
     let book_diffs: Vec<OrderDiffEntry> = b
@@ -589,7 +592,7 @@ struct TradeData<'a> {
 /// A trade whose aggressor we do not know is dropped rather than guessed: the side is the only field
 /// on this channel a consumer acts on directionally, and Hyperliquid's schema has no "unknown".
 fn render_trade(t: &NormalizedTrade, coin: &str) -> Option<String> {
-    if t.source_id != SOURCE_ID || t.symbol.as_ref() != coin {
+    if t.symbol.as_ref() != coin || !renders(t.source_id) {
         return None;
     }
     let side = match t.aggressor_side {
@@ -626,7 +629,7 @@ struct BboData<'a> {
 /// A side with no size is `null`: the decoder turns a side the publisher left out into zeros, and a
 /// consumer would read those as a real bid of 0.
 fn render_bbo(q: &NormalizedQuote, coin: &str) -> Option<String> {
-    if q.source_id != SOURCE_ID || q.symbol.as_ref() != coin {
+    if q.symbol.as_ref() != coin || !renders(q.source_id) {
         return None;
     }
     let side = |px: f64, sz: f64, n: u16| {
@@ -891,7 +894,7 @@ fn prepare_one(
     let FeedMessage::Book(b) = &**m else {
         return bare(None);
     };
-    if b.source_id != SOURCE_ID {
+    if !renders(b.source_id) {
         return bare(None);
     }
     let coin = b.symbol.as_ref();
@@ -1065,10 +1068,7 @@ fn sent(channel: &'static str) {
 /// order population, so such a market would render as an *empty* book, telling the consumer to discard
 /// levels the bridge holds.
 fn publishable(key: &BookKey, acc: &BookAccumulator, coin: &str) -> bool {
-    key.0.id() == SOURCE_ID
-        && acc.symbol().as_ref() == coin
-        && acc.baselined()
-        && acc.is_order_level()
+    acc.symbol().as_ref() == coin && renders(key.0.id()) && acc.baselined() && acc.is_order_level()
 }
 
 /// Copy one market out from under the shared lock — the arbiter's emit path takes this same mutex on
@@ -1200,7 +1200,7 @@ fn frames(
                 }
             }
         }
-        FeedMessage::Book(b) if b.source_id == SOURCE_ID => {
+        FeedMessage::Book(b) if renders(b.source_id) => {
             let coin = b.symbol.as_ref();
             let Some(key) = p.key.as_ref() else {
                 return out;
@@ -1590,7 +1590,7 @@ mod tests {
 
     const TEST_CATEGORY: &str = "perps";
 
-    /// The name [`SOURCE_ID`] carries.
+    /// Hyperliquid's registry name.
     const VENUE: &str = "HYPERLIQUID";
 
     use crate::model::BookReplay;
@@ -1631,13 +1631,14 @@ mod tests {
         acc
     }
 
-    /// Another Source ID under the same name is a different engine, not this sink's.
+    /// A builder DEX's Source ID shares Hyperliquid's name and is published; another name is not.
     #[test]
-    fn another_id_under_the_same_name_is_not_published() {
+    fn another_id_under_the_same_name_is_published() {
         let acc = accumulated(vec![(BookSide::Bid, 100.0, 1.0, 1)]);
-        assert!(publishable(&key(), &acc, "BTC"), "fixture sanity");
         let mut other = key();
         other.0 = crate::model::SourceKey::new(7, VENUE.into());
+        assert!(publishable(&other, &acc, "BTC"));
+        other.0 = crate::model::SourceKey::new(2, "PHOENIX".into());
         assert!(!publishable(&other, &acc, "BTC"));
     }
 
@@ -2178,6 +2179,15 @@ mod tests {
         assert!(render_bbo(&q, "ETH").is_none());
         q.source_id = 2;
         assert!(render_bbo(&q, "BTC").is_none());
+    }
+
+    #[test]
+    fn bbo_renders_a_builder_dex_but_not_an_unassigned_source() {
+        let mut q = normalized_quote("xyz:CL", (80.25, 2.0, 3), (80.26, 4.0, 1));
+        q.source_id = 7;
+        assert!(render_bbo(&q, "xyz:CL").is_some());
+        q.source_id = 999;
+        assert!(render_bbo(&q, "xyz:CL").is_none());
     }
 
     // --- Task 7: streaming ---
