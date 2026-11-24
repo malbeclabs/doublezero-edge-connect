@@ -336,6 +336,8 @@ with an `#<channel>.<instrument_id>` suffix needed only where a bare symbol coll
 The [`doublezero-edge`](../README.md#query-market-data-the-doublezero-edge-cli) CLI is a thin client
 over this surface.
 
+**Best bid and ask come from a book first, then the latest top-of-book quote.** `ticker` and `best_bid_ask` answer from the product's market-by-price book, else its market-by-order `depth`, and for a product with neither, from its latest top-of-book quote. The bridge keeps that quote only with `--quote-map` (`DZ_QUOTE_MAP`) on. Without it, a product carried only on a top-of-book feed, such as every Binance product, or Hyperliquid on a host not subscribed to its market-by-order feed, has no bid or ask: `ticker` reports both as `null` and `best_bid_ask` leaves the product out. Each answer names its `source`, `book` or `quote`. A quote also carries `as_of_ns`, when the bridge received it, in nanoseconds as a string, because a quote can be older than a book's top.
+
 **Candles cover a rolling one hour, in memory, and do not survive a restart.** The history buffer
 (`src/history.rs`) is a bounded per-product set of 1-second OHLCV buckets plus a ring of recent
 prints, fed from the post-arbiter broadcast — so every print arriving here is already deduplicated on

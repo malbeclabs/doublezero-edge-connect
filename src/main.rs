@@ -315,8 +315,8 @@ struct Args {
     subscription_gating_disable: bool,
 
     /// Keep the latest top-of-book quote and last trade per instrument, keyed by its full identity,
-    /// beside the books (`ingest::quote_map`). Off by default; turning it on changes no output, since
-    /// nothing reads the map yet.
+    /// beside the books (`ingest::quote_map`). Off by default; when on, `/v1`'s `ticker` and
+    /// `best_bid_ask` answer a product no book covers from its latest quote.
     #[arg(long = "quote-map", env = "DZ_QUOTE_MAP", default_value_t = false)]
     quote_map: bool,
 
@@ -700,8 +700,7 @@ async fn main() -> Result<()> {
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let books: model::BookSnapshot = Arc::new(Mutex::new(model::BookReplay::default()));
     // The latest top-of-book quote and trade per instrument (`--quote-map`). Only created when the
-    // flag is on, so the arbiter's send path does no extra work by default. Nothing reads it yet;
-    // the handle stays here for the reader that will.
+    // flag is on, so the arbiter's send path does no extra work by default.
     let quote_map: Option<model::QuoteMap> =
         args.quote_map.then(|| Arc::new(Mutex::new(HashMap::new())));
     // Rolling one-hour trade history behind the `/v1` query API. Built once here (like the three
@@ -1003,6 +1002,7 @@ async fn main() -> Result<()> {
             ws_cfg,
             api_bind: args.api_bind.clone(),
             history,
+            quote_map,
             shred: shred_params,
             diagnostics,
         })

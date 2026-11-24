@@ -234,6 +234,7 @@ async fn race_btc(empty_trades_replay: bool) {
         Arc::new(Mutex::new(ChannelFilter::default())),
         Vec::new(),
         arbiter.clone(),
+        None,
     ));
     let mock = MockWsInput::start_knowing(&["BTC"]).await;
     tokio::spawn(ws_input::run(

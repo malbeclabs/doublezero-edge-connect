@@ -1,8 +1,9 @@
 //! The read-only `/v1` query API: a JSON-over-HTTP surface that answers from the shared,
 //! already-computed state every other part of the bridge maintains — the instrument catalog
 //! (`InstrumentSnapshot`), the MBO depth and MBP book replay maps (`DepthSnapshot`/`BookSnapshot`),
-//! `history::Store`'s rolling one-hour candles/prints, and `ingest::health::FeedHealth`'s per-venue
-//! liveness. It reads all of it; it owns none of it and mutates nothing here.
+//! the latest top-of-book quotes (`QuoteMap`, with `--quote-map`), `history::Store`'s rolling
+//! one-hour candles/prints, and `ingest::health::FeedHealth`'s per-venue liveness. It reads all of
+//! it; it owns none of it and mutates nothing here.
 //!
 //! Connection handling and response writing are the shared [`crate::sinks::http`] scaffolding (no
 //! HTTP framework dependency, matching every other hand-rolled sink in this crate); this module only
@@ -58,12 +59,13 @@ use crate::{
         feeds::{feeds, Feed, FeedKind},
         health::{SharedFeedHealth, TapeLiveness},
         processor::DEPTH_LEVELS,
+        quote_map::tob_candidate,
         race::{Figures, Kind, EDGE, PUBLIC},
         sources::source_ids_of,
     },
     model::{
         category_arc, venue_arc, BookSnapshot, DepthSnapshot, InstrumentSnapshot,
-        NormalizedInstrument,
+        NormalizedInstrument, QuoteMap,
     },
     products::{self, Resolution},
 };
@@ -120,6 +122,8 @@ struct ApiState {
     enabled: Vec<Feed>,
     /// Read for `/v1/race`'s board only.
     arbiter: SharedArbiter,
+    /// `None` when `--quote-map` is off. Read only for a product no book answers.
+    quote_map: Option<QuoteMap>,
 }
 
 /// Bind the listener up front so the caller can decide what a bind failure means — mirrors
@@ -143,6 +147,7 @@ pub async fn serve(
     filter: Arc<Mutex<ChannelFilter>>,
     enabled: Vec<Feed>,
     arbiter: SharedArbiter,
+    quote_map: Option<QuoteMap>,
 ) -> Result<()> {
     let state = Arc::new(ApiState {
         instruments,
@@ -153,6 +158,7 @@ pub async fn serve(
         filter,
         enabled,
         arbiter,
+        quote_map,
     });
     http::serve_loop(
         listener,
@@ -640,28 +646,82 @@ fn ticker(state: &ApiState, inst: &NormalizedInstrument) -> Response {
         .collect();
 
     // One instrument, so one catalog scan — the same cost `book()` already pays per request.
-    let (bid, ask) = best_levels(
+    let best = book_or_quote(
         state,
         inst,
         depth_is_ambiguous(state, inst.source_id, &inst.symbol),
     );
-    ok_json(json!({
+    let (bid, ask) = best.map_or((None, None), |(bid, ask, _)| (bid, ask));
+    let mut body = json!({
         "trades": trades_json,
         "best_bid": bid.map(|(p, _)| decimal_string(p, inst.price_exponent)),
         "best_ask": ask.map(|(p, _)| decimal_string(p, inst.price_exponent)),
-    }))
+    });
+    if let Some((_, _, source)) = best {
+        tag_source(&mut body, source);
+    }
+    ok_json(body)
 }
 
 /// One side's best (price, size), or absent when nothing is derivable for it.
 type Level = Option<(f64, f64)>;
 
+/// Where a best-levels answer came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LevelsSource {
+    Book,
+    /// The quote map's top-of-book quote, with our receive time of it.
+    Quote {
+        as_of_ns: u64,
+    },
+}
+
+/// [`best_levels`] when a book answers, else the quote map's entry for the same identity. `None`
+/// when neither answers.
+fn book_or_quote(
+    state: &ApiState,
+    inst: &NormalizedInstrument,
+    ambiguous: bool,
+) -> Option<(Level, Level, LevelsSource)> {
+    match best_levels(state, inst, ambiguous) {
+        (None, None) => {}
+        (bid, ask) => return Some((bid, ask, LevelsSource::Book)),
+    }
+    let map = state.quote_map.as_ref()?;
+    // Keyed by identity, unlike `depth`, so an ambiguous symbol still answers here.
+    let key = (
+        crate::model::SourceKey::of(inst),
+        inst.category.clone(),
+        inst.channel,
+        inst.instrument_id,
+    );
+    let quote = crate::model::lock(map).get(&key).and_then(tob_candidate)?;
+    Some((
+        quote.bid,
+        quote.ask,
+        LevelsSource::Quote {
+            as_of_ns: quote.as_of_ns,
+        },
+    ))
+}
+
+/// Adds `source`, and for a quote `as_of_ns`, to a best-levels answer.
+fn tag_source(v: &mut Value, source: LevelsSource) {
+    match source {
+        LevelsSource::Book => v["source"] = json!("book"),
+        LevelsSource::Quote { as_of_ns } => {
+            v["source"] = json!("quote");
+            v["as_of_ns"] = json!(as_of_ns.to_string());
+        }
+    }
+}
+
 /// The best (price, size) per side, derived from whichever full-state book snapshot this identity
 /// actually has — the market-by-price accumulator's current top level if one exists (regardless of
 /// `baselined()`: reporting only the touched top level as "the best available" does not claim
 /// completeness the way replaying the whole book as a re-baseline would), else the market-by-order
-/// depth snapshot's top level. `None` for a side/venue with neither — there is no persisted "last
-/// quote" cache in this crate to fall back to (top-of-book quotes are not replayed anywhere; see
-/// `sinks/ws.rs`), so an honest answer here is "not available", not a guess.
+/// depth snapshot's top level. `None` for a side/venue with neither; [`book_or_quote`] then tries
+/// the quote map.
 ///
 /// Reads `BookAccumulator::{best_bid, best_ask}` rather than `to_book()` — this only ever needs the
 /// inside market, and materializing the market's entire level set (plus a `to_book` timestamp
@@ -940,9 +1000,9 @@ type ProductKey = (u16, Arc<str>, u8, u32);
 
 fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
     // Same discipline as `products_list`: snapshot the catalog and drop the `instruments` lock
-    // before looping — `best_levels` takes `books`/`depth` per instrument, and materializing a
-    // `NormalizedInstrument` clone up front is far cheaper than holding the catalog lock across
-    // every instrument's book/depth lookup.
+    // before looping — `book_or_quote` takes `books`/`depth`/the quote map per instrument, and
+    // materializing a `NormalizedInstrument` clone up front is far cheaper than holding the catalog
+    // lock across every instrument's lookups.
     let instruments: Vec<NormalizedInstrument> = {
         let map = crate::model::lock(&state.instruments);
         map.values().cloned().collect()
@@ -1020,18 +1080,19 @@ fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
             .copied()
             .unwrap_or(1)
             > 1;
-        let (bid, ask) = best_levels(state, i, depth_ambiguous);
-        if bid.is_none() && ask.is_none() {
-            // Nothing derivable for this identity (no persisted quote cache — see `best_levels`'s
-            // docs); omitting it is honest, a zeroed/fabricated level would not be.
+        let Some((bid, ask, source)) = book_or_quote(state, i, depth_ambiguous) else {
+            // Nothing derivable for this identity; omitting it is honest, a zeroed/fabricated level
+            // would not be.
             continue;
-        }
+        };
         let product_id = products::ProductId::of(i).render(ambiguous);
-        pricebooks.push(json!({
+        let mut pricebook = json!({
             "product_id": product_id,
             "bids": bid.map(|(p, s)| vec![json!([decimal_string(p, i.price_exponent), decimal_string(s, i.qty_exponent)])]).unwrap_or_default(),
             "asks": ask.map(|(p, s)| vec![json!([decimal_string(p, i.price_exponent), decimal_string(s, i.qty_exponent)])]).unwrap_or_default(),
-        }));
+        });
+        tag_source(&mut pricebook, source);
+        pricebooks.push(pricebook);
     }
     ok_json(json!({ "pricebooks": pricebooks }))
 }
@@ -1513,7 +1574,7 @@ fn json_status(status: &'static str, v: Value) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, net::Ipv4Addr};
 
     use tokio::net::TcpListener;
 
@@ -1521,7 +1582,7 @@ mod tests {
     use crate::{
         history::{Print, Store},
         ingest::{
-            arbiter::{Arbiter, SharedArbiter},
+            arbiter::{Arbiter, SharedArbiter, Transport},
             codec_mbp,
             feeds::{ArbitrationMode, FeedKind, FeedPorts, FeedPublisher},
             health::FeedHealth,
@@ -1529,7 +1590,8 @@ mod tests {
             receiver::{DatagramCtx, DatagramProcessor, PortRole},
         },
         model::{
-            BookAccumulator, BookAction, BookChange, BookSide, NormalizedBook, NormalizedDepth,
+            BookAccumulator, BookAction, BookChange, BookSide, FeedMessage, NormalizedBook,
+            NormalizedDepth, NormalizedQuote,
         },
     };
 
@@ -1622,6 +1684,30 @@ mod tests {
         filter: Arc<Mutex<ChannelFilter>>,
         enabled: Vec<Feed>,
     ) -> String {
+        spawn_with_quote_map(
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+            filter,
+            enabled,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_with_quote_map(
+        instruments: InstrumentSnapshot,
+        depth: DepthSnapshot,
+        books: BookSnapshot,
+        history: Arc<Mutex<Store>>,
+        health: SharedFeedHealth,
+        filter: Arc<Mutex<ChannelFilter>>,
+        enabled: Vec<Feed>,
+        quote_map: Option<QuoteMap>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1635,6 +1721,7 @@ mod tests {
                 filter,
                 enabled,
                 test_arbiter(),
+                quote_map,
             )
             .await;
         });
@@ -2644,6 +2731,7 @@ mod tests {
             filter,
             enabled,
             arbiter: test_arbiter(),
+            quote_map: None,
         };
         let inst = inst_in("perps", 3, "HUGE", "HUGEBOOK", 9, 1, -4, -2);
 
@@ -2722,6 +2810,7 @@ mod tests {
             filter,
             enabled,
             arbiter: test_arbiter(),
+            quote_map: None,
         };
         let inst = inst_in("perps", 3, "KALSHI", "EMPTYACC", 2, 41, -4, -2);
         assert_eq!(
@@ -2773,6 +2862,7 @@ mod tests {
             filter,
             enabled,
             arbiter: test_arbiter(),
+            quote_map: None,
         };
         for id in [41u32, 42u32] {
             let inst = inst_in("perps", 3, "KALSHI", "COLLIDE", 2, id, -4, -2);
@@ -2784,6 +2874,64 @@ mod tests {
                 best_levels(&state, &inst, ambiguous),
                 (None, None),
                 "instrument {id} must not be handed a depth entry that may be its neighbour's"
+            );
+        }
+    }
+
+    /// The quote map is keyed by identity, so where an ambiguous symbol's `depth` is refused each
+    /// instrument still answers from its own quote.
+    #[test]
+    fn an_ambiguous_symbol_answers_from_its_own_quote_rather_than_the_depth() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        let collide = |id| inst_in("perps", 3, "KALSHI", "COLLIDE", 2, id, -4, -2);
+        for id in [41u32, 42] {
+            instruments
+                .lock()
+                .unwrap()
+                .insert(("KALSHI".into(), "perps".into(), 2u8, id), collide(id));
+        }
+        depth.lock().unwrap().insert(
+            ("KALSHI".into(), "COLLIDE".into()),
+            NormalizedDepth {
+                venue: "KALSHI".into(),
+                source_name: "KALSHI".into(),
+                source_id: 3,
+                symbol: "COLLIDE".into(),
+                bids: vec![[0.61, 100.0]],
+                asks: vec![[0.63, 50.0]],
+                source_ts_ns: 7,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
+        );
+        let state = ApiState {
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+            filter,
+            enabled,
+            arbiter: test_arbiter(),
+            quote_map: Some(quote_map_of(vec![
+                tob_quote(&collide(41), 0.41, 0.43, 41),
+                tob_quote(&collide(42), 0.52, 0.54, 42),
+            ])),
+        };
+        for (id, bid, ask) in [(41u32, 0.41, 0.43), (42, 0.52, 0.54)] {
+            let inst = collide(id);
+            let ambiguous = depth_is_ambiguous(&state, inst.source_id, &inst.symbol);
+            assert!(ambiguous, "fixture sanity: the two entries collide");
+            assert_eq!(
+                book_or_quote(&state, &inst, ambiguous),
+                Some((
+                    Some((bid, 1.0)),
+                    Some((ask, 2.0)),
+                    LevelsSource::Quote {
+                        as_of_ns: u64::from(id)
+                    }
+                )),
             );
         }
     }
@@ -2827,6 +2975,7 @@ mod tests {
             filter,
             enabled,
             arbiter: test_arbiter(),
+            quote_map: None,
         };
         assert!(is_ambiguous(&state, "SHARED", &Arc::from("B")));
         for (inst, bid) in insts {
@@ -2926,6 +3075,7 @@ mod tests {
             filter,
             enabled,
             arbiter: test_arbiter(),
+            quote_map: None,
         };
         let inst = inst_in("perps", 3, "HUGE", "HUGEL3", 9, 1, -4, -2);
 
@@ -3714,6 +3864,293 @@ mod tests {
             .contains("HYPERLIQUID:NOPE"));
     }
 
+    /// A top-of-book quote for `inst`, carrying the identity `TobProcessor` stamps on one.
+    fn tob_quote(
+        inst: &NormalizedInstrument,
+        bid: f64,
+        ask: f64,
+        recv_ts_ns: u64,
+    ) -> NormalizedQuote {
+        NormalizedQuote {
+            venue: inst.venue.clone(),
+            source_name: inst.source_name.clone(),
+            source_id: inst.source_id,
+            symbol: inst.symbol.clone(),
+            bid,
+            ask,
+            bid_size: 1.0,
+            ask_size: 2.0,
+            bid_n: 0,
+            ask_n: 0,
+            source_ts_ns: 0,
+            recv_ts_ns,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+            venue_update_id: 0,
+            wire: Default::default(),
+            channel: inst.channel,
+            instrument_id: inst.instrument_id,
+            category: inst.category.clone(),
+        }
+    }
+
+    /// The map the arbiter's send path writes `quotes` into, so a test reads the key it files under.
+    fn quote_map_of(quotes: Vec<NormalizedQuote>) -> QuoteMap {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut arbiter = Arbiter::new(tx, 8);
+        let map: QuoteMap = Arc::new(Mutex::new(HashMap::new()));
+        arbiter.set_quote_map(map.clone());
+        for q in quotes {
+            arbiter.emit(
+                FeedMessage::Quote(q),
+                Transport::Edge(Ipv4Addr::LOCALHOST.into()),
+                "test",
+            );
+        }
+        map
+    }
+
+    async fn get_ok(url: String) -> Value {
+        let resp = reqwest::get(&url).await.unwrap();
+        assert_eq!(resp.status(), 200, "{url}");
+        resp.json().await.unwrap()
+    }
+
+    /// Binance `BTCUSDT` and `ETHUSDT` (quoting no bid) on a top-of-book feed alone, and Kalshi
+    /// `KXBTCPERP` and Hyperliquid `BTC` with a book and a quote at other prices.
+    async fn spawn_quoted_products(quote_map: bool) -> String {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        let btc = inst_in("spot", 8, "BINANCE", "BTCUSDT", 0, 1, -2, -5);
+        let eth = inst_in("spot", 8, "BINANCE", "ETHUSDT", 0, 2, -2, -4);
+        let kalshi = inst_in("perps", 3, "KALSHI", "KXBTCPERP", 9, 1, -4, -2);
+        let hl = inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5);
+        for i in [&btc, &eth, &kalshi, &hl] {
+            let key = (
+                crate::model::SourceKey::of(i),
+                i.category.clone(),
+                i.channel,
+                i.instrument_id,
+            );
+            instruments.lock().unwrap().insert(key, i.clone());
+        }
+        let mut acc = BookAccumulator::new("KXBTCPERP".into());
+        acc.apply(&book_batch(
+            "KALSHI",
+            "KXBTCPERP",
+            9,
+            1,
+            vec![
+                BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                    order_id: 0,
+                },
+                level_update(BookSide::Bid, 0.61, 10.0),
+                level_update(BookSide::Ask, 0.63, 20.0),
+            ],
+            true,
+        ));
+        books
+            .lock()
+            .unwrap()
+            .insert(("KALSHI".into(), "perps".into(), 9, 1), acc);
+        depth.lock().unwrap().insert(
+            ("HYPERLIQUID".into(), "BTC".into()),
+            NormalizedDepth {
+                venue: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
+                source_id: 1,
+                symbol: "BTC".into(),
+                bids: vec![[100.0, 1.0]],
+                asks: vec![[101.0, 2.0]],
+                source_ts_ns: 1,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
+        );
+        let map = quote_map.then(|| {
+            quote_map_of(vec![
+                tob_quote(&btc, 100.5, 100.6, 1_234),
+                // The decoder zero-fills a side the publisher left out.
+                NormalizedQuote {
+                    bid_size: 0.0,
+                    ..tob_quote(&eth, 0.0, 3.25, 5_678)
+                },
+                tob_quote(&kalshi, 0.5, 0.7, 1),
+                tob_quote(&hl, 90.0, 110.0, 1),
+            ])
+        });
+        spawn_with_quote_map(
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+            filter,
+            enabled,
+            map,
+        )
+        .await
+    }
+
+    /// A top-of-book-only product answers from the quote map, with `as_of_ns`; a product with a
+    /// book answers from it although it has a quote too.
+    #[tokio::test]
+    async fn the_quote_map_answers_a_product_no_book_covers() {
+        let base = spawn_quoted_products(true).await;
+
+        let body = get_ok(format!("{base}/v1/products/BINANCE:BTCUSDT/ticker")).await;
+        assert_eq!(body["best_bid"], "100.50", "{body}");
+        assert_eq!(body["best_ask"], "100.60", "{body}");
+        assert_eq!(body["source"], "quote", "{body}");
+        assert_eq!(body["as_of_ns"], "1234", "{body}");
+        for (id, bid, ask) in [
+            ("KALSHI:KXBTCPERP", "0.6100", "0.6300"),
+            ("HYPERLIQUID:BTC", "100.00", "101.00"),
+        ] {
+            let body = get_ok(format!("{base}/v1/products/{id}/ticker")).await;
+            assert_eq!(body["best_bid"], bid, "{body}");
+            assert_eq!(body["best_ask"], ask, "{body}");
+            assert_eq!(body["source"], "book", "{body}");
+            assert!(body.get("as_of_ns").is_none(), "{body}");
+        }
+
+        let body = get_ok(format!("{base}/v1/best_bid_ask")).await;
+        let pricebooks = body["pricebooks"].as_array().unwrap();
+        let entry = |id: &str| {
+            pricebooks
+                .iter()
+                .find(|p| p["product_id"] == id)
+                .unwrap_or_else(|| panic!("{id} missing: {body}"))
+        };
+        let btc = entry("BINANCE:BTCUSDT");
+        assert_eq!(btc["bids"], json!([["100.50", "1.00000"]]), "{body}");
+        assert_eq!(btc["asks"], json!([["100.60", "2.00000"]]), "{body}");
+        assert_eq!(btc["source"], "quote", "{body}");
+        assert_eq!(btc["as_of_ns"], "1234", "{body}");
+        let eth = entry("BINANCE:ETHUSDT");
+        assert_eq!(
+            eth["bids"],
+            json!([]),
+            "a zero-filled side is no level: {body}"
+        );
+        assert_eq!(eth["asks"], json!([["3.25", "2.0000"]]), "{body}");
+        assert_eq!(eth["as_of_ns"], "5678", "{body}");
+        for (id, bid) in [
+            ("KALSHI:KXBTCPERP", "0.6100"),
+            ("HYPERLIQUID:BTC", "100.00"),
+        ] {
+            assert_eq!(entry(id)["bids"][0][0], bid, "{body}");
+            assert_eq!(entry(id)["source"], "book", "{body}");
+            assert!(entry(id).get("as_of_ns").is_none(), "{body}");
+        }
+    }
+
+    /// With the map off, a book's answer gains only `source`.
+    #[tokio::test]
+    async fn without_the_quote_map_a_top_of_book_only_product_has_no_bid_or_ask() {
+        let base = spawn_quoted_products(false).await;
+
+        let body = get_ok(format!("{base}/v1/products/BINANCE:BTCUSDT/ticker")).await;
+        assert!(
+            body["best_bid"].is_null() && body["best_ask"].is_null(),
+            "{body}"
+        );
+        assert!(body.get("source").is_none(), "{body}");
+        assert!(body.get("as_of_ns").is_none(), "{body}");
+
+        let body = get_ok(format!("{base}/v1/best_bid_ask")).await;
+        let pricebooks = body["pricebooks"].as_array().unwrap();
+        let mut ids: Vec<&str> = pricebooks
+            .iter()
+            .map(|p| p["product_id"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["HYPERLIQUID:BTC", "KALSHI:KXBTCPERP"], "{body}");
+        for p in pricebooks {
+            assert_eq!(p["source"], "book", "{body}");
+            assert!(p.get("as_of_ns").is_none(), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn best_bid_ask_product_ids_filter_covers_top_of_book_products() {
+        let base = spawn_quoted_products(true).await;
+        let body = get_ok(format!(
+            "{base}/v1/best_bid_ask?product_ids=BINANCE:ETHUSDT,HYPERLIQUID:BTC"
+        ))
+        .await;
+        let mut answered: Vec<(&str, &str)> = body["pricebooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["product_id"].as_str().unwrap(),
+                    p["source"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        answered.sort_unstable();
+        assert_eq!(
+            answered,
+            [("BINANCE:ETHUSDT", "quote"), ("HYPERLIQUID:BTC", "book")],
+            "{body}"
+        );
+    }
+
+    /// Binance's two engines both list `BTCUSDT`. With the quote map on, the bare id is still refused
+    /// on both routes, and each suffixed id answers its own engine's quote.
+    #[tokio::test]
+    async fn an_ambiguous_symbol_is_refused_and_each_identity_answers_its_own_quote() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        let perp = inst_in("usdsm", 6, "BINANCE", "BTCUSDT", 0, 1, -2, -3);
+        let spot = inst_in("spot", 8, "BINANCE", "BTCUSDT", 0, 2, -2, -5);
+        for i in [&perp, &spot] {
+            let key = (
+                crate::model::SourceKey::of(i),
+                i.category.clone(),
+                i.channel,
+                i.instrument_id,
+            );
+            instruments.lock().unwrap().insert(key, i.clone());
+        }
+        let map = quote_map_of(vec![
+            tob_quote(&perp, 100.1, 100.2, 6),
+            tob_quote(&spot, 100.3, 100.4, 8),
+        ]);
+        let base = spawn_with_quote_map(
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+            filter,
+            enabled,
+            Some(map),
+        )
+        .await;
+
+        for path in [
+            "products/BINANCE:BTCUSDT/ticker",
+            "best_bid_ask?product_ids=BINANCE:BTCUSDT",
+        ] {
+            let resp = reqwest::get(format!("{base}/v1/{path}")).await.unwrap();
+            assert_eq!(resp.status(), 409, "{path}");
+            let body: Value = resp.json().await.unwrap();
+            assert_eq!(body["error"], "ambiguous_product", "{path}: {body}");
+        }
+        for (suffix, bid, as_of_ns) in [("%230.1", "100.10", "6"), ("%230.2", "100.30", "8")] {
+            let body = get_ok(format!("{base}/v1/products/BINANCE:BTCUSDT{suffix}/ticker")).await;
+            assert_eq!(body["best_bid"], bid, "{body}");
+            assert_eq!(body["source"], "quote", "{body}");
+            assert_eq!(body["as_of_ns"], as_of_ns, "{body}");
+        }
+    }
+
     #[tokio::test]
     async fn status_reports_venue_health_and_history_counters() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
@@ -4035,6 +4472,7 @@ mod tests {
             filter,
             enabled,
             arbiter: test_arbiter(),
+            quote_map: None,
         };
         for method in ["POST", "PUT", "PATCH", "DELETE"] {
             let req = Request {
@@ -4696,6 +5134,7 @@ mod tests {
             filter,
             enabled,
             arbiter: test_arbiter(),
+            quote_map: None,
         });
 
         let instruments_guard = instruments.lock().unwrap();
@@ -4764,6 +5203,7 @@ mod tests {
             filter,
             enabled,
             arbiter,
+            quote_map: None,
         };
         let (status, _, body) = race(&state);
         assert_eq!(status, "200 OK");
@@ -4818,6 +5258,7 @@ mod tests {
             filter,
             enabled,
             arbiter: test_arbiter(),
+            quote_map: None,
         };
         let v: Value = serde_json::from_slice(&race(&state).2).unwrap();
         assert_eq!(v["venues"], json!([]));
