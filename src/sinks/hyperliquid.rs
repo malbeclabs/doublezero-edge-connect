@@ -44,8 +44,8 @@ use crate::{
 
 use crate::ingest::sources::{source_name, HYPERLIQUID_SOURCE_ID};
 
-/// Every Source ID named like Hyperliquid's own, as Hyperliquid serves its builder DEXes beside its
-/// perps; their `coin`s (our `symbol`) carry a `dex:` prefix, so the two do not collide.
+/// Every Source ID named like Hyperliquid's own: it serves builder DEXes (`dex:` coins) beside its
+/// perps. One market under two such IDs at once would reach `bbo` and `trades` twice.
 fn renders(source_id: u16) -> bool {
     let hyperliquid = source_name(HYPERLIQUID_SOURCE_ID);
     hyperliquid.is_some() && source_name(source_id) == hyperliquid
