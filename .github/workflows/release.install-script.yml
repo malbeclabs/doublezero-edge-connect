@@ -23,7 +23,7 @@ permissions: {}
 
 env:
   AWS_REGION: us-east-1
-  DEPLOY_ROLE: arn:aws:iam::967501763874:role/github-get-doublezero-edge-connect
+  AWS_ROLE_ARN: arn:aws:iam::967501763874:role/github-get-doublezero-edge-connect
   BUCKET: doublezero-install-967501763874
   DISTRIBUTION_ID: E3RHVENYEH05TJ
 
@@ -38,10 +38,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
-        with:
-          role-to-assume: ${{ env.DEPLOY_ROLE }}
-          aws-region: ${{ env.AWS_REGION }}
+      # The org's action allowlist excludes aws-actions/configure-aws-credentials. The AWS CLI
+      # assumes AWS_ROLE_ARN from this token file itself.
+      - name: Fetch the OIDC token for AWS
+        run: |
+          set -o pipefail
+          curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -er .value > "$RUNNER_TEMP/aws-oidc-token"
+          echo "AWS_WEB_IDENTITY_TOKEN_FILE=$RUNNER_TEMP/aws-oidc-token" >> "$GITHUB_ENV"
 
       - name: Upload connect scripts
         run: |
