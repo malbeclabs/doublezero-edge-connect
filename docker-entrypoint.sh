@@ -16,7 +16,10 @@ BASE_ENTRYPOINT="${BASE_ENTRYPOINT:-/usr/local/bin/docker-entrypoint.sh}"
 DZ_SOCK="${DZ_SOCK:-/run/doublezerod/doublezerod.sock}"
 
 # The previous run's socket fails doublezerod's bind but passes both waits; no daemon is up yet.
-rm -f "$DZ_SOCK"
+if [ -e "$DZ_SOCK" ]; then
+    echo "[bridge-entrypoint] removing existing $DZ_SOCK before starting doublezerod" >&2
+    rm -f "$DZ_SOCK"
+fi
 
 # Run the base entrypoint with no args: it starts doublezerod, writes the CLI
 # config, prints `doublezero status`, then `wait`s on the daemon (keeping it up).

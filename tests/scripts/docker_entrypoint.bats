@@ -40,4 +40,5 @@ EOF
   local out="$BATS_TEST_TMPDIR/out" rc=0
   PATH="$STUB_BIN:$PATH" timeout 30 bash "$REPO_ROOT/docker-entrypoint.sh" >"$out" 2>&1 3>&- || rc=$?
   [ -e "$BRIDGE_RAN" ] || { echo "# the bridge never reached a live daemon (exit $rc):"; sed 's/^/#   /' "$out"; false; }
+  grep -q "removing existing $DZ_SOCK" "$out" || { echo "# the removal was not logged:"; sed 's/^/#   /' "$out"; false; }
 }
