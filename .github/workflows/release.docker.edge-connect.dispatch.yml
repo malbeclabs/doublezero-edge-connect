@@ -69,7 +69,7 @@ jobs:
   # like the poll's rebuild — a base move is not an edge-connect release.
   rebuild:
     needs: validate
-    if: needs.validate.outputs.ok == 'true' && github.ref == 'refs/heads/main'
+    if: needs.validate.outputs.ok == 'true'
     permissions:
       contents: read
       packages: write

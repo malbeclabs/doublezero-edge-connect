@@ -10,7 +10,8 @@ self-hosted-runner:
 # Delete this once an actionlint release knows the key.
 #
 # It also predates the `$/` self-repository syntax (July 2026), which zizmor requires
-# for an in-repo reusable workflow. The second pattern matches only `$/` calls.
+# for an in-repo reusable workflow. The second pattern matches only `$/` calls, and
+# actionlint then checks none of their `with:` against the called workflow's inputs.
 paths:
   .github/workflows/**:
     ignore:

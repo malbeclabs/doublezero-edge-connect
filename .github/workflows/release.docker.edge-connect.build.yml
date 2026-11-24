@@ -1,8 +1,10 @@
 name: release.docker.edge-connect.build
 
 # Reusable build of ONE doublezero-edge-connect environment variant. Called by
-# release.docker.edge-connect.yml (releases / main / dispatch) and
-# release.docker.edge-connect.poll.yml (base poll).
+# release.docker.edge-connect.yml (releases / main / dispatch),
+# release.docker.edge-connect.dispatch.yml (base published) and
+# release.docker.edge-connect.poll.yml (base poll). They call it through `$/`,
+# which actionlint does not resolve, so check them by hand when an input changes.
 # Each variant layers the same edge-connect binary on the matching doublezero base
 # image; only the base differs across testnet / mainnet-beta / devnet. Keeping the
 # base/tag logic here is what keeps publish and poll from drifting.
@@ -38,6 +40,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Only main publishes, whichever workflow called us.
+    if: ${{ !inputs.push || github.ref == 'refs/heads/main' }}
     # Serialize everything that pushes one variant's tags, whichever workflow called
     # us: the publish matrix (push to main, manual dispatch, versioned release), the
     # base-published dispatch and the poll's rebuild all write the same moving tag
@@ -194,10 +198,17 @@ jobs:
           if [ -n "$VERSION" ]; then
             safe="$(printf '%s' "$VERSION" | tr '~:' '--')"
             if [ "$VARIANT" = 'devnet' ]; then
-              tags="${tags}"$'\n'"${IMAGE}:${safe}"
+              pinned="${IMAGE}:${safe}"
             else
-              tags="${tags}"$'\n'"${IMAGE}:${MOVING}-${safe}"
+              pinned="${IMAGE}:${MOVING}-${safe}"
             fi
+            # A version names one commit: refuse to move it, but let a re-run of that commit through.
+            if published="$(docker buildx imagetools inspect --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}' "$pinned" 2>/dev/null)" \
+              && [ "$published" != "$SHA" ]; then
+              echo "::error::$pinned is already published from ${published:-another commit}"
+              exit 1
+            fi
+            tags="${tags}"$'\n'"${pinned}"
           fi
           {
             echo 'tags<<EOF'
@@ -213,6 +224,8 @@ jobs:
           platforms: linux/amd64
           provenance: false
           tags: ${{ steps.tags.outputs.tags }}
+          # A pushed image never restores layers from the Actions cache.
+          no-cache: ${{ inputs.push }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |

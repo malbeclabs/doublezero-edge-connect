@@ -96,7 +96,7 @@ jobs:
   # an edge-connect release, so no pinned version tag).
   rebuild:
     needs: check
-    if: needs.check.outputs.stale != '[]' && github.ref == 'refs/heads/main'
+    if: needs.check.outputs.stale != '[]'
     permissions:
       contents: read
       packages: write
