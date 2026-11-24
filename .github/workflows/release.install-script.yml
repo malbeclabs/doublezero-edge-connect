@@ -1,14 +1,9 @@
 name: release.install-script
 
-# Publishes scripts/connect*.sh to the CDN behind https://get.doublezero.xyz/connect
-# (and /connect-testnet, /connect-devnet). Uploads to the SAME doublezero-install S3
-# bucket + CloudFront distribution that serves the doublezero installer (managed in
-# the doublezero infra repo), under the connect* keys. Auth is GitHub OIDC into the
-# main-only deploy role (no static keys).
-#
-# PREREQUISITE: the deploy role's OIDC trust policy must be extended to also trust
-# this repo (repo:malbeclabs/doublezero-edge-connect:*); until then the
-# configure-aws-credentials step fails. See the design doc / infra runbook.
+# Publishes scripts/connect*.sh and the shred-proxy installer to the CDN behind
+# https://get.doublezero.xyz/connect (and /connect-testnet, /connect-devnet, /shred-proxy).
+# Auth is GitHub OIDC into a role that trusts only this workflow on main, under this
+# repo's custom OIDC subject template. Infra: malbeclabs/infra's install-script-hosting.md.
 #
 # The feed-registry document under the feeds/ keys of the same bucket is published by
 # malbeclabs/infra's feed-registry aggregator — a different artifact with its own publisher,
@@ -24,26 +19,24 @@ on:
       - ".github/workflows/release.install-script.yml"
   workflow_dispatch:
 
-permissions:
-  id-token: write # assume the AWS deploy role via OIDC
-  contents: read
+permissions: {}
 
 env:
   AWS_REGION: us-east-1
-  BUCKET: doublezero-install
-  # Account-scoped infra (deploy-role ARN incl. the AWS account ID, and the CloudFront
-  # distribution id) lives in repo Actions Variables so it is not baked into a public
-  # workflow. Set both under Settings -> Secrets and variables -> Actions -> Variables:
-  #   DEPLOY_ROLE     = arn:aws:iam::<account-id>:role/github-doublezero-install-deploy
-  #   DISTRIBUTION_ID = <cloudfront-distribution-id>
-  DEPLOY_ROLE: ${{ vars.DEPLOY_ROLE }}
-  DISTRIBUTION_ID: ${{ vars.DISTRIBUTION_ID }}
+  DEPLOY_ROLE: arn:aws:iam::967501763874:role/github-get-doublezero-edge-connect
+  BUCKET: doublezero-install-967501763874
+  DISTRIBUTION_ID: E3RHVENYEH05TJ
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write # assume the AWS deploy role via OIDC
+      contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
         with:

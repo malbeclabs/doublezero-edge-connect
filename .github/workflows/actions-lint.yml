@@ -51,7 +51,6 @@ jobs:
             release.docker.edge-connect.poll.yml
             release.docker.edge-connect.yml
             release.edge-cli.yml
-            release.install-script.yml
             release.shred-proxy.yml
           )
           excluded=()
