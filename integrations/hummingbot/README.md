@@ -52,7 +52,9 @@ class DoubleZeroBook(StrategyV2Base):
         self.logger().info(f"BTC-USD mid {mid}, mark {mark}")
 ```
 
-Hummingbot imports a script before it builds the script's connectors, which is what lets the call take effect. It applies to every connector of that type in the process, including those that `MarketDataProvider` and paper trading build. Hummingbot reloads the script on every `start`; calling `use_doublezero` again replaces the URL.
+Hummingbot imports a script before it builds the script's connectors, which is what lets the call take effect. Hummingbot reloads the script on every `start`; calling `use_doublezero` again replaces the URL.
+
+**The replacement is process-wide and lasts until Hummingbot exits.** Every connector of that type reads edge-connect from then on, including those that `MarketDataProvider` and paper trading build, and those of strategies that never call `use_doublezero`, V1 strategies among them. The interactive client imports every script in `scripts/` when it starts, so there, one script that calls `use_doublezero` applies it whichever strategy you run. Run strategies that should read the venue's own feed from an install without such a script.
 
 A live connector needs its keys as usual. To try the adapter without keys, add `hyperliquid_perpetual` to `paper_trade.paper_trade_exchanges` in `conf/conf_client.yml` and trade `hyperliquid_perpetual_paper_trade`: its book comes from edge-connect, but paper trading has no funding.
 
@@ -60,23 +62,23 @@ A live connector needs its keys as usual. To try the adapter without keys, add `
 
 - Hummingbot on the bridge's machine, outside Docker or in a container on the host network (Hummingbot's own `docker-compose.yml` runs it that way): `ws://127.0.0.1:8081`.
 - Hummingbot in Docker Desktop on a Mac, with the Mac app's bridge: `ws://host.docker.internal:8081`.
-- A bridge on another host: `ws://<host>:8081`, with the bridge started with `WS_BIND=0.0.0.0:8081`. It has no TLS or authentication, so firewall the port.
+- A bridge on another host: `ws://<host>:8081`, with the bridge started with `WS_BIND=0.0.0.0:8081`. It has no TLS or authentication, so firewall the port. Across a network you do not trust, anyone on the path can rewrite the books you quote against: put the bridge behind a TLS reverse proxy and use `wss://<host>` instead.
 
 **Controllers.** A V2 controller can call `use_doublezero` at its module's top level instead: Hummingbot imports a script's controllers while it loads their configs, before it builds any connector. That holds while the script's `init_markets` calls `load_controller_configs`, as `StrategyV2Base`'s does and `v2_with_controllers.py` inherits; a script that overrides it without that call must call `use_doublezero` itself.
 
-**V1 strategies cannot use it.** They load no user code before their connectors are built.
+**V1 strategies cannot call it**, since they load no user code before their connectors are built, though the scope above still reaches them.
 
 ## What to expect
 
 - A pair's first book comes from edge-connect's replay rather than the venue's REST API, and edge-connect's later corrections arrive as ordinary book updates. Hummingbot sees a book only at the end of each logical event, never mid-event.
-- A pair edge-connect does not carry stops the connector's startup after 60 seconds with an error naming it, and so does a symbol two edge-connect markets share. Until then, a warning every 30 seconds says what the pair is waiting for.
+- A pair edge-connect does not carry stops the connector's startup with an error naming it, once edge-connect's catalog has lacked it for 60 seconds. So does a symbol two edge-connect markets share, and a pair whose subscription edge-connect refuses. Until then, a warning every 30 seconds says what the pair is waiting for. A pair added at runtime that is refused this way is removed from the connector again.
 - When edge-connect is unreachable, the adapter reconnects with back-off, and the book holds its last state meanwhile, as it does when the venue's own feed drops.
-- Each pair takes four of the 256 subscriptions edge-connect allows a client, plus one per connector.
+- Each pair takes two of the 256 subscriptions edge-connect allows a client by default, plus one per connector, so a connector carries up to 127 pairs.
 - Testnet connectors keep the venue's feed, since edge-connect carries mainnet.
 
 ## Tested Hummingbot versions
 
 CI runs the tests and an end-to-end check in each supported release's published image. Today that is Hummingbot v2.18.0 (`hummingbot/hummingbot:version-2.18.0`), listed in the `image` matrix of [`.github/workflows/hummingbot.yml`](../../.github/workflows/hummingbot.yml).
 
-- `tests/` covers the book assembler against PROTOCOL.md's rules, and the data source against a stub edge-connect driving Hummingbot's real order-book tracker. Run them from this directory against a Hummingbot checkout: `PYTHONPATH=<hummingbot> python -m pytest`.
+- `tests/` covers the book assembler against PROTOCOL.md's rules, and the data source against a stub edge-connect driving Hummingbot's real order-book tracker. Run them from this directory against a Hummingbot checkout compiled with `./compile`, as `PYTHONPATH=<hummingbot> python -m pytest`, or in an image as CI does: `docker run --rm -v "$PWD:/work:ro" -w /work -e PYTHONPATH=/home/hummingbot hummingbot/hummingbot:version-2.18.0 python -m pytest -p no:cacheprovider`.
 - `e2e/run.sh <image>` runs a V2 script in a Hummingbot image against `e2e/stub.py`, which plays a synthetic edge-connect session and Hyperliquid's public API. It checks that the books move, that trades carry distinct IDs, that funding changes after startup, and that neither edge-connect nor Hyperliquid was asked for anything it does not serve.

@@ -36,7 +36,7 @@ jobs:
         run: docker pull "$IMAGE"
       - name: Unit tests
         run: |
-          docker run --rm -v "$PWD/integrations/hummingbot:/work" -w /work \
+          docker run --rm -v "$PWD/integrations/hummingbot:/work:ro" -w /work \
             -e PYTHONPATH=/home/hummingbot -e PYTHONDONTWRITEBYTECODE=1 \
             "$IMAGE" python -m pytest -p no:cacheprovider
       - name: End to end
