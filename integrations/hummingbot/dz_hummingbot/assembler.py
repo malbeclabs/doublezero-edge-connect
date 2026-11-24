@@ -21,9 +21,8 @@ def market_key(msg: dict) -> MarketKey:
 
 @dataclass
 class Event:
-    """One logical book event's net effect on the published levels. A size of 0 removes the level."""
+    """One logical book event's effect on the published levels. A size of 0 removes the level."""
 
-    update_id: int
     bids: List[Level]
     asks: List[Level]
     source_ts_ns: int
@@ -41,7 +40,6 @@ class _Market:
     touched: Dict[str, Set[float]] = field(default_factory=lambda: {BID: set(), ASK: set()})
     cleared: Set[str] = field(default_factory=set)
     complete: bool = False
-    update_id: int = 0
     source_ts_ns: int = 0
 
     def clear(self, side: str) -> None:
@@ -80,20 +78,18 @@ class _Market:
         return self.levels[side].get(price, 0.0) + sum(self.level_orders.get((side, price), {}).values())
 
     def close(self) -> Optional[Event]:
-        if self.cleared == set(SIDES):
+        rebaselined, self.cleared = self.cleared, set()
+        if rebaselined == set(SIDES):
             self.complete = True
-        self.cleared.clear()
-        bids, asks = self._publish(BID), self._publish(ASK)
-        if not bids and not asks:
-            return None
-        self.update_id += 1
-        return Event(self.update_id, bids, asks, self.source_ts_ns)
+        bids, asks = self._publish(BID, BID in rebaselined), self._publish(ASK, ASK in rebaselined)
+        return Event(bids, asks, self.source_ts_ns) if bids or asks else None
 
-    def _publish(self, side: str) -> List[Level]:
+    def _publish(self, side: str, rebaselined: bool) -> List[Level]:
+        # A rebuilt side is sent whole, so it also restores a level the consumer dropped on its own.
         published, out = self.published[side], []
         for price in self.touched[side]:
             size = self.size(side, price)
-            if size != published.get(price, 0.0):
+            if size != published.get(price, 0.0) or (rebaselined and size > 0):
                 out.append((price, size))
                 if size > 0:
                     published[price] = size
@@ -104,20 +100,23 @@ class _Market:
 
 
 class BookAssembler:
-    """Turns edge-connect book batches into net level changes, one per closed logical event.
+    """Turns edge-connect book batches into level changes, one per closed logical event.
 
     Changes are applied as they arrive but published only at `last: true`, so a consumer never sees
     an event's intermediate (possibly crossed) book. A `clear` empties its side and the rebuild
-    that follows is published as the difference from what the consumer already holds, which makes
-    a re-baseline an ordinary event rather than a snapshot.
+    that follows is published as changes to what the consumer already holds, which makes a
+    re-baseline an ordinary event rather than a snapshot.
     """
 
     def __init__(self) -> None:
         self._markets: Dict[MarketKey, _Market] = {}
 
     def apply(self, msg: dict) -> Optional[Event]:
-        """Applies one `book`/`order_book` message; returns the net change if it closes an event."""
-        market = self._markets.setdefault(market_key(msg), _Market())
+        """Applies one `book`/`order_book` message; returns the changes if it closes an event."""
+        key = market_key(msg)
+        market = self._markets.get(key)
+        if market is None:
+            market = self._markets[key] = _Market()
         for change in msg["changes"]:
             action, side = change["action"], change["side"]
             if action == "clear":
@@ -137,12 +136,17 @@ class BookAssembler:
         market = self._markets.get(key)
         return market is not None and market.complete
 
-    def snapshot(self, key: MarketKey) -> Tuple[int, List[Level], List[Level]]:
-        """The published book, best first, and the update id of the event it stands at."""
-        market = self._markets[key]
-        bids = sorted(market.published[BID].items(), reverse=True)
-        asks = sorted(market.published[ASK].items())
-        return market.update_id, bids, asks
+    def snapshot(self, key: MarketKey) -> Tuple[List[Level], List[Level]]:
+        """The published book, best first."""
+        published = self._markets[key].published
+        return sorted(published[BID].items(), reverse=True), sorted(published[ASK].items())
+
+    def replace(self, old: MarketKey, new: MarketKey) -> Tuple[List[Level], List[Level]]:
+        """The changes that turn `old`'s published book into `new`'s; `old` is forgotten."""
+        before, after = self._markets.pop(old).published, self._markets[new].published
+        bids, asks = ([(price, after[side].get(price, 0.0)) for price in before[side].keys() | after[side].keys()]
+                      for side in SIDES)
+        return bids, asks
 
     def forget(self, key: MarketKey) -> None:
         self._markets.pop(key, None)

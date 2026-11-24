@@ -1,4 +1,6 @@
 import asyncio
+import socket
+import time
 import unittest
 from decimal import Decimal
 from unittest.mock import patch
@@ -46,10 +48,13 @@ def trade(symbol, trade_id, source_id=1):
 
 BTC_BOOK = order_book("BTC", [CLEAR, order("bid", 100.0, 1.0, 1), order("bid", 100.0, 2.0, 2),
                               order("bid", 99.0, 5.0, 3), order("ask", 101.0, 1.5, 4)])
+ETH_BOOK = order_book("ETH", [CLEAR, order("bid", 30.0, 1.0, 1), order("ask", 31.0, 2.0, 2)], instrument_id=2)
 
 
 class FakeConnector:
     async def exchange_symbol_associated_to_pair(self, trading_pair):
+        if trading_pair.startswith("NONE"):
+            raise KeyError(trading_pair)
         return trading_pair.split("-")[0]
 
 
@@ -92,14 +97,21 @@ def levels(entries):
     return sorted((row.price, row.amount) for row in entries)
 
 
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 class DataSourceTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.stub = StubEdgeConnect([instrument("BTC"), BTC_BOOK])
+        self.stub = StubEdgeConnect([instrument("BTC"), instrument("ETH", instrument_id=2), BTC_BOOK, ETH_BOOK])
         await self.stub.start()
         self.venue = FakeVenue()
         self.pairs = ["BTC-USD"]
         self.tracker = None
         self.tasks = []
+        self.cleanups = []
         patcher = patch.object(OrderBookTracker, "_sleep", staticmethod(lambda delay: asyncio.sleep(0)))
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -110,11 +122,13 @@ class DataSourceTest(unittest.IsolatedAsyncioTestCase):
         for task in self.tasks:
             task.cancel()
         await self.stub.stop()
+        for stub in self.cleanups:
+            await stub.stop()
         await ConnectionsFactory().close()
 
-    def data_source(self, cls=DoubleZeroOrderBookDataSource, **kwargs):
+    def data_source(self, cls=DoubleZeroOrderBookDataSource, url=None, **kwargs):
         factory = WebAssistantsFactory(throttler=AsyncThrottler(rate_limits=[]))
-        return cls(self.pairs, FakeConnector(), self.venue, self.stub.url, VENUE, factory, **kwargs)
+        return cls(self.pairs, FakeConnector(), self.venue, url or self.stub.url, VENUE, factory, **kwargs)
 
     async def start_tracker(self, ds):
         self.tracker = OrderBookTracker(data_source=ds, trading_pairs=self.pairs)
@@ -151,6 +165,16 @@ class DataSourceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(levels(book.ask_entries()), [(101.0, 1.5)])
         self.assertEqual(self.tracker.metrics.total_snapshots_processed, 0)
 
+    async def test_a_rebaseline_restores_a_level_hummingbot_truncated(self):
+        book = await self.start_tracker(self.data_source())
+
+        # An ask crossing the 100 bid: Hummingbot drops the older side, which edge-connect still holds.
+        await self.stub.push(order_book("BTC", [order("ask", 99.5, 1.0, 6)]))
+        await until(lambda: levels(book.bid_entries()) == [(99.0, 5.0)])
+        await self.stub.push(order_book("BTC", [order("ask", 99.5, 0, 6)]), BTC_BOOK)
+
+        await until(lambda: levels(book.bid_entries()) == [(99.0, 5.0), (100.0, 3.0)])
+
     async def test_an_event_is_applied_whole_at_last(self):
         book = await self.start_tracker(self.data_source())
 
@@ -160,16 +184,12 @@ class DataSourceTest(unittest.IsolatedAsyncioTestCase):
         await until(lambda: levels(book.ask_entries()) == [(100.5, 2.0), (101.0, 1.5)])
 
         self.assertEqual(levels(book.bid_entries()), [(99.0, 5.0), (100.0, 3.0)])
-        self.assertEqual(self.tracker.metrics.total_diffs_processed, 1)
 
-    async def test_subscribes_by_source_name_symbol_and_type(self):
+    async def test_subscribes_to_each_pairs_book_and_prints_by_name(self):
         await self.start_tracker(self.data_source())
 
-        await until(lambda: len(self.stub.received) == 5)
         self.assertEqual([frame["subscription"] for frame in self.stub.received], [
             {"source_name": VENUE, "type": "status"},
-            {"source_name": VENUE, "symbol": "BTC", "type": "instrument"},
-            {"source_name": VENUE, "symbol": "BTC", "type": "book"},
             {"source_name": VENUE, "symbol": "BTC", "type": "order_book"},
             {"source_name": VENUE, "symbol": "BTC", "type": "trade"},
         ])
@@ -184,10 +204,21 @@ class DataSourceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(levels(book.bid_entries()), [])
         self.assertEqual(self.stub.connections, 2)
 
+    async def test_a_market_renumbered_across_a_reconnect_is_followed(self):
+        book = await self.start_tracker(self.data_source())
+
+        self.stub.catalog = [instrument("BTC", instrument_id=9),
+                             order_book("BTC", [CLEAR, order("bid", 97.0, 1.0, 1)], instrument_id=9)]
+        await self.stub.drop()
+        await until(lambda: levels(book.bid_entries()) == [(97.0, 1.0)])
+
+        self.assertEqual(levels(book.ask_entries()), [])
+        await self.stub.push(order_book("BTC", [order("ask", 98.0, 2.0, 2)], instrument_id=9))
+        await until(lambda: levels(book.ask_entries()) == [(98.0, 2.0)])
+
     async def test_other_venues_and_symbols_are_ignored(self):
-        self.stub.catalog.append(dict(BTC_BOOK, source_name="PHOENIX", venue="PHOENIX", instrument_id=2,
+        self.stub.catalog.append(dict(BTC_BOOK, source_name="PHOENIX", venue="PHOENIX", instrument_id=3,
                                       changes=[CLEAR, order("bid", 1.0, 1.0, 1)]))
-        self.stub.catalog.append(order_book("ETH", [CLEAR, order("bid", 2.0, 1.0, 1)], instrument_id=3))
         book = await self.start_tracker(self.data_source())
 
         self.assertEqual(levels(book.bid_entries()), [(99.0, 5.0), (100.0, 3.0)])
@@ -197,17 +228,70 @@ class DataSourceTest(unittest.IsolatedAsyncioTestCase):
         self.listen(ds)
 
         with patch.object(data_source, "NOT_CARRIED_AFTER_SECONDS", 0):
-            with self.assertRaisesRegex(ValueError, "no HYPERLIQUID market named 'ETH'.*ETH-USD"):
-                await ds._order_book_snapshot("ETH-USD")
+            with self.assertRaisesRegex(ValueError, "no HYPERLIQUID market named 'SOL'.*SOL-USD"):
+                await ds._order_book_snapshot("SOL-USD")
+
+    async def test_the_not_carried_grace_runs_from_the_catalog_not_the_request(self):
+        port = free_port()
+        ds = self.data_source(url=f"ws://127.0.0.1:{port}/")
+        self.listen(ds)
+        with patch.object(data_source, "NOT_CARRIED_AFTER_SECONDS", 1.0):
+            request = asyncio.ensure_future(ds._order_book_snapshot("SOL-USD"))
+            await asyncio.sleep(1.5)
+            late = StubEdgeConnect(self.stub.catalog)
+            await late.start(port)
+            self.cleanups.append(late)
+            await until(lambda: ds._catalog_read_at is not None, timeout=10)
+            self.assertFalse(request.done())
+
+            with self.assertRaisesRegex(ValueError, "no HYPERLIQUID market named 'SOL'"):
+                await request
+            self.assertGreaterEqual(time.monotonic() - ds._catalog_read_at, 1.0)
 
     async def test_a_symbol_shared_by_two_markets_is_refused(self):
         self.stub.catalog.append(order_book("BTC", [CLEAR, order("bid", 1.0, 1.0, 1)], source_id=7))
         ds = self.data_source()
         self.listen(ds)
 
-        await until(lambda: len(ds._markets.get("BTC", ())) == 2)
         with self.assertRaisesRegex(ValueError, "2 edge-connect HYPERLIQUID markets share the symbol 'BTC'"):
             await ds._order_book_snapshot("BTC-USD")
+
+    async def test_a_pair_past_the_subscription_cap_is_refused_by_name(self):
+        self.stub.max_subscriptions = 2
+        ds = self.data_source()
+        self.listen(ds)
+
+        with self.assertRaisesRegex(ValueError, "refused BTC-USD: max subscriptions reached"):
+            await ds._order_book_snapshot("BTC-USD")
+
+    async def test_a_pair_can_be_added_removed_and_added_again(self):
+        ds = self.data_source()
+        await self.start_tracker(ds)
+
+        for _ in range(2):
+            self.assertTrue(await self.tracker.add_trading_pair("ETH-USD"))
+            self.assertEqual(levels(self.tracker.order_books["ETH-USD"].ask_entries()), [(31.0, 2.0)])
+            self.assertTrue(await self.tracker.remove_trading_pair("ETH-USD"))
+
+        self.assertEqual(self.pairs, ["BTC-USD"])
+        self.assertIn({"source_name": VENUE, "symbol": "ETH", "type": "order_book"},
+                      [frame["subscription"] for frame in self.stub.received if frame["method"] == "unsubscribe"])
+
+    async def test_a_refused_pair_added_later_leaves_the_connector_so_a_restart_still_starts(self):
+        ds = self.data_source()
+        book = await self.start_tracker(ds)
+
+        with patch.object(data_source, "NOT_CARRIED_AFTER_SECONDS", 0):
+            self.assertFalse(await self.tracker.add_trading_pair("SOL-USD"))
+        self.assertFalse(await self.tracker.add_trading_pair("NONE-USD"))
+        self.assertEqual(self.pairs, ["BTC-USD"])
+
+        self.tracker.stop()
+        self.tracker.start()
+        await until(lambda: self.tracker.ready)
+        book = self.tracker.order_books["BTC-USD"]
+        await self.stub.push(trade("BTC", 1))
+        await until(lambda: book.last_trade_price == 100.5)
 
     async def test_trades_from_another_source_id_are_dropped(self):
         book = await self.start_tracker(self.data_source())
@@ -223,12 +307,14 @@ class DataSourceTest(unittest.IsolatedAsyncioTestCase):
 
 
 class PerpetualDataSourceTest(DataSourceTest):
-    def data_source(self, cls=DoubleZeroPerpetualDataSource, **kwargs):
-        return super().data_source(cls, funding_subscription=lambda coin: {"funding": coin}, **kwargs)
+    def data_source(self, cls=DoubleZeroPerpetualDataSource, url=None, **kwargs):
+        return super().data_source(cls, url, funding_subscription=lambda coin: {"funding": coin}, **kwargs)
 
-    async def test_funding_comes_from_the_venue_connection_which_subscribes_to_nothing_else(self):
+    async def test_funding_opens_the_venue_connection_for_funding_alone(self):
         ds = self.data_source()
         await self.start_tracker(ds)
+        self.assertEqual(self.venue.sent, [])
+
         updates = asyncio.Queue()
         self.tasks.append(asyncio.ensure_future(ds.listen_for_funding_info(updates)))
 
@@ -239,10 +325,11 @@ class PerpetualDataSourceTest(DataSourceTest):
     async def test_a_pair_added_later_subscribes_funding_on_the_venue_connection(self):
         ds = self.data_source()
         await self.start_tracker(ds)
+        self.tasks.append(asyncio.ensure_future(ds.listen_for_funding_info(asyncio.Queue())))
         await until(lambda: self.venue.sent)
         self.venue._ws_assistant = self.venue
 
-        await ds.subscribe_to_trading_pair("ETH-USD")
+        self.assertTrue(await ds.subscribe_to_trading_pair("ETH-USD"))
 
         self.assertEqual(self.venue.sent, [{"funding": "BTC"}, {"funding": "ETH"}])
         self.assertIn("ETH-USD", self.pairs)

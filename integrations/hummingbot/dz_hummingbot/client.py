@@ -5,25 +5,21 @@ import logging
 import time
 from typing import Awaitable, Callable, Optional
 
+import aiohttp
+
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 
-# A book consumer needs the definitions, both book granularities and the prints; `quote` and
-# `depth` would only cost parsing.
-KINDS = ("instrument", "book", "order_book", "trade")
 HEARTBEAT_SECONDS = 20.0
 # An order-level re-baseline of a deep market is one frame of several MB; Hummingbot's default cap is 4 MB.
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 BACKOFF_MIN_SECONDS = 0.5
 BACKOFF_MAX_SECONDS = 30.0
 STABLE_SESSION_SECONDS = 30.0
+TRANSPORT_ERRORS = (OSError, asyncio.TimeoutError, aiohttp.ClientError, aiohttp.WebSocketError)
 
 logger = logging.getLogger(__name__)
-
-
-def subscriptions(source_name: str, symbol: str) -> list:
-    return [{"source_name": source_name, "symbol": symbol, "type": kind} for kind in KINDS]
 
 
 class EdgeConnectClient:
@@ -54,9 +50,11 @@ class EdgeConnectClient:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning(f"edge-connect at {self.url}: {e!r}")
+                # A failure that is not the transport's is a handling bug, so it gets a traceback.
+                logger.warning(f"edge-connect at {self.url}: {e!r}", exc_info=not isinstance(e, TRANSPORT_ERRORS))
             finally:
-                self._ws = None
+                if self._ws is ws:  # a restarted run may already hold the next connection
+                    self._ws = None
                 await ws.disconnect()
             if time.monotonic() - started >= STABLE_SESSION_SECONDS:
                 delay = BACKOFF_MIN_SECONDS

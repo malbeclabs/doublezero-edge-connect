@@ -32,7 +32,7 @@ def test_protocol_example_applies_to_the_held_book():
     event = book.apply(batch([update("bid", 0.62, 150), delete("ask", 0.63)]))
 
     assert (event.bids, event.asks) == ([(0.62, 150)], [(0.63, 0.0)])
-    assert book.snapshot(KEY)[1:] == ([(0.62, 150)], [(0.64, 10)])
+    assert book.snapshot(KEY) == ([(0.62, 150)], [(0.64, 10)])
 
 
 def test_rebaseline_split_across_batches_publishes_nothing_until_last():
@@ -46,15 +46,15 @@ def test_rebaseline_split_across_batches_publishes_nothing_until_last():
     assert book.is_complete(KEY)
 
 
-def test_rebaseline_removes_levels_the_new_book_lacks():
+def test_rebaseline_sends_its_book_whole_and_removes_levels_it_lacks():
     book = BookAssembler()
     book.apply(batch([clear(), update("bid", 10.0, 1), update("bid", 9.0, 3), update("ask", 11.0, 2)]))
 
     event = book.apply(batch([clear(), update("bid", 10.0, 1), update("ask", 12.0, 5)]))
 
-    assert sorted(event.bids) == [(9.0, 0.0)]
+    assert sorted(event.bids) == [(9.0, 0.0), (10.0, 1)]
     assert sorted(event.asks) == [(11.0, 0.0), (12.0, 5)]
-    assert book.snapshot(KEY)[1:] == ([(10.0, 1)], [(12.0, 5)])
+    assert book.snapshot(KEY) == ([(10.0, 1)], [(12.0, 5)])
 
 
 def test_clear_mid_event_discards_the_open_event():
@@ -64,9 +64,9 @@ def test_clear_mid_event_discards_the_open_event():
     assert book.apply(batch([update("bid", 10.5, 7), update("ask", 11.0, 9)], last=False)) is None
     event = book.apply(batch([clear(), update("bid", 10.0, 4), update("ask", 11.0, 2)]))
 
-    # 10.5 was never published, so dropping it is no change; 11.0 nets back to what is held.
-    assert (event.bids, event.asks) == ([(10.0, 4)], [])
-    assert book.snapshot(KEY)[1:] == ([(10.0, 4)], [(11.0, 2)])
+    # 10.5 was never published, so dropping it changes nothing the consumer holds.
+    assert (event.bids, event.asks) == ([(10.0, 4)], [(11.0, 2)])
+    assert book.snapshot(KEY) == ([(10.0, 4)], [(11.0, 2)])
 
 
 def test_intermediate_crossed_state_is_never_published():
@@ -101,12 +101,12 @@ def test_order_level_fold_sums_orders_sharing_a_price():
     book = BookAssembler()
     book.apply(batch([clear(), update("bid", 10.0, 1.5, order_id=1), update("bid", 10.0, 2.5, order_id=2)],
                      kind="order_book"))
-    assert book.snapshot(KEY)[1] == [(10.0, 4.0)]
+    assert book.snapshot(KEY)[0] == [(10.0, 4.0)]
 
     event = book.apply(batch([delete("bid", 10.0, order_id=1)], kind="order_book"))
 
     assert event.bids == [(10.0, 2.5)]
-    assert book.snapshot(KEY)[1] == [(10.0, 2.5)]
+    assert book.snapshot(KEY)[0] == [(10.0, 2.5)]
 
 
 def test_order_level_partial_fill_and_price_move():
@@ -130,7 +130,7 @@ def test_a_level_whose_orders_all_leave_is_removed_despite_float_residue():
     event = book.apply(batch([delete("bid", 10.0, order_id=2)], kind="order_book"))
 
     assert event.bids == [(10.0, 0.0)]
-    assert book.snapshot(KEY)[1] == []
+    assert book.snapshot(KEY)[0] == []
 
 
 def test_clear_empties_order_level_side():
@@ -142,7 +142,7 @@ def test_clear_empties_order_level_side():
     book.apply(batch([update("bid", 9.0, 1, order_id=1)], kind="order_book"))
 
     assert event.bids == [(10.0, 0.0)]
-    assert book.snapshot(KEY)[1:] == ([(9.0, 1)], [(11.0, 1)])
+    assert book.snapshot(KEY) == ([(9.0, 1)], [(11.0, 1)])
 
 
 def test_markets_sharing_a_symbol_are_kept_apart_by_identity():
@@ -153,21 +153,21 @@ def test_markets_sharing_a_symbol_are_kept_apart_by_identity():
     book.apply(first)
     book.apply(second)
 
-    assert book.snapshot(market_key(first))[1] == [(1.0, 1)]
-    assert book.snapshot(market_key(second))[1] == [(2.0, 2)]
+    assert book.snapshot(market_key(first))[0] == [(1.0, 1)]
+    assert book.snapshot(market_key(second))[0] == [(2.0, 2)]
 
 
-def test_update_ids_increase_per_market_and_the_snapshot_names_the_last_event():
+def test_replace_turns_one_markets_book_into_anothers():
     book = BookAssembler()
-    ids = [
-        book.apply(batch([clear(), update("bid", 10.0, 1)])).update_id,
-        book.apply(batch([update("bid", 10.0, 2)])).update_id,
-        book.apply(batch([update("bid", 10.0, 3)], instrument_id=42)).update_id,
-        book.apply(batch([update("bid", 10.0, 4)])).update_id,
-    ]
+    old = batch([clear(), update("bid", 10.0, 1), update("ask", 11.0, 2)], instrument_id=41)
+    new = batch([clear(), update("bid", 10.0, 1), update("ask", 12.0, 3)], instrument_id=42)
+    book.apply(old)
+    book.apply(new)
 
-    assert ids == [1, 2, 1, 3]
-    assert book.snapshot(KEY)[0] == 3
+    bids, asks = book.replace(market_key(old), market_key(new))
+
+    assert (sorted(bids), sorted(asks)) == ([(10.0, 1)], [(11.0, 0.0), (12.0, 3)])
+    assert not book.is_complete(market_key(old))
 
 
 def test_source_timestamp_is_the_latest_nonzero_one():

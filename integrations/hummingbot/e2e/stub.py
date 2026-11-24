@@ -135,11 +135,8 @@ async def edge_connect(request):
                 await ws.send_json({"channel": "subscription_response", "method": frame["method"],
                                     "subscription": subscription})
                 symbol = subscription.get("symbol")
-                if frame["method"] == "subscribe" and symbol in books:
-                    if subscription.get("type") == "instrument":
-                        await ws.send_json(instrument(symbol))
-                    elif subscription.get("type") == "order_book":
-                        await ws.send_json(books[symbol].rebaseline())
+                if frame["method"] == "subscribe" and symbol in books and subscription.get("type") == "order_book":
+                    await ws.send_json(books[symbol].rebaseline())
             else:
                 report["edge"]["unserved"].append(frame)
                 await ws.send_json({"channel": "error", "error": "unrecognized message"})
@@ -186,6 +183,7 @@ async def info(request):
         return web.json_response(dex(body.get("dex", "")))
     if kind == "allPerpMetas":
         return web.json_response([dex(""), dex("xyz")])
+    report["venue"]["unexpected"].append(body)
     return web.json_response({"error": f"the stub serves no {kind!r}"}, status=400)
 
 
