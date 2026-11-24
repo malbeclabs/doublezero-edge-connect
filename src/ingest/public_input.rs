@@ -113,7 +113,8 @@ pub trait PublicVenue {
     /// Venue name stamped on every emitted message and every metric (must match the edge feed's
     /// venue so both land in the same arbiter dedup state).
     fn venue(&self) -> &str;
-    /// The registry Source ID stamped on every emitted message.
+    /// The input's own registry Source ID: its race registers under it and its coins resolve from it
+    /// ([`resolve_instrument`]). A copy carries the ID its coin resolved to, which may be another.
     fn source_id(&self) -> u16;
     /// The public `wss://` (or `ws://` in tests) endpoint to connect to.
     fn url(&self) -> &str;
@@ -433,7 +434,7 @@ impl Sequencer {
     }
 }
 
-/// True if the `(source_id, symbol)` instrument is already in the shared snapshot, so a price emitted for
+/// True if the `(venue, symbol)` instrument is already in the shared snapshot, so a price emitted for
 /// it carries known precision (precision before price). The snapshot is populated by the edge side
 /// only once it has revealed that instrument's Source ID (see `ingest::processor`'s deferral), so
 /// this stays closed for an instrument the edge has never once gone live for — a cold start, not a
@@ -449,24 +450,23 @@ impl Sequencer {
 /// JSON decode (called once per public WS text frame, for two venues), so no secondary
 /// `HashSet<(venue, symbol)>` is added.
 ///
-/// Matched on the input's own Source ID, not its name: several IDs may share a name, and a trade
-/// built here is stamped with this one.
+/// Matched as [`resolve_instrument`] matches.
 pub fn instrument_known(instruments: &InstrumentSnapshot, source_id: u16, symbol: &str) -> bool {
-    crate::model::lock(instruments)
-        .values()
-        .any(|i| i.source_id == source_id && i.symbol.as_ref() == symbol)
+    resolve_instrument(instruments, source_id, symbol).is_some()
 }
 
 /// What [`resolve_instrument`] reads off a catalog entry: the identity a message built at this seam
 /// must carry, plus the universe it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedInstrument {
+    /// The matched entry's Source ID, which a copy must carry to race its edge copy.
+    pub source_id: u16,
     pub channel: u8,
     pub instrument_id: u32,
     /// The matched entry's `category` — the universe the edge row that defined it carries. One
-    /// public input can span several universes under its one Source ID (Hyperliquid's native perps
-    /// and the `xyz:` builder DEX both arrive as ID 1 on one public socket), so a constant would
-    /// file every symbol under one of them and history would drop the rest as unattributable.
+    /// public input can span several universes (Hyperliquid's native perps and its `xyz:` builder
+    /// DEX share one public socket), so a constant would file every symbol under one of them and
+    /// history would drop the rest as unattributable.
     pub category: Arc<str>,
 }
 
@@ -483,24 +483,42 @@ pub struct ResolvedInstrument {
 /// it can never drift out of step with an `upsert_instrument`/`remove_instrument` the way a
 /// separately-maintained symbol→identity map would.
 ///
-/// Scoped to the input's own Source ID for the same reason as [`instrument_known`]. Within it, first
-/// match wins. Safe here because neither venue this module backstops presents one symbol under
-/// two different `(channel, instrument_id)` pairs the way a price-aggregated venue's mirrored paths
-/// do (see `history::Key`'s docs) — if a public backstop ever grew a mirrored-path venue of its own,
-/// this would need the same disambiguation `products::resolve` applies instead of a bare first match.
+/// Matched on the input's venue name, not only its own Source ID: Hyperliquid's builder DEXes share
+/// its public socket but are filed on the edge under IDs of their own, and their `dex:` prefixes keep
+/// symbols apart across those IDs. A symbol several of them carry resolves to the input's own ID,
+/// else to nothing, never to whichever hash order finds first. An input for a venue whose engines
+/// share symbols (Binance's spot and futures both list `BTCUSDT`) would have to match on its ID
+/// alone. Within one ID, first match wins. Safe here because neither venue this module backstops
+/// presents one symbol under two different `(channel, instrument_id)` pairs the way a
+/// price-aggregated venue's mirrored paths do (see `history::Key`'s docs) — if a public backstop ever
+/// grew a mirrored-path venue of its own, this would need the same disambiguation
+/// `products::resolve` applies instead of a bare first match.
 pub fn resolve_instrument(
     instruments: &InstrumentSnapshot,
     source_id: u16,
     symbol: &str,
 ) -> Option<ResolvedInstrument> {
-    crate::model::lock(instruments)
-        .values()
-        .find(|i| i.source_id == source_id && i.symbol.as_ref() == symbol)
-        .map(|i| ResolvedInstrument {
-            channel: i.channel,
-            instrument_id: i.instrument_id,
-            category: i.category.clone(),
-        })
+    let venue = crate::ingest::sources::source_label(source_id);
+    let resolved = |i: &crate::model::NormalizedInstrument| ResolvedInstrument {
+        source_id: i.source_id,
+        channel: i.channel,
+        instrument_id: i.instrument_id,
+        category: i.category.clone(),
+    };
+    let catalog = crate::model::lock(instruments);
+    let (mut other, mut several) = (None, false);
+    for i in catalog.values().filter(|i| i.symbol.as_ref() == symbol) {
+        if i.source_id == source_id {
+            return Some(resolved(i));
+        }
+        if i.venue.as_ref() != venue {
+            continue;
+        }
+        several |=
+            other.is_some_and(|o: &crate::model::NormalizedInstrument| o.source_id != i.source_id);
+        other.get_or_insert(i);
+    }
+    other.filter(|_| !several).map(resolved)
 }
 
 /// Parse a non-negative, finite `f64` from a decimal string, or `None`. Rejects `NaN`/`±inf`
@@ -522,14 +540,15 @@ pub fn finite_non_negative(v: f64) -> Option<f64> {
 mod tests {
     use super::*;
 
-    fn catalog(entries: &[(u16, &str, u32)]) -> InstrumentSnapshot {
+    /// One entry per `(source_id, venue label, symbol, instrument_id)`.
+    fn catalog(entries: &[(u16, &str, &str, u32)]) -> InstrumentSnapshot {
         let mut map = std::collections::HashMap::new();
-        for &(source_id, symbol, instrument_id) in entries {
+        for &(source_id, label, symbol, instrument_id) in entries {
             let i = crate::model::NormalizedInstrument {
                 tick_size: 0,
                 asset_class: 0,
-                venue: "SHARED".into(),
-                source_name: "SHARED".into(),
+                venue: label.into(),
+                source_name: label.into(),
                 source_id,
                 symbol: symbol.into(),
                 channel: 0,
@@ -551,18 +570,37 @@ mod tests {
         std::sync::Arc::new(std::sync::Mutex::new(map))
     }
 
-    /// A backstop stamps one fixed Source ID, so it must only match that ID's instruments: another
-    /// ID under the same name is a different engine.
+    /// A lookup covers every Source ID carrying the input's venue name, and reports which matched.
     #[test]
-    fn lookups_are_scoped_to_the_inputs_own_source_id() {
-        let snap = catalog(&[(4, "A", 1), (10, "dex:A", 2)]);
-        assert!(instrument_known(&snap, 4, "A"));
-        assert!(!instrument_known(&snap, 4, "dex:A"));
+    fn lookups_cover_every_source_id_under_the_venues_name() {
+        let snap = catalog(&[
+            (1, "HYPERLIQUID", "BTC", 1),
+            (7, "HYPERLIQUID", "xyz:CL", 2),
+            (2, "PHOENIX", "SOL", 3),
+        ]);
+        assert!(instrument_known(&snap, 1, "BTC"));
         assert_eq!(
-            resolve_instrument(&snap, 10, "dex:A").map(|r| (r.channel, r.instrument_id)),
-            Some((0, 2))
+            resolve_instrument(&snap, 1, "xyz:CL").map(|r| (r.source_id, r.instrument_id)),
+            Some((7, 2))
         );
-        assert_eq!(resolve_instrument(&snap, 4, "dex:A"), None);
+        assert!(!instrument_known(&snap, 1, "SOL"));
+        assert_eq!(resolve_instrument(&snap, 2, "xyz:CL"), None);
+    }
+
+    /// A symbol several of the name's IDs carry resolves to the input's own, or to nothing.
+    #[test]
+    fn a_symbol_under_several_ids_resolves_to_the_inputs_own_or_nothing() {
+        let snap = catalog(&[
+            (7, "HYPERLIQUID", "A", 1),
+            (1, "HYPERLIQUID", "A", 2),
+            (7, "HYPERLIQUID", "B", 3),
+            (11, "HYPERLIQUID", "B", 4),
+        ]);
+        assert_eq!(
+            resolve_instrument(&snap, 1, "A").map(|r| r.source_id),
+            Some(1)
+        );
+        assert_eq!(resolve_instrument(&snap, 1, "B"), None);
     }
 
     fn subs(names: &[&str], kinds: &[Kind]) -> Vec<Subscription> {

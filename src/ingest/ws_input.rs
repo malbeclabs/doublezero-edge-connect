@@ -47,13 +47,12 @@ fn hl_venue() -> &'static str {
     crate::ingest::sources::source_label(HL_SOURCE_ID)
 }
 
-// The instrument **universe** each message is filed under is read off the catalog entry the coin
-// resolves to (`public_input::resolve_instrument`), never a constant. Hyperliquid's native perps
-// (`hl-perps`) and its `xyz:` builder DEX (`xyz-perps`) both arrive as Source ID 1 on this one public
-// socket, so a constant filed every `xyz:` coin under the native universe: history then looked its
-// trades up in the wrong category and dropped them as unattributable, and the day this venue turns
-// `Sticky` the tape gate (keyed on `(venue, category)`) would treat the backstop as a universe of
-// its own and stop collapsing the two copies of one fill.
+// The instrument **universe** and **Source ID** each message carries are read off the catalog entry
+// the coin resolves to (`public_input::resolve_instrument`), never constants: this one public socket
+// carries Hyperliquid's native perps (`hl-perps`, ID 1) and its `xyz:` builder DEX (`xyz-perps`,
+// ID 7) alike. Under the wrong one, a copy misses its edge market's state (the arbiter's floors and
+// trade window key on the ID, the tape gate on the universe) and goes out beside the edge copy as a
+// duplicate, while history drops its trades as unattributable.
 
 /// The registry row's own `&'static` spelling of a catalog `category`, which is what
 /// `Arbiter::emit` takes. Every catalog entry was defined by a row, so `None` only means the
@@ -304,7 +303,7 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
     let quote = NormalizedQuote {
         venue: venue_arc(hl_venue()),
         source_name: venue_arc(hl_venue()),
-        source_id: HL_SOURCE_ID,
+        source_id: resolved.source_id,
         symbol: d.coin.into(),
         bid: bid_px,
         ask: ask_px,
@@ -354,7 +353,7 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
     let trade = NormalizedTrade {
         venue: venue_arc(hl_venue()),
         source_name: venue_arc(hl_venue()),
-        source_id: HL_SOURCE_ID,
+        source_id: resolved.source_id,
         symbol: t.coin.into(),
         channel: resolved.channel,
         instrument_id: resolved.instrument_id,
@@ -415,23 +414,31 @@ mod tests {
     }
     use crate::{ingest::arbiter::Arbiter, model::NormalizedInstrument};
 
+    /// The XYZ builder DEX's Source ID, which shares Hyperliquid's name.
+    const XYZ_SOURCE_ID: u16 = 7;
+
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
-        insert(&map, symbol, "hl-perps");
+        insert(&map, HL_SOURCE_ID, symbol, "hl-perps");
         map
     }
 
-    /// One catalog entry for `symbol` under `category`, at channel 0 / instrument 1 — the same
-    /// identity pair in every universe, so only the category can tell two entries apart.
-    fn insert(map: &InstrumentSnapshot, symbol: &str, category: &str) {
+    /// One catalog entry for `symbol` under `source_id` and `category`, at channel 0 / instrument 1
+    /// — the same identity pair in every universe, so only the category can tell two entries apart.
+    fn insert(map: &InstrumentSnapshot, source_id: u16, symbol: &str, category: &str) {
         map.lock().unwrap().insert(
-            (hl_venue().into(), category.into(), 0u8, 1u32),
+            (
+                crate::model::SourceKey::from_id(source_id),
+                category.into(),
+                0u8,
+                1u32,
+            ),
             NormalizedInstrument {
                 tick_size: 0,
                 asset_class: 0,
                 venue: hl_venue().into(),
                 source_name: hl_venue().into(),
-                source_id: HL_SOURCE_ID,
+                source_id,
                 symbol: symbol.into(),
                 channel: 0,
                 instrument_id: 1,
@@ -442,16 +449,14 @@ mod tests {
         );
     }
 
-    /// An `xyz:` coin arrives as Source ID 1 on the same public socket as the native perps, so its
-    /// trade must be filed under the universe its catalog entry belongs to, not the native one —
-    /// the two share `(channel, instrument_id)` here, so a wrong category lands on the other
-    /// market's history or none at all.
+    /// An `xyz:` coin shares the native perps' public socket, so its trade must take its own edge
+    /// market's Source ID and universe — the two share `(channel, instrument_id)` here.
     #[test]
-    fn an_xyz_trade_is_filed_under_its_own_universe() {
+    fn an_xyz_trade_is_filed_under_its_own_source_and_universe() {
         let (arbiter, mut rx) = arbiter_with_rx();
         let instruments: InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
-        insert(&instruments, "BTC", "hl-perps");
-        insert(&instruments, "xyz:GOLD", "xyz-perps");
+        insert(&instruments, HL_SOURCE_ID, "BTC", "hl-perps");
+        insert(&instruments, XYZ_SOURCE_ID, "xyz:GOLD", "xyz-perps");
         for (coin, tid) in [("xyz:GOLD", 1u64), ("BTC", 2)] {
             let frame = format!(
                 r#"{{"channel":"trades","data":[{{"coin":"{coin}","side":"B","px":"10.0",
@@ -462,14 +467,71 @@ mod tests {
         let mut got = Vec::new();
         while let Ok(m) = rx.try_recv() {
             if let FeedMessage::Trade(t) = &*m {
-                got.push((t.symbol.to_string(), t.category.to_string()));
+                got.push((t.symbol.to_string(), t.category.to_string(), t.source_id));
             }
         }
         assert_eq!(
             got,
             vec![
-                ("xyz:GOLD".to_string(), "xyz-perps".to_string()),
-                ("BTC".to_string(), "hl-perps".to_string()),
+                (
+                    "xyz:GOLD".to_string(),
+                    "xyz-perps".to_string(),
+                    XYZ_SOURCE_ID
+                ),
+                ("BTC".to_string(), "hl-perps".to_string(), HL_SOURCE_ID),
+            ]
+        );
+    }
+
+    /// A builder-DEX quote races its edge copy in one floor: the edge's tick collapses the public
+    /// copy, and a tick only the public input delivered goes out under the same Source ID.
+    #[test]
+    fn a_builder_dex_quote_races_its_edge_copy() {
+        let (arbiter, mut rx) = arbiter_with_rx();
+        let instruments: InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        insert(&instruments, XYZ_SOURCE_ID, "xyz:CL", "xyz-perps");
+        let tick = |ms: u64| ms * 1_000_000;
+        let edge = NormalizedQuote {
+            venue: venue_arc(hl_venue()),
+            source_name: venue_arc(hl_venue()),
+            source_id: XYZ_SOURCE_ID,
+            symbol: "xyz:CL".into(),
+            bid: 80.25,
+            ask: 80.26,
+            bid_size: 2.0,
+            ask_size: 4.0,
+            bid_n: 3,
+            ask_n: 1,
+            source_ts_ns: tick(1_700_000_000_000),
+            recv_ts_ns: now_ns(),
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+            channel: 0,
+            instrument_id: 0,
+            category: crate::model::empty_category(),
+            venue_update_id: 0,
+            wire: crate::model::QuoteWire::default(),
+        };
+        let edge_path = Transport::Edge(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        lock(&arbiter).emit(FeedMessage::Quote(edge), edge_path, "xyz-perps");
+        for ms in [1_700_000_000_000u64, 1_700_000_000_001] {
+            let frame = format!(
+                r#"{{"channel":"bbo","data":{{"coin":"xyz:CL","time":{ms},
+                "bbo":[{{"px":"80.25","sz":"2.0","n":3}},{{"px":"80.26","sz":"4.0","n":1}}]}}}}"#
+            );
+            handle_text(&frame, &arbiter, &instruments);
+        }
+        let mut got = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Quote(q) = &*m {
+                got.push((q.source_id, q.source_ts_ns));
+            }
+        }
+        assert_eq!(
+            got,
+            vec![
+                (XYZ_SOURCE_ID, tick(1_700_000_000_000)),
+                (XYZ_SOURCE_ID, tick(1_700_000_000_001)),
             ]
         );
     }

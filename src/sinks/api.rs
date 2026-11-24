@@ -1041,18 +1041,19 @@ fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
 // ---------------------------------------------------------------------------------------------
 
 /// Each public input's race against the edge (`ingest::race`). A symbol's status reads the edge
-/// catalog: one pass over it, after the arbiter's lock is released.
+/// catalog by venue name, since an input races every Source ID its name carries: one pass over it,
+/// after the arbiter's lock is released.
 fn race(state: &ApiState) -> Response {
     let snap = crate::ingest::arbiter::lock(&state.arbiter)
         .race_board()
         .snapshot();
-    let mut defined: HashMap<u16, HashSet<Arc<str>>> = snap
+    let mut defined: HashMap<&str, HashSet<Arc<str>>> = snap
         .venues
         .iter()
-        .map(|v| (v.source_id, HashSet::new()))
+        .map(|v| (v.venue.as_str(), HashSet::new()))
         .collect();
     for i in crate::model::lock(&state.instruments).values() {
-        if let Some(symbols) = defined.get_mut(&i.source_id) {
+        if let Some(symbols) = defined.get_mut(i.venue.as_ref()) {
             symbols.insert(i.symbol.clone());
         }
     }
@@ -1061,7 +1062,7 @@ fn race(state: &ApiState) -> Response {
         .venues
         .iter()
         .map(|v| {
-            let catalog = &defined[&v.source_id];
+            let catalog = &defined[v.venue.as_str()];
             let symbols: Vec<Value> = v
                 .symbols
                 .iter()
@@ -4731,6 +4732,15 @@ mod tests {
             ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
+        instruments.lock().unwrap().insert(
+            (
+                crate::model::SourceKey::from_id(7),
+                "default".into(),
+                0u8,
+                42u32,
+            ),
+            inst(7, "HYPERLIQUID", "xyz:CL", 0, 42, -2, -5),
+        );
         let arbiter = test_arbiter();
         {
             let mut a = crate::ingest::arbiter::lock(&arbiter);
@@ -4739,7 +4749,7 @@ mod tests {
             board.register(
                 1,
                 "HYPERLIQUID",
-                ["BTC", "ETH", "NOPE"]
+                ["BTC", "ETH", "NOPE", "xyz:CL"]
                     .into_iter()
                     .flat_map(|s| Kind::ALL.map(|k| (s, k))),
             );
@@ -4749,6 +4759,7 @@ mod tests {
                 ("BTC", SubState::Live),
                 ("ETH", SubState::Acked),
                 ("NOPE", SubState::Refused),
+                ("xyz:CL", SubState::Live),
             ] {
                 for kind in Kind::ALL {
                     board.set_state(1, symbol, kind, state);
@@ -4781,10 +4792,16 @@ mod tests {
             .iter()
             .map(|s| (s["symbol"].as_str().unwrap(), s["status"].as_str().unwrap()))
             .collect();
-        // ETH: confirmed, while the edge defines the venue's BTC but not it.
+        // ETH: confirmed, while the edge defines the venue's BTC but not it. xyz:CL: defined under
+        // the builder DEX's Source ID 7, which the venue's name carries too.
         assert_eq!(
             statuses,
-            [("BTC", "racing"), ("ETH", "no_edge"), ("NOPE", "refused")]
+            [
+                ("BTC", "racing"),
+                ("ETH", "no_edge"),
+                ("NOPE", "refused"),
+                ("xyz:CL", "racing")
+            ]
         );
         assert_eq!(
             venues[0]["quotes"],

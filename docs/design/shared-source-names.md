@@ -44,7 +44,7 @@ Two PRs.
   that category. Shared IDs widen it by no row.
 - Name-only lookups filter on a fixed Source ID: the public backstops'
   `instrument_known` / `resolve_instrument`, and the order-book sink's venue filter.
-  (That sink later moved to every ID named like ID 1, as Hyperliquid serves its builder DEXes on one socket.)
+  (All three later moved to every ID carrying the venue's name, as Hyperliquid serves its builder DEXes on one socket.)
 - Product ids: `resolve` already matches by name. The ambiguity count moves from
   `(source_id, symbol)` to `(name, symbol)`, so a symbol listed under two IDs of one name renders
   with the `#channel.instrument` suffix and resolves back.

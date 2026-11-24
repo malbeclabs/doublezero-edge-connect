@@ -212,6 +212,7 @@ impl PhoenixVenue {
         // Resolves precision AND the (channel, instrument_id) identity in one scan — see
         // `resolve_instrument`'s doc for why a bare symbol match is safe for this venue.
         let Some(ResolvedInstrument {
+            source_id,
             channel,
             instrument_id,
             ..
@@ -247,7 +248,7 @@ impl PhoenixVenue {
         let trade = NormalizedTrade {
             venue: venue_arc(phoenix_venue()),
             source_name: venue_arc(phoenix_venue()),
-            source_id: PHOENIX_SOURCE_ID,
+            source_id,
             symbol: symbol.into(),
             channel,
             instrument_id,

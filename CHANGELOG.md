@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- **The Hyperliquid public backstop dropped every XYZ builder DEX coin.** `--ws-input-coins xyz:CL` resolved against Source ID 1 alone, and the edge files `xyz:` markets under 7, so the builder DEX had no public backstop and `/v1/race` reported its coins `no_edge`. A public input now covers every Source ID carrying its venue's name, and each copy takes the ID of the edge market it resolves to, so it races that copy rather than going out beside it.
 - **The Hyperliquid-compatible sink served none of the XYZ builder DEX's markets.** Their `xyz:` coins arrive as Source ID 7 and the sink rendered ID 1 alone, so a subscription to `xyz:CL` received nothing. It now renders every Source ID sharing ID 1's registry name, as Hyperliquid itself serves its builder DEXes beside its perps on one socket, so another Hyperliquid engine needs no release. This sink alone drops #169's one-ID rule.
 - **A restarted container could crash-loop on the previous run's daemon socket.** The socket file outlived the run, so on restart both readiness waits took it for a ready daemon while the new `doublezerod` failed to bind over it; the bridge then exited with the daemon, and the restart policy repeated the cycle. The entrypoint now removes the file before starting the daemon.
 - **A venue-compatible sink that exits no longer stops the process.** A panic or error in the Hyperliquid-, Binance- or Kalshi-compatible sink's task ended `main`, taking the DoubleZero tunnel down with it. It now logs one error naming the sink, counts it on `dz_venue_sink_exits_total{sink}`, and leaves that sink off until restart, as a failed bind already does.
@@ -97,7 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   universe to `hl-perps`, so with `--ws-input-coins` set the backstop's quotes and trades were keyed
   as a universe of their own — harmless while Hyperliquid arbitrates `Coordinated`, and a duplicate
   tape the day it turns `Sticky`. The category is now read off the catalog entry the coin resolves
-  to rather than a constant, since the native perps and the `xyz:` builder DEX (`xyz-perps`) both arrive as Source ID 1 on the one
+  to rather than a constant, since the native perps and the `xyz:` builder DEX (`xyz-perps`) share the one
   public socket: an `xyz:` coin in `--ws-input-coins` had its trades filed under the native universe,
   where history dropped them as unattributable or credited them to a market sharing the identity.
 - **This repo no longer publishes the hosted feed registry.** #161 published `src/ingest/registry.json`
