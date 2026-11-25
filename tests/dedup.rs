@@ -5,7 +5,7 @@
 //! per-(venue, symbol) `source_ts` latch-to-leader floor: within one `source_ts` tick only the
 //! leader (first publisher to open it) is emitted — a slower publisher's samples at the same tick
 //! arrive in a delay-corrupted order and are dropped — and a strictly-older BBO (stale laggard) plus
-//! the leader's exact `(source_ts, content)` repeats are dropped too. So the emitted `source_ts` is
+//! the leader's repeat of its last content are dropped too. So the emitted `source_ts` is
 //! non-decreasing — not strictly increasing — per symbol, and within a tick the series is one
 //! publisher's coherent subsequence.
 
@@ -272,7 +272,7 @@ fn assert_quote_source_ts_non_decreasing(msgs: &[Value]) {
 fn two_publishers_latch_to_leader_no_stale_or_dupes() {
     let recs = read_combined("tests/fixtures/tob_btc_dual.combined.bin");
     let msgs = replay(&recs);
-    // No two emitted quotes share the oracle's business identity (exact duplicates dropped).
+    // No emitted quote repeats the one before it for its symbol (exact duplicates dropped).
     assertions::no_business_duplicates(&msgs);
     assertions::quotes_well_formed(&msgs);
     // Latch-to-leader floor: per (venue, symbol) the emitted source_ts is non-decreasing — a lagging
@@ -281,12 +281,12 @@ fn two_publishers_latch_to_leader_no_stale_or_dupes() {
 
     let quotes = msgs.iter().filter(|m| m["type"] == "quote").count();
     // The fixture carries 8788 raw BTC mktdata quotes split across two publishers mirroring the same
-    // feed (417 distinct source_ts). Latch-to-leader emits the leader's distinct canonical BBOs at a
-    // non-decreasing floor — the `bbo_hash` identity (px, sz, bid_n, ask_n), so a count-only change at
-    // an unchanged price/size is a distinct quote. Far above a strict one-per-tick watermark (~417,
-    // which over-drops real intra-tick changes).
+    // feed (417 distinct source_ts). Latch-to-leader emits every leader BBO that differs from its
+    // last at a non-decreasing floor — the `bbo_hash` identity (px, sz, bid_n, ask_n), so a
+    // count-only change at an unchanged price/size is a distinct quote. Far above a strict
+    // one-per-tick watermark (~417, which over-drops real intra-tick changes).
     //
-    // 7508, up from 4521: the wire Source ID is now authoritative (no feed-row fallback), and this
+    // 7541: the wire Source ID is now authoritative (no feed-row fallback), and this
     // fixture's two publishers disagree about it. Confirmed by decoding the raw quotes directly:
     // the first publisher stamps every one of its 4699 quotes with Source ID 1 (Hyperliquid, correct);
     // the second publisher stamps every one of its 4133 quotes with Source ID 3 — the registry's row
@@ -296,15 +296,15 @@ fn two_publishers_latch_to_leader_no_stale_or_dupes() {
     // BOTH publishers' quotes fell back to this feed's static venue ("HYPERLIQUID") and competed on ONE
     // dedup floor, silently merging the mislabeled path into the correct one — exactly the "name it
     // after the multicast group it arrived on" workaround the plan reversal exists to remove. With the
-    // fallback gone, the two paths are honestly reported as different venues (4508 "HYPERLIQUID" + 3000
-    // for the other venue = 7508) and no longer share a floor, so the cross-path duplication this
+    // fallback gone, the two paths are honestly reported as different venues (4528 "HYPERLIQUID" + 3013
+    // for the other venue = 7541) and no longer share a floor, so the cross-path duplication this
     // fixture's two mirrors actually represent is no longer collapsed — each path now only dedups
-    // against itself (4699 -> 4508, 4133 -> 3000). This is the correct, intended behavior of the new
+    // against itself (4699 -> 4528, 4133 -> 3013). This is the correct, intended behavior of the new
     // rule: the output is visibly wrong about which publisher this is, which is what surfaces the
     // second publisher's defect instead of hiding it. The fix belongs at that publisher, not here.
     assert_eq!(
-        quotes, 7508,
-        "two-pub latch-to-leader quote count (leader's distinct canonical BBOs incl. bid_n/ask_n)"
+        quotes, 7541,
+        "two-pub latch-to-leader quote count (leader's canonical BBO changes incl. bid_n/ask_n)"
     );
 }
 
@@ -334,7 +334,7 @@ fn per_symbol_dedup_is_independent() {
 
     let raw = raw_quotes_by_symbol(&recs);
     let emitted = emitted_quotes_by_symbol(&msgs);
-    // Each symbol emits the leader's distinct intra-tick changes: well below raw (non-leader samples,
+    // Each symbol emits the leader's intra-tick changes: well below raw (non-leader samples,
     // stale laggard replays, and exact dups dropped) but well above a strict one-per-tick watermark.
     // The exact per-symbol counts aren't pinned here (the single-symbol test above pins BTC); this
     // test pins the cross-symbol *independence* property below.
@@ -390,9 +390,9 @@ fn per_symbol_dedup_is_independent() {
 /// The literal duplicate-multicast-packet case for quotes: replay one publisher's feed, then
 /// replay it again with **every mktdata datagram delivered twice** (byte-for-byte, same datagram
 /// sequence — exactly what a redundant multicast delivery looks like). The emitted quote set must be
-/// identical. The duplicate datagram is *not* rejected at the sequence gate — an equal sequence is
-/// an accepted idempotent full-state update (`SeqTracker::duplicate_of_last_is_not_stale`) — so this
-/// pins that the duplicate's decoded payload is collapsed by the arbiter's latch-to-leader floor.
+/// identical. This pins the outcome, not the gate: every captured datagram carries one quote per
+/// instrument, which the floor collapses anyway (`tob_a_redelivered_datagram_emits_its_quotes_once`
+/// pins the gate).
 #[test]
 fn duplicate_multicast_quote_packet_collapses() {
     let recs = read_combined("tests/fixtures/tob_btc_dual.combined.bin");
@@ -470,17 +470,14 @@ fn duplicate_packet_from_second_publisher_collapses() {
 }
 
 /// The duplicate-packet case for trades: replay the single-publisher TOB golden, then replay it with
-/// every mktdata datagram duplicated. Trades dedup by `trade_id` in the arbiter's windowed dedup, so
-/// the emitted trade set is unchanged. Guarded so a trade-less fixture fails loud rather than
-/// passing vacuously.
+/// every mktdata datagram delivered again afterwards: the emitted trade set must be unchanged.
+/// Guarded so a trade-less fixture fails loud rather than passing vacuously.
 #[test]
 fn duplicate_multicast_trade_packet_collapses() {
     let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
     let ref_bytes = std::fs::read("tests/fixtures/tob_refdata.bin").expect("read tob_refdata.bin");
-    let mkt_bytes =
-        std::fs::read("tests/fixtures/tob_marketdata.bin").expect("read tob_marketdata.bin");
     let ref_datagrams = replay_helper::split_datagrams(&ref_bytes, replay_helper::TOB_MAGIC);
-    let mkt_datagrams = replay_helper::split_datagrams(&mkt_bytes, replay_helper::TOB_MAGIC);
+    let mkt_datagrams = replay_helper::tob_golden_mktdata();
 
     // Refdata first (instrument definitions before prices), then mktdata, all from one publisher.
     let mut baseline: Vec<(IpAddr, u8, Vec<u8>)> = Vec::new();

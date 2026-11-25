@@ -1,7 +1,7 @@
 //! Semantic invariants over collected WS messages. These hold regardless of how many
 //! publishers fed the input, so they double as the deduplication oracle.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -43,7 +43,12 @@ pub fn instrument_before_price(msgs: &[Value]) {
     }
 }
 
-/// No two messages carry identical business content.
+/// No trade repeats a `trade_id`, and no quote or depth repeats the one before it for its
+/// `(venue, symbol)`.
+///
+/// **Quotes and depth: consecutive, not per tick.** A book can return to an earlier state within
+/// one `source_ts` (A, B, A) and the arbiter emits that return, so only a repeat of the message
+/// before it is a duplicate.
 ///
 /// **Key design — business-content only, BY DESIGN.** Per-receipt timestamps
 /// (`recv_ts_ns`, `kernel_rx_ts_ns`, `ws_send_ts_ns`) are deliberately excluded.
@@ -67,17 +72,18 @@ pub fn instrument_before_price(msgs: &[Value]) {
 /// asks). Keying on source_ts_ns alone would false-fail when two publishers emit the
 /// same snapshot at the same event timestamp but with different book content (a valid
 /// divergence), and would false-collapse snapshots from a batch split across datagrams.
-/// Including the book content means identical state → true duplicate (correctly flagged)
-/// and different state → different key (no false fail).
+/// Including the book content means identical consecutive state → true duplicate (correctly
+/// flagged) and different state → different key (no false fail).
 ///
 /// **Known limitation — `source_ts_ns == 0` collisions.** Two genuinely distinct
-/// quotes that both have `source_ts_ns == 0` (the "unknown" sentinel) and identical
-/// bid/ask/sizes share the same key and produce a false-positive duplicate failure.
+/// consecutive quotes that both have `source_ts_ns == 0` (the "unknown" sentinel) and
+/// identical bid/ask/sizes share the same key and produce a false-positive duplicate failure.
 /// This does not occur in the current single-publisher fixtures. Future multi-publisher
 /// dedup work must define duplicate identity precisely (e.g. by datagram channel + sequence
 /// number at ingest) rather than relying on this heuristic.
 pub fn no_business_duplicates(msgs: &[Value]) {
     let mut seen: HashSet<String> = HashSet::new();
+    let mut last: HashMap<(&str, &str, &str), String> = HashMap::new();
     for m in msgs {
         let key = match ty(m) {
             "quote" => format!(
@@ -100,7 +106,7 @@ pub fn no_business_duplicates(msgs: &[Value]) {
             ),
             // Depth identity is content-inclusive: venue + symbol + source_ts_ns + book state.
             // Two snapshots that share source_ts_ns but differ in bids/asks are not duplicates
-            // (batch split or publisher divergence); two that match on all fields are.
+            // (batch split or publisher divergence); two consecutive ones matching on all fields are.
             "depth" => format!(
                 "d|{}|{}|{}|{}|{}",
                 s(m, "venue"),
@@ -111,10 +117,14 @@ pub fn no_business_duplicates(msgs: &[Value]) {
             ),
             _ => continue,
         };
-        assert!(
-            seen.insert(key.clone()),
-            "duplicate business message: {key}"
-        );
+        let repeated = match ty(m) {
+            "trade" => !seen.insert(key.clone()),
+            t => {
+                let stream = (t, s(m, "venue"), s(m, "symbol"));
+                last.insert(stream, key.clone()).as_ref() == Some(&key)
+            }
+        };
+        assert!(!repeated, "duplicate business message: {key}");
     }
 }
 

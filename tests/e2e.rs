@@ -69,10 +69,7 @@ async fn spike_loopback_multicast_produces_a_quote() {
         &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
-    let mktdata = replay::split_datagrams(
-        &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
-        replay::TOB_MAGIC,
-    );
+    let mktdata = replay::tob_golden_mktdata();
 
     // Fixture is in real wire order (manifest before def), so a single refdata pass retains the
     // def and the quote precision gate resolves immediately.
@@ -113,10 +110,7 @@ async fn tob_single_publisher_contract() {
         &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
-    let mktdata = replay::split_datagrams(
-        &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
-        replay::TOB_MAGIC,
-    );
+    let mktdata = replay::tob_golden_mktdata();
     tokio::task::spawn_blocking(move || {
         replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
         std::thread::sleep(Duration::from_millis(100));
@@ -142,8 +136,8 @@ async fn tob_single_publisher_contract() {
 
     let quotes = ws_client::by_type(&msgs, "quote");
     // The quote dedup is a per-(venue, symbol) source_ts staleness floor keyed on raw BBO content: it
-    // keeps every distinct (source_ts, content) at a non-decreasing floor and drops only strictly-
-    // older replays and exact duplicates. A single publisher delivers each of its samples once with
+    // keeps each leader change at a non-decreasing floor and drops only strictly-older replays and a
+    // repeat of the leader's last quote. A single publisher delivers each of its samples once with
     // non-decreasing source_ts, so none are stale and none are exact duplicates — all 41 are emitted.
     assert_eq!(
         quotes.len(),
@@ -285,10 +279,7 @@ fn two_publisher_port_blocks_are_both_ingested() {
         &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
-    let mktdata = replay::split_datagrams(
-        &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
-        replay::TOB_MAGIC,
-    );
+    let mktdata = replay::tob_golden_mktdata();
     // `Bridge::spawn` returns on the FIRST receiver-bound marker, but `--feed Hyperliquid` now
     // binds 22 receivers over 55 sockets, so a one-shot send can land before these two have joined
     // — an un-joined group silently discards the datagram. Re-send each round until both publishers

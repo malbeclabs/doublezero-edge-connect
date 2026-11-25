@@ -487,7 +487,7 @@ Modules are grouped by role under `src/`:
   `Contest{winner, lead_ns}` drops the losing cross-publisher copy and records the head-to-head
   lead-time histogram (`dz_quote_lead_ns`/`dz_trade_lead_ns`/`dz_depth_lead_ns`, #60 — a *margin*
   diagnostic, not a win rate: one contest slot per tick, in-tick losers only), `Dropped` is a
-  plain collapse. The **tape leader** (`tape_leader`, keyed `(venue, category)`, `Sticky` venues only —
+  plain collapse. Within a tick both floors drop only the leader's repeat of its **last** content, never an earlier one: a book returning to an earlier state inside one `source_ts` (A, B, A) is the current state, and remembering every content the tick had seen left every consumer on B. That is also why `TobProcessor` drops a redelivered datagram (`SeqCheck::Duplicate`) itself: the floor would emit its quotes again. The **tape leader** (`tape_leader`, keyed `(venue, category)`, `Sticky` venues only —
   the `category` `emit` parameter is the feed row's, never a wire field: PROTOCOL.md is a consumer
   contract and this is producer-side keying) is the path-level twin of
   the reconciler's row ownership, and both are needed before the `trade_id == 0` bypass is sound: a
@@ -823,7 +823,7 @@ Modules are grouped by role under `src/`:
   instrument id) and routes **only to the originating publisher's** building book. `emit_depth` stamps
   `source_ts_ns = book.last_event_ts()` (a per-*event* time) while coalescing per *datagram*, so two
   datagrams in one tick can emit two depths with the same `source_ts`; this is **benign** under the
-  content-inclusive depth floor (same tick + same leader + new content → both admitted, distinct
+  content-inclusive depth floor (same tick + same leader + content unlike its last → both admitted, distinct
   content → distinct oracle key) — we deliberately do **not** mutate `source_ts` with a synthetic
   tiebreak (it's a latency stamp; PROTOCOL.md promises only full-state/self-heal, not a unique
   `source_ts` per depth).

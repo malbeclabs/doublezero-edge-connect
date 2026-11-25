@@ -47,6 +47,18 @@ pub fn split_datagrams(bytes: &[u8], magic: u16) -> Vec<Vec<u8>> {
     datagrams
 }
 
+/// The TOB golden's market data, numbered in replay order. Its generator stamps sequence `0` on every
+/// datagram, which the bridge drops after the first as redelivered.
+pub fn tob_golden_mktdata() -> Vec<Vec<u8>> {
+    let bytes =
+        std::fs::read("tests/fixtures/tob_marketdata.bin").expect("read tob_marketdata.bin");
+    let mut datagrams = split_datagrams(&bytes, TOB_MAGIC);
+    for (sequence, d) in (0u64..).zip(&mut datagrams) {
+        d[4..12].copy_from_slice(&sequence.to_le_bytes());
+    }
+    datagrams
+}
+
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use socket2::{Domain, Protocol, Socket, Type};

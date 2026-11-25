@@ -27,6 +27,8 @@ records in first-seen order: ChannelReset → InstrumentDefinition → ManifestS
 records were reordered to ChannelReset → ManifestSummary → InstrumentDefinition. Datagram bytes are
 unmodified; only record order changed.
 
+**`tob_marketdata.bin` sequence numbers:** the generator stamps `0` on every datagram, which the bridge drops after the first as redelivered. Replay it through `replay::tob_golden_mktdata`, which numbers the datagrams in order; the file itself is unmodified.
+
 The **MBO trio** (`mbo_refdata.bin` / `mbo_snapshot.bin` / `mbo_mktdata.bin`) is a real two-sided
 recorder capture — see "MBO fixtures (real two-sided capture)" below. It replaces the earlier
 hand-crafted empty-anchor snapshot from PR #2; no manual reorder or hand-crafting applies.
@@ -100,7 +102,7 @@ Quotes dedup by a per-`(venue, symbol)` `source_ts` staleness floor keyed on raw
 keeps every distinct top-of-book change at the newest `source_ts` — including multiple distinct BBOs
 that share a `source_ts`, which are real intra-tick updates (this matches the `hl-bbo-feed-race`
 board's `(symbol, source_ts, bbo_hash)` identity) — but drops a lagging publisher's strictly-older
-BBO (stale: the market moved on) and any exact `(source_ts, content)` duplicate. Because the two
+BBO (stale: the market moved on) and a repeat of the leader's last content. Because the two
 publishers interleave, the laggard's older-tick replays are dropped, so the deduped count falls
 between the raw count and the much smaller per-tick count a strict high-watermark would keep (the
 watermark over-drops: it discards real intra-tick BBO changes, not just stale replays). A dedup test
