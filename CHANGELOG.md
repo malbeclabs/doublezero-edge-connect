@@ -532,6 +532,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- **`/v1/products/{id}/ticker` and `/v1/best_bid_ask` answer a product with no book from its latest top-of-book quote**, so a product carried only on a top-of-book feed, every Binance product among them, has a best bid and ask once `--quote-map` is on. A book still answers first. Each answer carries `origin` (`book` or `quote`), and a quote its `as_of_ns`, our receive time of it: a quote outlives a top-of-book feed that goes silent or is unsubscribed, so check its age. With the map off, the only change is `origin: "book"` where a book answers. `sinks::api::serve` now takes the `Option<QuoteMap>`. See [Output sinks](docs/output-sinks.md#query-api-v1).
 - **The Binance-compatible sink accepts the paths stock Binance clients build**, so CCXT, python-binance and Binance's own SDKs connect as NautilusTrader does: streams named after `/ws`, a numeric segment there that CCXT adds as a connection index and Binance ignores, and USD-M's `/public`, `/market` and `/private`, which split the three streams as Binance does. Spot has no such split, and any other path is still a 404. See [Output sinks](docs/output-sinks.md#binance-compatible-sink).
 - **Response helpers for an upcoming public quote server** (`src/market_data/`): quote freshness, the `Cache-Control` policy for each response, the RFC 9457 problem catalog, fixed origin headers and "did you mean" hints for an unknown instrument. Nothing calls them yet, so output is unchanged.
 - **The native market-data response bodies** (quote, markets and the ambiguous-instrument problem) for the same upcoming server, built on its problem catalog; no route serves them yet. `/v1` now formats decimals through the same code, so both surfaces format numbers alike.
@@ -541,7 +542,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The Hyperliquid-compatible sink serves `bbo`**, rendered from our top-of-book `quote`, so a stock NautilusTrader Hyperliquid data client pointed at it receives quotes as well as trades and L2. An empty side is `null`, as Hyperliquid sends it, and the MBO book's top never produces `bbo`. See [Output sinks](docs/output-sinks.md#hyperliquid-compatible-sink).
 - **The bridge can keep the latest top-of-book quote and last trade per instrument**, behind
   `--quote-map` / `DZ_QUOTE_MAP`, off by default. Entries are keyed by the instrument's full
-  identity, never its symbol, and nothing reads them yet, so turning it on changes no output.
+  identity, never its symbol.
 - **Kalshi's crypto up/down pair in the compiled-in registry.** `edge-kalshi-updown-tob` (group
   `233.84.178.26`, Top-of-Book, `37000`/`47000`) and `edge-kalshi-updown-mbp` (`233.84.178.34`,
   Market-by-Price, `38000`/`48000`/`58000`), category `updown`, each one explicit block shared by two

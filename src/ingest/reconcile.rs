@@ -45,7 +45,7 @@ use crate::{
         subscriptions::{self, Detected, HostSubs},
     },
     metrics::metrics,
-    model::{category_arc, BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot},
+    model::{category_arc, BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot, QuoteMap},
     shred::{self, DedupMode, ShredConfig},
     sinks::api,
 };
@@ -247,6 +247,8 @@ pub struct ReconcilerConfig {
     /// API reads from. Built once in `main` (like `instruments`/`depth`/`books`) so the window
     /// survives the sink's own activate/deactivate cycles.
     pub history: Arc<Mutex<Store>>,
+    /// The latest-values map the query API reads (`--quote-map`); `None` when the flag is off.
+    pub quote_map: Option<QuoteMap>,
     pub shred: ShredParams,
     /// The shared diagnostics snapshot this reconciler publishes at the end of every tick, and
     /// `sinks::admin` serves. Write-only from here — nothing in this module ever reads it back, so
@@ -1094,6 +1096,7 @@ impl Reconciler {
                         self.cfg.filter.clone(),
                         self.cfg.enabled.clone(),
                         self.cfg.arbiter.clone(),
+                        self.cfg.quote_map.clone(),
                     )));
                     self.history_writer = Some(tokio::spawn(feed_history(
                         self.cfg.tx.subscribe(),
@@ -2125,6 +2128,7 @@ mod tests {
             r.cfg.filter.clone(),
             r.cfg.enabled.clone(),
             r.cfg.arbiter.clone(),
+            None,
         ));
         let base = format!("http://{addr}");
 
@@ -2875,6 +2879,7 @@ mod tests {
             },
             api_bind: String::new(),
             history: Arc::new(Mutex::new(Store::new())),
+            quote_map: None,
             shred: ShredParams {
                 disabled: true,
                 explicit_sources: Vec::new(),
@@ -3018,6 +3023,7 @@ mod tests {
                 tx.clone(),
                 8,
             ))),
+            None,
         ));
         tokio::spawn(feed_history(
             tx.subscribe(),
@@ -3159,6 +3165,7 @@ mod tests {
                 tx.clone(),
                 8,
             ))),
+            None,
         ));
         tokio::spawn(feed_history(
             tx.subscribe(),

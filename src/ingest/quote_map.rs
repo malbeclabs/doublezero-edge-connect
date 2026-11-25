@@ -137,11 +137,11 @@ pub fn trade_key(t: &NormalizedTrade) -> Option<BookKey> {
 // ---------------------------------------------------------------------------------------------
 // Candidates: what each source would answer for one instrument, and the order between them.
 //
-// These are for a periodic snapshot builder only. It reads each store (this map, the book
-// replay, the depth replay) in its own pass, taking that store's lock once and never two at a
-// time, and hands each instrument's values here. None of these functions takes a lock except
-// `copy_quote_map`. A request handler must never call them: the stores' locks are the ones the
-// arbiter takes on every message. They mirror `sinks::api`'s `best_levels`, which is left as is.
+// These are for a periodic snapshot builder. It reads each store (this map, the book replay, the
+// depth replay) in its own pass, taking that store's lock once and never two at a time, and hands
+// each instrument's values here. None of these functions takes a lock except `copy_quote_map`,
+// which a request handler must never call: the arbiter waits on that lock for the whole clone.
+// `sinks::api` reads one entry at a time through `tob_candidate`, book first.
 // ---------------------------------------------------------------------------------------------
 
 /// Which store answered.
