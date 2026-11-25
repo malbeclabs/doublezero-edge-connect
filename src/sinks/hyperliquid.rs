@@ -2730,34 +2730,76 @@ mod tests {
 
     /// **Item J.** A coin that resolves to more than one market cannot be served: the schema carries
     /// no channel or instrument field, so both markets' snapshots and updates would arrive under one
-    /// name. Refused, rather than silently served one of them.
+    /// name. Refused, rather than silently served one of them — the second market being another
+    /// instrument, or the same one under another of Hyperliquid's Source IDs.
     #[tokio::test]
     async fn an_ambiguous_coin_subscription_is_refused() {
-        let mut second = key();
-        second.3 = 8;
-        let books = vec![
-            (key(), accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)])),
-            (second, accumulated(vec![(BookSide::Ask, 200.0, 1.0, 12)])),
-        ];
-        let (_tx, addr, srv) = spawn(books).await;
+        let mut other_instrument = key();
+        other_instrument.3 = 8;
+        let mut other_source = key();
+        other_source.0 = crate::model::SourceKey::new(7, VENUE.into());
+        for second in [other_instrument, other_source] {
+            let books = vec![
+                (key(), accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)])),
+                (
+                    second.clone(),
+                    accumulated(vec![(BookSide::Ask, 200.0, 1.0, 12)]),
+                ),
+            ];
+            let (_tx, addr, srv) = spawn(books).await;
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+                .await
+                .unwrap();
+            ws.send(WsMessage::Text(
+                r#"{"method":"subscribe","subscription":{"type":"l4Book","coin":"BTC"}}"#.into(),
+            ))
+            .await
+            .unwrap();
+            let f = next_text(&mut ws, Duration::from_secs(2)).await.unwrap();
+            let v: serde_json::Value = serde_json::from_str(&f).unwrap();
+            assert_eq!(v["channel"], "error", "{second:?}: got {f}");
+            assert!(v["data"].as_str().unwrap().contains("ambiguous"));
+            assert!(
+                next_text(&mut ws, Duration::from_millis(300))
+                    .await
+                    .is_none(),
+                "an ambiguous coin must not be bootstrapped from either market"
+            );
+            srv.abort();
+        }
+    }
+
+    /// A market under two of Hyperliquid's Source IDs at once reaches `bbo` and `trades` once per ID,
+    /// the same print included: deliberately, as docs/output-sinks.md says.
+    #[tokio::test]
+    async fn a_market_under_two_source_ids_reaches_bbo_and_trades_once_per_id() {
+        let (tx, addr, srv) = spawn(vec![]).await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
             .unwrap();
-        ws.send(WsMessage::Text(
-            r#"{"method":"subscribe","subscription":{"type":"l4Book","coin":"BTC"}}"#.into(),
-        ))
-        .await
-        .unwrap();
-        let f = next_text(&mut ws, Duration::from_secs(2)).await.unwrap();
-        let v: serde_json::Value = serde_json::from_str(&f).unwrap();
-        assert_eq!(v["channel"], "error", "got {f}");
-        assert!(v["data"].as_str().unwrap().contains("ambiguous"));
-        assert!(
-            next_text(&mut ws, Duration::from_millis(300))
-                .await
-                .is_none(),
-            "an ambiguous coin must not be bootstrapped from either market"
-        );
+        for channel in ["bbo", "trades"] {
+            ws.send(WsMessage::Text(
+                format!(r#"{{"method":"subscribe","subscription":{{"type":"{channel}","coin":"xyz:CL"}}}}"#)
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            next_text(&mut ws, Duration::from_secs(2)).await.unwrap(); // ack
+        }
+        for source_id in [1, 7] {
+            let mut q = normalized_quote("xyz:CL", (80.25, 2.0, 3), (80.26, 4.0, 1));
+            q.source_id = source_id;
+            let mut t = normalized_trade(VENUE, "xyz:CL", 80.25, 1.0, true, 42);
+            t.source_id = source_id;
+            let _ = tx.send(Arc::new(FeedMessage::Quote(q)));
+            let _ = tx.send(Arc::new(FeedMessage::Trade(t)));
+        }
+        let mut channels = Vec::new();
+        while let Some(f) = next_text(&mut ws, Duration::from_millis(500)).await {
+            let v: serde_json::Value = serde_json::from_str(&f).unwrap();
+            channels.push(v["channel"].as_str().unwrap().to_string());
+        }
+        assert_eq!(channels, ["bbo", "trades", "bbo", "trades"]);
         srv.abort();
     }
 

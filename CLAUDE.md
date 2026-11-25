@@ -774,7 +774,7 @@ Modules are grouped by role under `src/`:
   connection, decodes the HL JSON → `FeedMessage`, scales the public block time (ms) to ns so it
   shares the **same canonical `source_ts`** as the edge copy, and emits through the shared arbiter as
   `Transport::PublicWs`. Gates each emission on the `(venue, symbol)` instrument being known in the
-  shared snapshot (precision before price, supplied by edge refdata). Backstop behavior falls out of
+  shared snapshot (precision before price, supplied by edge refdata). ⚠️ `venue` is the **name**, covering every Source ID it carries, since the socket serves Hyperliquid's builder DEXes too, and each copy takes the matched entry's ID: an `xyz:` copy stamped 1 misses its edge copy's floor (ID 7) and goes out beside it as a duplicate. A symbol several of those IDs carry resolves to the input's own ID or to nothing, never by hash order. `ingest::race` and `/v1/race` match by name for the same reason, the board counting only the floor the public copies carry. Backstop behavior falls out of
   the floor: edge leads each tick in steady state (public copy dropped as a no-op), public fills in on
   an edge gap — no health check.
 - **`ingest/phoenix_input.rs`** — the Phoenix `PublicVenue` (off by default), **trades only** (the

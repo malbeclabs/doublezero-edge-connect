@@ -222,6 +222,9 @@ struct Race {
     state: SubState,
     figures: Figures,
     firsts: Firsts,
+    /// The Source ID the public copies carry: where the venue's name spans several, only that
+    /// floor's edge copies race them.
+    public_id: Option<u16>,
 }
 
 impl Race {
@@ -323,21 +326,38 @@ impl RaceBoard {
         v.symbols[i].1[kind.idx()].as_mut()
     }
 
-    fn live(&mut self, source_id: u16, symbol: &str, kind: Kind) -> Option<&mut Race> {
-        self.race(source_id, symbol, kind)
-            .filter(|r| r.state == SubState::Live)
+    /// `symbol`'s live race in the input for `venue`, for a copy under `source_id` from `side`. By
+    /// name, not Source ID: an input races every ID its name carries, as Hyperliquid's builder DEXes
+    /// share its public socket.
+    fn live(
+        &mut self,
+        venue: &str,
+        source_id: u16,
+        symbol: &str,
+        kind: Kind,
+        side: usize,
+    ) -> Option<&mut Race> {
+        let v = self.venues.values_mut().find(|v| v.venue == venue)?;
+        let i = *v.index.get(symbol)?;
+        let race = v.symbols[i].1[kind.idx()]
+            .as_mut()
+            .filter(|r| r.state == SubState::Live)?;
+        if side == PUBLIC {
+            race.public_id = Some(source_id);
+        }
+        (race.public_id.unwrap_or(source_id) == source_id).then_some(race)
     }
 
     /// A quote that reached the staleness floor from `side`; `opened` when it opened its tick.
     pub fn on_quote(&mut self, q: &NormalizedQuote, side: usize, opened: bool) {
-        if let Some(race) = self.live(q.source_id, &q.symbol, Kind::Quotes) {
+        if let Some(race) = self.live(&q.venue, q.source_id, &q.symbol, Kind::Quotes, side) {
             race.observe(q.source_ts_ns, q.source_ts_ns, side, q.recv_ts_ns, opened);
         }
     }
 
     /// A trade that reached the `trade_id` window from `side`; `admitted` when its copy went out.
     pub fn on_trade(&mut self, t: &NormalizedTrade, side: usize, admitted: bool) {
-        if let Some(race) = self.live(t.source_id, &t.symbol, Kind::Trades) {
+        if let Some(race) = self.live(&t.venue, t.source_id, &t.symbol, Kind::Trades, side) {
             race.observe(t.trade_id, t.source_ts_ns, side, t.recv_ts_ns, admitted);
         }
     }
@@ -346,9 +366,8 @@ impl RaceBoard {
     pub fn snapshot(&self) -> RaceSnapshot {
         let mut venues: Vec<VenueSnapshot> = self
             .venues
-            .iter()
-            .map(|(&source_id, v)| VenueSnapshot {
-                source_id,
+            .values()
+            .map(|v| VenueSnapshot {
                 venue: v.venue.clone(),
                 up: v.up,
                 reconnects: v.reconnects,
@@ -379,7 +398,6 @@ pub struct RaceSnapshot {
 }
 
 pub struct VenueSnapshot {
-    pub source_id: u16,
     pub venue: String,
     pub up: bool,
     pub reconnects: u64,
@@ -421,8 +439,8 @@ impl SymbolSnapshot {
         self.races[kind.idx()].as_ref().map(|(_, f)| f)
     }
 
-    /// `defined`: the edge catalog holds this symbol under the venue's Source ID. `venue_defined`:
-    /// it holds any of the venue's instruments.
+    /// `defined`: the edge catalog holds this symbol under the venue's name. `venue_defined`: it
+    /// holds any of the venue's instruments.
     pub fn status(&self, defined: bool, venue_defined: bool, grace_over: bool) -> Status {
         let mut states = self.races.iter().flatten().map(|(s, _)| *s);
         if states.clone().any(|s| s == SubState::Refused) {
@@ -517,6 +535,38 @@ mod tests {
             .find(|s| s.symbol == symbol)
             .and_then(|s| s.figures(kind).cloned())
             .unwrap()
+    }
+
+    /// Where several IDs carry one symbol, only the floor the public copies race counts.
+    #[test]
+    fn only_the_floor_the_public_copies_race_counts() {
+        let mut b = RaceBoard::default();
+        b.register(SRC, "HYPERLIQUID", [("xyz:CL", Kind::Quotes)]);
+        b.set_state(SRC, "xyz:CL", Kind::Quotes, SubState::Live);
+        let at = |source_id: u16, ts: u64| NormalizedQuote {
+            source_id,
+            ..quote("xyz:CL", ts, ts)
+        };
+        b.on_quote(&at(1, 1_000), PUBLIC, true);
+        b.on_quote(&at(7, 2_000), EDGE, true);
+        b.on_quote(&at(1, 3_000), EDGE, true);
+        assert_eq!(figures(&b, "xyz:CL", Kind::Quotes).won, [1, 1]);
+    }
+
+    /// An input races every Source ID its venue's name carries, as the builder DEX's 7 under 1's.
+    #[test]
+    fn another_source_id_under_the_inputs_name_counts() {
+        let mut b = RaceBoard::default();
+        b.register(SRC, "HYPERLIQUID", [("xyz:CL", Kind::Quotes)]);
+        b.set_state(SRC, "xyz:CL", Kind::Quotes, SubState::Live);
+        let mut q = quote("xyz:CL", 1_000, 10);
+        q.source_id = 7;
+        b.on_quote(&q, EDGE, true);
+        q.venue = "PHOENIX".into();
+        q.source_id = 2;
+        q.source_ts_ns = 2_000;
+        b.on_quote(&q, EDGE, true);
+        assert_eq!(figures(&b, "xyz:CL", Kind::Quotes).won, [1, 0]);
     }
 
     #[test]

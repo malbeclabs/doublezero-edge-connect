@@ -36,6 +36,8 @@ docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun \
   doublezero-edge-connect
 ```
 
+The daemon's socket, `/run/doublezerod/doublezerod.sock`, belongs to the container: the entrypoint removes whatever is at that path when it starts, so never bind-mount a host daemon's socket, or the directory holding it, there.
+
 Any of the bridge's env vars (see [Configure](../README.md#configure-override-the-one-liner))
 can be passed with `-e`. The WebSocket listens on the host's loopback, `127.0.0.1:8081`, by default; `-e WS_BIND=0.0.0.0:8081` serves engines on other hosts.
 
