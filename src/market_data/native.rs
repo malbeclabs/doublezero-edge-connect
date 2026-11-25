@@ -396,6 +396,10 @@ pub fn markets_body(
 /// The ambiguous-symbol problem: every candidate in key order, each with a quote link by its own
 /// id, and the attribution.
 pub fn ambiguous_instrument(venue: &str, candidates: &[InstrumentView], links: &Links) -> Problem {
+    debug_assert!(
+        candidates.len() >= 2,
+        "a 409 needs two candidates to choose between"
+    );
     let mut sorted: Vec<&InstrumentView> = candidates.iter().collect();
     sorted.sort_by(|a, b| a.id.cmp(&b.id));
     let candidates: Vec<Value> = sorted
@@ -949,6 +953,13 @@ mod tests {
             ids,
             ["1:hl-perps:9:3", "1:hl-perps:10:3", "1:xyz-perps:0:3"]
         );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "two candidates")]
+    fn one_candidate_is_not_ambiguous() {
+        ambiguous_instrument("hyperliquid", &[inst("BTC", 3)], &links());
     }
 
     #[test]
