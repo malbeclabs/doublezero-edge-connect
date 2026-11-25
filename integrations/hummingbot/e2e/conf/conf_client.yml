@@ -1,0 +1,4 @@
+# Paper trading needs no credentials; Hummingbot enables it per connector here.
+paper_trade:
+  paper_trade_exchanges:
+  - hyperliquid_perpetual
