@@ -73,7 +73,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/release.docker.edge-connect.build.yml
+    uses: $/.github/workflows/release.docker.edge-connect.build.yml
     with:
       env: ${{ needs.validate.outputs.env }}
       push: true

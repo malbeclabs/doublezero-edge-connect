@@ -298,7 +298,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the serial group, and each of the three carries the reason in its own doc comment — the writer is
   the one that has to know, since the reader cannot enumerate them.
 - **Two pushes to `main` close together could leave a moving image tag on the older commit.** Every
-  path that publishes a variant — the push/tag/manual matrix, the `doublezero-base-published`
+  path that publishes a variant — the push/dispatch matrix, the `doublezero-base-published`
   dispatch and the daily base poll — writes the same moving tag (`:testnet`, `:mainnet-beta`,
   devnet `:latest`), so the tag ends up wherever the *last* push landed rather than at the newest
   commit. On 2026-09-11 two pushes three minutes apart inverted exactly that way: the older commit's
@@ -309,7 +309,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only ever serialized dispatches against each other, and a workflow-level group of the same name
   would have queued that run's own build job behind the run holding it.
 
-  A release tag shares that lane rather than getting one of its own, and `queue: max` is what
+  A versioned release shares that lane rather than getting one of its own, and `queue: max` is what
   makes that safe. By default a concurrency group holds one run in progress and *one* pending, and
   a newly queued run cancels the pending one whatever `cancel-in-progress` says — so a release
   publish waiting behind a build could be evicted by a later push to `main` and silently never
@@ -321,11 +321,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pushes nothing — the pull-request smoke test — still takes a per-run lane, so it neither waits
   behind a publish nor sits in a publisher's queue.
 
-  What this does not promise: FIFO orders by arrival, not by commit, so a release tag cut on a
-  commit that is *not* `main`'s HEAD still publishes the moving tag for that older commit.
-  Ordering by commit means consulting the tag's current `org.opencontainers.image.revision` before
-  overwriting it, which is worth doing the day this repo tags anything but HEAD. `queue` is also
-  newer (May 2026) than the newest actionlint release (v1.7.12, March 2026), so
+  `queue` is newer (May 2026) than the newest actionlint release (v1.7.12, March 2026), so
   `.github/actionlint.yaml` ignores exactly that one syntax-check message — every other unexpected
   key under `concurrency` still fails the lint.
 - **A mirror publisher's `publisher_offset` was applied only by the market-by-price processor**, so
@@ -380,6 +376,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their SHA-256; `cargo-deny` runs the same checks as before. `actionlint.yml` is replaced by
   `actions-lint.yml` (actionlint plus zizmor), every kept checkout drops its token, and
   `.github/CODEOWNERS` now owns the CI configuration and `deny.toml` (malbeclabs/infra#3339).
+- **A versioned image is released by dispatching `release.docker.edge-connect` on `main` with a `version`, not by pushing a `v*` tag, which now publishes nothing.** The pinned `:<env>-X.Y.Z` tags are unchanged, and a version already published from another commit is refused. Only `main` publishes, and a pushed image no longer restores layers from the Actions cache. The four image workflows pass actions-lint, so they can be re-enabled (malbeclabs/infra#3348).
 - **A feed-registry row that shares its venue name with other Source IDs but declares no `source_id`
   is reported at load** (`info`, once per `(venue, category)`): its engines' health and status are
   reported together under the name. The hosted Hyperliquid rows are such rows today. Refusing them is
