@@ -8,6 +8,7 @@
 
 pub mod history;
 pub mod ingest;
+pub mod market_data;
 pub mod metrics;
 pub mod model;
 pub mod products;
