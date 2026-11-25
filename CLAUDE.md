@@ -129,6 +129,13 @@ Modules are grouped by role under `src/`:
   header value is a `&'static str`, so no feed or request text reaches a header. `near_match`:
   "did you mean" hints at a bounded cost per request — the edit distance is banded to
   `|i - j| <= 2`, because a query sharing a long prefix with every symbol never trips the early exit.
+  `native`: the native response bodies, built on `response`'s types — the one problem catalog;
+  extend it there rather than adding a second type. The
+  `<source_id>:<category>:<channel>:<instrument_id>` id is accepted in its one canonical spelling
+  only; `FreshnessReport`; decimal and RFC 3339 formatting; the quote, markets and ambiguous-instrument
+  bodies and their links. Links come only from configured URLs, never from a request, so a body
+  depends on nothing outside the cache key; `detail` never carries feed text. `sinks::api` renders
+  its decimals through `native::decimal`, so the two surfaces format alike.
 - **root** — `model` (shared wire types/clocks/snapshots) and `main`.
 
 - **`ingest/registry.rs` + `ingest/registry.json`** — the feed registry as **data**. The rows are a

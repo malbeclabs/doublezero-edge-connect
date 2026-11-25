@@ -61,6 +61,7 @@ use crate::{
         race::{Figures, Kind, EDGE, PUBLIC},
         sources::source_ids_of,
     },
+    market_data::native::decimal as decimal_string,
     model::{
         category_arc, venue_arc, BookSnapshot, DepthSnapshot, InstrumentSnapshot,
         NormalizedInstrument,
@@ -451,13 +452,6 @@ fn price_increment_string(tick_size: i64, price_exponent: i8) -> String {
         crate::ingest::codec_common::apply_exponent(tick_size, price_exponent),
         price_exponent,
     )
-}
-
-/// Render `value` as a fixed-decimal string at `exponent`'s precision (never Rust's scientific/debug
-/// float formatting) — what every numeric field in this API's envelopes uses.
-fn decimal_string(value: f64, exponent: i8) -> String {
-    let decimals = (-exponent).max(0) as usize;
-    format!("{value:.decimals$}")
 }
 
 /// Best-effort feed-kind label for one instrument, derived from which snapshot actually holds data
